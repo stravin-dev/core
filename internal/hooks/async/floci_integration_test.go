@@ -192,10 +192,11 @@ func TestFlociIntegration_StreamsOutboxSignedWebhookAndDLQ(t *testing.T) {
 	}
 
 	dispatcher, err := NewWebhookDispatcher(DispatcherConfig{
-		Webhooks:  repo,
-		Cipher:    hookCipher,
-		DLQ:       dlqSink,
-		Telemetry: tel,
+		Webhooks:             repo,
+		Cipher:               hookCipher,
+		DLQ:                  dlqSink,
+		Telemetry:            tel,
+		AllowPrivateNetworks: true,
 	})
 	if err != nil {
 		t.Fatalf("NewWebhookDispatcher: %v", err)

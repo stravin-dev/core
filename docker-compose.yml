@@ -192,6 +192,7 @@ services:
       STRAVIN_DDB_TABLE: "stravin-core"
       STRAVIN_KMS_KEY_ID: "alias/stravin-local-dev"
       STRAVIN_HOOK_POLL_INTERVAL: "${STRAVIN_HOOK_POLL_INTERVAL:-250ms}"
+      STRAVIN_WEBHOOK_ALLOW_PRIVATE_NETWORKS: "${STRAVIN_WEBHOOK_ALLOW_PRIVATE_NETWORKS:-true}"
       AWS_ENDPOINT_URL: "http://floci:4566"
       AWS_REGION: "us-east-1"
       AWS_ACCESS_KEY_ID: "test"

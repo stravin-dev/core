@@ -35,9 +35,34 @@ var blockedMetadataIPs = []net.IP{
 	net.ParseIP("fd00:ec2::254"),
 }
 
+var cgnatCIDR = mustParseCIDR("100.64.0.0/10")
+
+func mustParseCIDR(cidr string) *net.IPNet {
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		panic(fmt.Sprintf("async: invalid CIDR %q: %v", cidr, err))
+	}
+	return network
+}
+
+// SafeClientOptions configures SSRF validation for webhook target URLs and HTTP clients.
+// Zero value is fail-closed (blocks loopback, RFC1918, ULA, link-local, CGNAT, multicast,
+// unspecified, and cloud metadata addresses).
+type SafeClientOptions struct {
+	// AllowPrivateNetworks permits loopback and private (RFC1918 / IPv6 ULA) targets.
+	// Cloud metadata endpoints, link-local, CGNAT, multicast, and unspecified addresses
+	// remain blocked even when enabled. Intended only for local development and E2E tests.
+	AllowPrivateNetworks bool
+}
+
 // ValidateTargetURL checks that rawURL uses http or https, has a non-empty host,
-// and does not target known cloud metadata endpoints.
+// and does not target blocked private, loopback, link-local, CGNAT, or cloud metadata endpoints.
 func ValidateTargetURL(rawURL string) (*url.URL, error) {
+	return ValidateTargetURLWithOptions(rawURL, SafeClientOptions{})
+}
+
+// ValidateTargetURLWithOptions validates rawURL under the provided SSRF policy.
+func ValidateTargetURLWithOptions(rawURL string, opts SafeClientOptions) (*url.URL, error) {
 	trimmed := strings.TrimSpace(rawURL)
 	if trimmed == "" {
 		return nil, fmt.Errorf("%w: empty url", ErrInvalidTargetURL)
@@ -62,16 +87,28 @@ func ValidateTargetURL(rawURL string) (*url.URL, error) {
 		return nil, fmt.Errorf("%w: %s", ErrBlockedTargetHost, host)
 	}
 
-	if ip := net.ParseIP(host); ip != nil && isBlockedIP(ip) {
+	if !opts.AllowPrivateNetworks && isLocalhostName(host) {
+		return nil, fmt.Errorf("%w: %s", ErrBlockedTargetHost, host)
+	}
+
+	if ip := net.ParseIP(host); ip != nil && isBlockedIPWithPolicy(ip, opts.AllowPrivateNetworks) {
 		return nil, fmt.Errorf("%w: %s", ErrBlockedTargetHost, ip.String())
 	}
 
 	return parsed, nil
 }
 
+func isLocalhostName(host string) bool {
+	return host == "localhost" || strings.HasSuffix(host, ".localhost")
+}
+
 func isBlockedIP(ip net.IP) bool {
+	return isBlockedIPWithPolicy(ip, false)
+}
+
+func isBlockedIPWithPolicy(ip net.IP, allowPrivate bool) bool {
 	if ip == nil {
-		return false
+		return true
 	}
 	if v4 := ip.To4(); v4 != nil {
 		ip = v4
@@ -81,20 +118,36 @@ func isBlockedIP(ip net.IP) bool {
 			return true
 		}
 	}
+	if ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() ||
+		ip.IsUnspecified() ||
+		cgnatCIDR.Contains(ip) {
+		return true
+	}
+	if !allowPrivate && (ip.IsLoopback() || ip.IsPrivate()) {
+		return true
+	}
 	return false
 }
 
-// NewSafeHTTPClient builds an HTTP client that blocks cloud metadata IPs at both
-// URL-validation and dial time (mitigating DNS rebinding), validates redirects,
-// and enforces per-request timeouts.
+// NewSafeHTTPClient builds a fail-closed HTTP client that blocks loopback, private,
+// link-local, CGNAT, multicast, unspecified, and cloud metadata IPs at both
+// URL-validation and dial time (mitigating DNS rebinding), disables proxy env vars,
+// validates redirects, and enforces per-request timeouts.
 func NewSafeHTTPClient(timeout time.Duration) *http.Client {
+	return NewSafeHTTPClientWithOptions(timeout, SafeClientOptions{})
+}
+
+// NewSafeHTTPClientWithOptions builds an SSRF-hardened HTTP client configured by opts.
+func NewSafeHTTPClientWithOptions(timeout time.Duration, opts SafeClientOptions) *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   defaultDialTimeout,
 		KeepAlive: 30 * time.Second,
 	}
 
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 nil, // Never allow HTTP_PROXY/HTTPS_PROXY to bypass DialContext IP checks.
 		MaxIdleConns:          64,
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
@@ -104,12 +157,19 @@ func NewSafeHTTPClient(timeout time.Duration) *http.Client {
 			if err != nil {
 				return nil, fmt.Errorf("%w: %w", ErrInvalidTargetURL, err)
 			}
+			normalizedHost := strings.ToLower(strings.TrimSuffix(host, "."))
+			if _, blocked := blockedMetadataHosts[normalizedHost]; blocked {
+				return nil, fmt.Errorf("%w: %s", ErrBlockedTargetHost, normalizedHost)
+			}
+			if !opts.AllowPrivateNetworks && isLocalhostName(normalizedHost) {
+				return nil, fmt.Errorf("%w: %s", ErrBlockedTargetHost, normalizedHost)
+			}
 			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 			if err != nil {
 				return nil, err
 			}
 			for _, ipAddr := range ips {
-				if isBlockedIP(ipAddr.IP) {
+				if isBlockedIPWithPolicy(ipAddr.IP, opts.AllowPrivateNetworks) {
 					return nil, fmt.Errorf("%w: resolved to %s", ErrBlockedTargetHost, ipAddr.IP.String())
 				}
 			}
@@ -135,7 +195,7 @@ func NewSafeHTTPClient(timeout time.Duration) *http.Client {
 			if len(via) >= 5 {
 				return errors.New("async: stopped after 5 redirects")
 			}
-			if _, err := ValidateTargetURL(req.URL.String()); err != nil {
+			if _, err := ValidateTargetURLWithOptions(req.URL.String(), opts); err != nil {
 				return err
 			}
 			return nil
