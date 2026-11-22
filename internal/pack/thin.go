@@ -124,7 +124,7 @@ func CompleteThinPack(thinPack []byte, resolver BaseResolver, limits Limits) ([]
 
 func writeBasePackEntry(buf *bytes.Buffer, typ ObjectType, data []byte) error {
 	size := int64(len(data))
-	b := byte((uint8(typ)&0x07)<<4) | byte(size&0x0f)
+	b := ((uint8(typ) & 0x07) << 4) | byte(size&0x0f)
 	size >>= 4
 	for size > 0 {
 		buf.WriteByte(b | 0x80)

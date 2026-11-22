@@ -439,7 +439,7 @@ func parseSignature(raw string) Signature {
 }
 
 func parseTZOffset(s string) (*time.Location, bool) {
-	sign := 1
+	var sign int
 	switch s[0] {
 	case '+':
 		sign = 1

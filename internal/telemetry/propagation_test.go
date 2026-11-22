@@ -8,6 +8,7 @@ import (
 
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/metadata"
+
 	"stravin.dev/core/internal/telemetry"
 )
 

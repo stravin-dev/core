@@ -246,7 +246,7 @@ func ValidateOID(oid string) error {
 	}
 	for i := 0; i < len(oid); i++ {
 		c := oid[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return fmt.Errorf("%w: non-hex character at %d", ErrInvalidOID, i)
 		}
 	}
