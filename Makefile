@@ -1,8 +1,9 @@
 GO := ./scripts/go.sh
 DAEMONS := edge node pack ctrl hook
 BIN_DIR := bin
+PRE_COMMIT ?= $(shell if command -v pre-commit >/dev/null 2>&1; then echo pre-commit; elif command -v asdf >/dev/null 2>&1; then echo "asdf exec pre-commit"; else echo pre-commit; fi)
 
-.PHONY: test vet lint build docker-build clean
+.PHONY: test vet lint build docker-build clean pre-commit install-hooks
 
 test:
 	$(GO) test -race -v ./...
@@ -37,3 +38,9 @@ docker-build:
 
 clean:
 	rm -rf $(BIN_DIR)
+
+install-hooks:
+	$(PRE_COMMIT) install
+
+pre-commit:
+	$(PRE_COMMIT) run --all-files
