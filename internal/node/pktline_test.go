@@ -97,6 +97,70 @@ func TestAdvertiseRefs_NoMatchingDefaultBranchOmitsHEAD(t *testing.T) {
 	}
 }
 
+func TestAdvertiseRefs_ReceivePackCapabilities(t *testing.T) {
+	empty := AdvertiseRefs(nil, "refs/heads/main", AdvertiseOptions{
+		IncludeServiceHeader: true,
+		ServiceName:          "git-receive-pack",
+	})
+	emptyStr := string(empty)
+	if !strings.HasPrefix(emptyStr, "001f# service=git-receive-pack\n0000") {
+		t.Fatalf("missing receive-pack service header: %q", emptyStr)
+	}
+	for _, capName := range []string{"report-status", "delete-refs", "side-band-64k", "ofs-delta", "atomic"} {
+		if !strings.Contains(emptyStr, capName) {
+			t.Errorf("empty receive-pack advertisement missing capability %q: %q", capName, emptyStr)
+		}
+	}
+
+	oidMain := strings.Repeat("a", 40)
+	oidDev := strings.Repeat("b", 40)
+	refs := []ddb.RefState{
+		{RefName: "refs/heads/main", OID: oidMain},
+		{RefName: "refs/heads/dev", OID: oidDev},
+	}
+	out := AdvertiseRefs(refs, "refs/heads/main", AdvertiseOptions{
+		ServiceName: "git-receive-pack",
+	})
+	lines := decodePktLines(t, out)
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 pkt-lines (no HEAD for receive-pack), got %d: %q", len(lines), lines)
+	}
+	if !strings.HasPrefix(lines[0], oidDev+" refs/heads/dev\x00") {
+		t.Fatalf("line 0 = %q, want first sorted ref with caps", lines[0])
+	}
+	if lines[1] != oidMain+" refs/heads/main\n" {
+		t.Fatalf("line 1 = %q, want %q", lines[1], oidMain+" refs/heads/main\n")
+	}
+}
+
+func TestParseReceiveCommands_AndSideBand(t *testing.T) {
+	oldOID := strings.Repeat("0", 40)
+	newOID := strings.Repeat("a", 40)
+	var wire bytes.Buffer
+	wire.Write(EncodePktLine([]byte(oldOID + " " + newOID + " refs/heads/main\x00report-status side-band-64k atomic\n")))
+	wire.Write(FlushPkt)
+
+	cmds, caps, err := ParseReceiveCommands(&wire)
+	if err != nil {
+		t.Fatalf("ParseReceiveCommands: %v", err)
+	}
+	if len(cmds) != 1 {
+		t.Fatalf("got %d commands, want 1", len(cmds))
+	}
+	if cmds[0].OldOID != oldOID || cmds[0].NewOID != newOID || cmds[0].RefName != "refs/heads/main" {
+		t.Fatalf("unexpected command: %+v", cmds[0])
+	}
+	if !caps["report-status"] || !caps["side-band-64k"] || !caps["atomic"] {
+		t.Fatalf("unexpected caps: %+v", caps)
+	}
+
+	sb := EncodeSideBand(SideBandStderr, []byte("hook failed\n"))
+	sbLines := decodePktLines(t, sb)
+	if len(sbLines) != 1 || sbLines[0] != "\x02hook failed\n" {
+		t.Fatalf("EncodeSideBand = %q, want [\\x02hook failed\\n]", sbLines)
+	}
+}
+
 func decodePktLines(t *testing.T, data []byte) []string {
 	t.Helper()
 	var lines []string
