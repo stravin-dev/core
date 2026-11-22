@@ -15,21 +15,55 @@
       }
     ]
   },
-  "description": "Stravin Core Golden Signals and storage-engine invariants (Ingress, DynamoDB Ref-CAS, S3, Wasm Hooks, NVMe Cache, Compaction, Telemetry Health).",
+  "description": "Stravin Core Golden Signals across stravin-edge, stravin-node, stravin-pack, stravin-hook, and stravin-ctrl with Tempo trace exemplars and correlated Loki logs.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
   "id": null,
-  "links": [],
+  "links": [
+    {
+      "icon": "external link",
+      "targetBlank": true,
+      "title": "Explore Tempo Traces",
+      "type": "link",
+      "url": "/explore?left=%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22queryType%22%3A%22traceqlSearch%22%2C%22filters%22%3A%5B%5D%7D%5D%7D"
+    },
+    {
+      "icon": "external link",
+      "targetBlank": true,
+      "title": "Explore Core Logs (Loki)",
+      "type": "link",
+      "url": "/explore?left=%7B%22datasource%22%3A%22loki%22%2C%22queries%22%3A%5B%7B%22expr%22%3A%22%7Bservice_name%3D~%5C%22stravin-.*%5C%22%7D%22%7D%5D%7D"
+    },
+    {
+      "icon": "dashboard",
+      "targetBlank": false,
+      "title": "Stravin Load Tester",
+      "type": "link",
+      "url": "/d/stravin-loadgen"
+    }
+  ],
   "panels": [
     {
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Overall Git ingress RPS and error rate across SSH and Smart HTTP.",
+      "description": "Overall Git ingress RPS and error rate across SSH and Smart HTTP (stravin-edge).",
       "fieldConfig": {
         "defaults": {
+          "links": [
+            {
+              "targetBlank": true,
+              "title": "Explore Tempo Traces (stravin-edge)",
+              "url": "/explore?left=%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7Bresource.service.name%3D%5C%22stravin-edge%5C%22%7D%22%7D%5D%7D"
+            },
+            {
+              "targetBlank": true,
+              "title": "Explore Loki Logs (stravin-edge)",
+              "url": "/explore?left=%7B%22datasource%22%3A%22loki%22%2C%22queries%22%3A%5B%7B%22expr%22%3A%22%7Bservice_name%3D%5C%22stravin-edge%5C%22%7D%22%7D%5D%7D"
+            }
+          ],
           "unit": "reqps"
         },
         "overrides": []
@@ -54,7 +88,7 @@
           "refId": "B"
         }
       ],
-      "title": "Ingress RPS & Errors",
+      "title": "Ingress RPS & Errors (stravin-edge)",
       "type": "timeseries"
     },
     {
@@ -62,9 +96,16 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Ingress p50/p95/p99 latency with Tempo exemplars.",
+      "description": "Ingress p50/p95/p99 latency with clickable Tempo exemplars (stravin-edge).",
       "fieldConfig": {
         "defaults": {
+          "links": [
+            {
+              "targetBlank": true,
+              "title": "Explore Slow Traces in Tempo",
+              "url": "/explore?left=%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7Bresource.service.name%3D%5C%22stravin-edge%5C%22%20%26%26%20duration%3E100ms%7D%22%7D%5D%7D"
+            }
+          ],
           "unit": "s"
         },
         "overrides": []
@@ -98,7 +139,92 @@
           "refId": "C"
         }
       ],
-      "title": "Ingress Latency (p50 / p95 / p99)",
+      "title": "Ingress Latency p50 / p95 / p99 (stravin-edge)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "GitWire RPC request rate and error rate on stravin-node.",
+      "fieldConfig": {
+        "defaults": {
+          "links": [
+            {
+              "targetBlank": true,
+              "title": "Explore Tempo Traces (stravin-node)",
+              "url": "/explore?left=%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7Bresource.service.name%3D%5C%22stravin-node%5C%22%7D%22%7D%5D%7D"
+            },
+            {
+              "targetBlank": true,
+              "title": "Explore Loki Logs (stravin-node)",
+              "url": "/explore?left=%7B%22datasource%22%3A%22loki%22%2C%22queries%22%3A%5B%7B%22expr%22%3A%22%7Bservice_name%3D%5C%22stravin-node%5C%22%7D%22%7D%5D%7D"
+            }
+          ],
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 3,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (status_code) (rate(stravin_node_requests_total[5m]))",
+          "legendFormat": "node {{status_code}} rps",
+          "refId": "A"
+        }
+      ],
+      "title": "Node GitWire RPS & Errors (stravin-node)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "GitWire execution p50/p95/p99 latency on stravin-node with Tempo exemplars.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 4,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "exemplar": true,
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(stravin_node_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50 node",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(stravin_node_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 node",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "exemplar": true,
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(stravin_node_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99 node",
+          "refId": "C"
+        }
+      ],
+      "title": "Node GitWire Latency p50 / p95 / p99 (stravin-node)",
       "type": "timeseries"
     },
     {
@@ -113,8 +239,8 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "id": 3,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "id": 5,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom" },
         "tooltip": { "mode": "multi" }
@@ -133,7 +259,7 @@
           "refId": "B"
         }
       ],
-      "title": "CAS Conflict & Retry Rate",
+      "title": "DynamoDB Ref-CAS Conflicts & Retries",
       "type": "timeseries"
     },
     {
@@ -141,15 +267,15 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Regional S3 Put/Get/Head operation rates and cross-region origin fallback spikes.",
+      "description": "Regional S3 Put/Get/Head operation rates, node pack fetches, and origin fallback spikes.",
       "fieldConfig": {
         "defaults": {
           "unit": "ops"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "id": 4,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "id": 6,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom" },
         "tooltip": { "mode": "multi" }
@@ -163,12 +289,18 @@
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (status_code) (rate(stravin_node_s3_pack_fetches_total[5m]))",
+          "legendFormat": "node s3 pack fetch ({{status_code}})",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum(rate(stravin_s3_origin_fallback_total[5m]))",
           "legendFormat": "origin fallback/s",
-          "refId": "B"
+          "refId": "C"
         }
       ],
-      "title": "S3 Put/Get & Origin-Fallback Rate",
+      "title": "S3 Operations, Pack Fetches & Origin Fallback",
       "type": "timeseries"
     },
     {
@@ -176,15 +308,15 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Tier 1 wazero Wasm hook execution duration and verdicts (allow, reject, timeout, oom).",
+      "description": "Tier 1 wazero Wasm hook execution duration and verdicts on stravin-hook.",
       "fieldConfig": {
         "defaults": {
           "unit": "s"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
-      "id": 5,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "id": 7,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom" },
         "tooltip": { "mode": "multi" }
@@ -211,7 +343,7 @@
           "refId": "C"
         }
       ],
-      "title": "Wasm Hook Duration, Timeouts & Rejections",
+      "title": "Wasm Hook Duration & Verdicts (stravin-hook)",
       "type": "timeseries"
     },
     {
@@ -234,8 +366,8 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
-      "id": 6,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "id": 8,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom" },
         "tooltip": { "mode": "multi" }
@@ -254,7 +386,7 @@
           "refId": "B"
         }
       ],
-      "title": "NVMe Cache Hit Ratio & Tenant Bytes",
+      "title": "NVMe Cache Hit Ratio & Tenant Bytes (stravin-node)",
       "type": "timeseries"
     },
     {
@@ -262,15 +394,15 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "L0 pack backlog, compaction lag, and delayed GC reap rate in stravin-pack.",
+      "description": "L0 pack backlog, compaction cycles, lag, and delayed GC reap rate in stravin-pack.",
       "fieldConfig": {
         "defaults": {
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
-      "id": 7,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "id": 9,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom" },
         "tooltip": { "mode": "multi" }
@@ -290,12 +422,59 @@
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(stravin_pack_compaction_cycles_total[5m]))",
+          "legendFormat": "compaction cycles/s",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum(rate(stravin_pack_gc_reaped_total[5m]))",
           "legendFormat": "gc reaped/s",
+          "refId": "D"
+        }
+      ],
+      "title": "Compaction Lag & GC (stravin-pack)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Control plane lease renewals, scrub runs, and orphaned-pack recovery runs on stravin-ctrl.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "id": 10,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(stravin_ctrl_lease_renewals_total[5m]))",
+          "legendFormat": "lease renewals/s",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(stravin_ctrl_scrub_runs_total[5m]))",
+          "legendFormat": "scrub runs/s",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(stravin_ctrl_recovery_runs_total[5m]))",
+          "legendFormat": "recovery runs/s",
           "refId": "C"
         }
       ],
-      "title": "Compaction Lag (stravin-pack)",
+      "title": "Control Plane Leases, Scrub & Recovery (stravin-ctrl)",
       "type": "timeseries"
     },
     {
@@ -310,8 +489,8 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
-      "id": 8,
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 40 },
+      "id": 11,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom" },
         "tooltip": { "mode": "multi" }
@@ -330,13 +509,41 @@
           "refId": "B"
         }
       ],
-      "title": "Telemetry Dropped",
+      "title": "Telemetry Pipeline Health (Dropped Items)",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "description": "Live structured OTLP logs from all Stravin Core daemons with direct trace_id links to Tempo.",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 48 },
+      "id": 12,
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": true,
+        "showCommonLabels": false,
+        "showLabels": true,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "{service_name=~\"stravin-.*\"}",
+          "refId": "A"
+        }
+      ],
+      "title": "Stravin Core Logs (Loki -> Tempo Trace Links)",
+      "type": "logs"
     }
   ],
   "refresh": "10s",
   "schemaVersion": 39,
-  "tags": ["stravin", "golden-signals", "otel"],
+  "tags": ["stravin", "core", "golden-signals", "otel"],
   "templating": {
     "list": []
   },
@@ -346,7 +553,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Stravin Core — Golden Signals",
-  "uid": "stravin-golden-signals",
+  "title": "Stravin Core",
+  "uid": "stravin-core",
   "version": 1
 }
