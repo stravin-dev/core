@@ -30,6 +30,18 @@ func TestClassifyError(t *testing.T) {
 			want: ErrorRetryableConflict,
 		},
 		{
+			name: "stravin-node ref CAS conflict on shared branch is retryable conflict",
+			err:  &GitError{Op: "push", ExitCode: 1, Stderr: "! [remote rejected] HEAD -> main (ref CAS conflict)"},
+			opts: ClassifyOptions{ExclusiveBranch: false},
+			want: ErrorRetryableConflict,
+		},
+		{
+			name: "stravin-node ref CAS conflict on exclusive branch is unexpected",
+			err:  &GitError{Op: "push", ExitCode: 1, Stderr: "! [remote rejected] HEAD -> feat/exclusive (ref CAS conflict)"},
+			opts: ClassifyOptions{ExclusiveBranch: true},
+			want: ErrorUnexpected,
+		},
+		{
 			name: "non-fast-forward on exclusive branch is unexpected",
 			err:  &GitError{Op: "push", ExitCode: 1, Stderr: "! [rejected] agent-1/feat -> agent-1/feat (non-fast-forward)"},
 			opts: ClassifyOptions{ExclusiveBranch: true},
@@ -53,6 +65,21 @@ func TestClassifyError(t *testing.T) {
 		{
 			name: "remote end hung up unexpectedly is retryable transient",
 			err:  &GitError{Op: "fetch", ExitCode: 128, Stderr: "fatal: the remote end hung up unexpectedly\nfatal: early EOF"},
+			want: ErrorRetryableTransient,
+		},
+		{
+			name: "curl empty reply from server under toxiproxy reset_peer is retryable transient",
+			err:  &GitError{Op: "clone", ExitCode: 128, Stderr: "fatal: unable to access 'http://127.0.0.1:18080/local/repo.git/': Empty reply from server"},
+			want: ErrorRetryableTransient,
+		},
+		{
+			name: "ssh kex exchange drop under toxiproxy reset_peer is retryable transient",
+			err:  &GitError{Op: "clone", ExitCode: 128, Stderr: "kex_exchange_identification: Connection closed by remote host"},
+			want: ErrorRetryableTransient,
+		},
+		{
+			name: "git unexpected disconnect on sideband packet is retryable transient",
+			err:  &GitError{Op: "fetch", ExitCode: 128, Stderr: "fatal: unexpected disconnect while reading sideband packet"},
 			want: ErrorRetryableTransient,
 		},
 		{
@@ -90,6 +117,12 @@ func TestClassifyError(t *testing.T) {
 		{
 			name: "expected invalid refspec reject is expected reject",
 			err:  &GitError{Op: "push", ExitCode: 128, Stderr: "fatal: invalid refspec 'HEAD:refs/heads/bad..ref'"},
+			opts: ClassifyOptions{ExpectReject: true},
+			want: ErrorExpectedReject,
+		},
+		{
+			name: "expected colon-containing invalid refspec reject is expected reject",
+			err:  &GitError{Op: "push", ExitCode: 1, Stderr: "error: src refspec HEAD:refs/heads/bad does not match any"},
 			opts: ClassifyOptions{ExpectReject: true},
 			want: ErrorExpectedReject,
 		},

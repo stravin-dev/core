@@ -74,7 +74,72 @@ Enable the optional OpenTelemetry observability profile:
 docker compose --profile telemetry up -d
 ```
 
-Open Grafana at [http://localhost:3000](http://localhost:3000) (anonymous Admin access enabled for local dev) with pre-provisioned Prometheus, Loki, and Tempo datasources.
+Open Grafana at [http://localhost:3000](http://localhost:3000) (anonymous Admin access enabled for local dev) with pre-provisioned Prometheus, Loki, and Tempo datasources and cross-linked dashboards:
+
+- **Stravin Core** (`stravin-core`): Edge Git HTTP/SSH RPS & latency, gRPC throughput, Node pack cache hit ratio, S3/DynamoDB latency, and Wasm hook evaluation metrics with Prometheus exemplars -> Tempo traces -> Loki logs links.
+- **Stravin Load Tester** (`stravin-loadgen`): Active dev/agent threads, scenario throughput & latency, retryable conflict/transient counts, unexpected errors, and `git fsck` failures with direct trace-ID cross-links to Tempo and Loki.
+
+## Load & Chaos Testing (Local)
+
+Stravin Core includes a standalone multi-persona Git load generator (`stravin-loadgen`), a Toxiproxy fault injector (`stravin-chaos`), and a local chaos Compose stack (`docker-compose.chaos.yml`) to prove correctness under concurrent load and network faults. Load and chaos verification is local-only (not run in GitHub Actions).
+
+### Quick Commands
+
+```bash
+# Build the standalone load generator and chaos nemesis binaries
+make build-loadgen
+make build-chaos
+
+# Boot the Toxiproxy + Floci + Stravin Core chaos stack (add TELEMETRY=1 for Grafana/OTel)
+make chaos-up
+make chaos-up TELEMETRY=1
+
+# Run stravin-loadgen against the local stack (configurable DEVS, AGENTS, DURATION, HTTP_URL, AUTH_TOKEN, etc.)
+make load-test DEVS=4 AGENTS=6 DURATION=60s HTTP_URL=http://127.0.0.1:18080
+
+# Tear down the chaos stack and telemetry containers/volumes
+make chaos-down
+
+# Run the automated local Load + Chaos E2E suite (with SIGINT Ctrl+C cleanup verification)
+make chaos-e2e
+```
+
+### `stravin-loadgen` CLI & 22 Dev/Agent Scenarios
+
+`stravin-loadgen` simulates parallel developer (`--devs`) and AI agent (`--agents`) Git workers using deterministic seeded entropy (`--seed`), client-side `git fsck --full --strict` and SHA verification, and guaranteed OpenTelemetry flush on `SIGINT` / Ctrl+C (`--flush-timeout`, default `10s`):
+
+```bash
+./bin/stravin-loadgen \
+  --devs 4 --agents 6 \
+  --duration 0 \
+  --seed 42 \
+  --http-url http://127.0.0.1:18080 \
+  --ssh-addr 127.0.0.1:12222 \
+  --ssh-key /path/to/id_ed25519 \
+  --tenant local --repos loadgen-1,loadgen-2,loadgen-3 \
+  --auth-token dev:stravin-local-dev-token \
+  --scenarios ""
+```
+
+Key flags: `--devs`, `--agents`, `--duration` (`0` = continuous until Ctrl+C), `--seed`, `--scenarios` (comma-separated filter; empty runs all 22), `--http-url`, `--ssh-addr`, `--ssh-key`, `--auth-token`, `--otel-endpoint`, `--flush-timeout`, `--max-retries`, `--fail-fast`.
+
+Registered scenarios (22 total):
+- **Developer (11)**: `dev_clone_and_read`, `dev_feature_branch_pr`, `dev_incremental_thin_pack`, `dev_rebase_and_force_push`, `dev_concurrent_main_push_retry`, `dev_tag_and_release`, `dev_large_binary_asset`, `dev_branch_cleanup_cycle`, `dev_shallow_clone_unshallow`, `dev_ssh_full_lifecycle`, `dev_noop_empty_push_and_fetch`.
+- **AI Agent (11)**: `agent_rapid_checkpoint_burst`, `agent_parallel_branch_fanout`, `agent_shared_branch_race`, `agent_deep_tree_refactor`, `agent_orphan_branch_artifact`, `agent_merge_commit_diamond`, `agent_cherry_pick_backport`, `agent_wasm_hook_allow_and_reject`, `agent_high_churn_compaction_trigger`, `agent_protocol_switch_http_ssh`, `agent_corrupt_ref_negative_test`.
+
+### `stravin-chaos` & `docker-compose.chaos.yml`
+
+`docker-compose.chaos.yml` routes Git and backend traffic through [Toxiproxy](https://github.com/Shopify/toxiproxy):
+- `127.0.0.1:8474`: Toxiproxy HTTP admin API
+- `127.0.0.1:18080` -> `stravin-edge:8080` (`edge_http` Smart HTTP proxy)
+- `127.0.0.1:12222` -> `stravin-edge:2222` (`edge_ssh` Git SSH proxy)
+- Internal proxies: `edge_to_node_grpc` (`:19090`) and `node_to_floci` (`:14566`)
+
+`stravin-chaos` injects seeded `latency`, `bandwidth`, `reset_peer`, `timeout`, and `slow_close` toxics (plus optional `--enable-restarts` on Stravin daemons, never `floci`) and automatically clears all active toxics on `SIGINT`/`SIGTERM` exit:
+
+```bash
+./bin/stravin-chaos --toxiproxy-url http://127.0.0.1:8474 --seed 42 --interval 5s --fault-duration 3s
+```
 
 ## Multi-Region Local Testing (Dual Floci)
 
