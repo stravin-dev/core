@@ -1,0 +1,93 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: detect-aws-credentials
+        args: ["--allow-missing-credentials"]
+      - id: detect-private-key
+
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt
+        language: system
+        types: [go]
+        pass_filenames: false
+        entry: >-
+          bash -ec 'if command -v gofmt >/dev/null 2>&1 && [ "${STRAVIN_FORCE_DOCKER_GO:-0}" != "1" ]; then
+          out="$(gofmt -l .)";
+          else
+          out="$(docker run --rm -v "$PWD:/workspace" -w /workspace "${STRAVIN_GO_IMAGE:-golang:1.24-bookworm}" gofmt -l .)";
+          fi;
+          if [ -n "$out" ]; then
+          echo "Unformatted Go files:";
+          echo "$out";
+          exit 1;
+          fi'
+
+      - id: goimports
+        name: goimports (golangci-lint fmt)
+        language: system
+        types: [go]
+        pass_filenames: false
+        entry: >-
+          bash -ec 'if command -v golangci-lint >/dev/null 2>&1 && [ "${STRAVIN_FORCE_DOCKER_GO:-0}" != "1" ]; then
+          out="$(golangci-lint fmt --diff)";
+          else
+          out="$(docker run --rm
+          -v "$PWD:/workspace"
+          -v "${STRAVIN_GO_MOD_VOLUME:-stravin-go-mod-cache}:/go/pkg/mod"
+          -v "${STRAVIN_GO_BUILD_VOLUME:-stravin-go-build-cache}:/root/.cache/go-build"
+          -v "${STRAVIN_GOLANGCI_CACHE_VOLUME:-stravin-golangci-lint-cache}:/root/.cache/golangci-lint"
+          -w /workspace
+          -e GOMODCACHE=/go/pkg/mod
+          -e GOCACHE=/root/.cache/go-build
+          -e GOLANGCI_LINT_CACHE=/root/.cache/golangci-lint
+          "${STRAVIN_GOLANGCI_IMAGE:-golangci/golangci-lint:v2.15.0}"
+          golangci-lint fmt --diff)";
+          fi;
+          if [ -n "$out" ]; then
+          echo "$out";
+          exit 1;
+          fi'
+
+      - id: go-vet
+        name: go vet
+        language: system
+        types: [go]
+        pass_filenames: false
+        entry: ./scripts/go.sh vet ./...
+
+      - id: golangci-lint
+        name: golangci-lint
+        language: system
+        types: [go]
+        pass_filenames: false
+        entry: >-
+          bash -ec 'if command -v golangci-lint >/dev/null 2>&1 && [ "${STRAVIN_FORCE_DOCKER_GO:-0}" != "1" ]; then
+          exec golangci-lint run ./...;
+          else
+          exec docker run --rm
+          -v "$PWD:/workspace"
+          -v "${STRAVIN_GO_MOD_VOLUME:-stravin-go-mod-cache}:/go/pkg/mod"
+          -v "${STRAVIN_GO_BUILD_VOLUME:-stravin-go-build-cache}:/root/.cache/go-build"
+          -v "${STRAVIN_GOLANGCI_CACHE_VOLUME:-stravin-golangci-lint-cache}:/root/.cache/golangci-lint"
+          -w /workspace
+          -e GOMODCACHE=/go/pkg/mod
+          -e GOCACHE=/root/.cache/go-build
+          -e GOLANGCI_LINT_CACHE=/root/.cache/golangci-lint
+          "${STRAVIN_GOLANGCI_IMAGE:-golangci/golangci-lint:v2.15.0}"
+          golangci-lint run ./...;
+          fi'
+
+      - id: go-mod-tidy
+        name: go mod tidy
+        language: system
+        files: '(^go\.(mod|sum)$|\.go$)'
+        pass_filenames: false
+        entry: ./scripts/go.sh mod tidy -diff
