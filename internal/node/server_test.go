@@ -336,7 +336,8 @@ func TestServer_UploadPackRealGitRoundTripOverBufconn(t *testing.T) {
 			if frame.ExitCode != 0 {
 				t.Fatalf("git-upload-pack exit code = %d, stderr=%q", frame.ExitCode, frame.ErrMessage)
 			}
-			break
+			// Continue reading until gRPC io.EOF so the server handler returns
+			// and runs defer execSpan.End() before we inspect exported spans.
 		}
 	}
 
