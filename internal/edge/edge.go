@@ -25,7 +25,7 @@ const defaultShutdownTimeout = 10 * time.Second
 type ServerConfig struct {
 	SSHAddr         string
 	HTTPAddr        string
-	HealthAddr      string // Optional dedicated /healthz & /metrics listener (e.g. ":8081").
+	HealthAddr      string // Optional dedicated /healthz listener (e.g. ":8081").
 	ShutdownTimeout time.Duration
 	HostKey         ssh.Signer
 	Authenticator   Authenticator
@@ -37,7 +37,7 @@ type ServerConfig struct {
 	Logger          *slog.Logger
 }
 
-// Server coordinates the SSH, Smart HTTP, and optional dedicated health/metrics listeners.
+// Server coordinates the SSH, Smart HTTP, and optional dedicated health listeners.
 type Server struct {
 	cfg         ServerConfig
 	metrics     *Metrics
@@ -111,7 +111,6 @@ func (s *Server) Run(ctx context.Context) error {
 				"service": "stravin-edge",
 			})
 		})
-		mux.Handle("/metrics", s.metrics)
 		healthSrv = NewHTTPServer(s.cfg.HealthAddr, mux)
 	}
 

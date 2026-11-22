@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 
@@ -301,13 +302,50 @@ func TestHTTPHandler_SmartHTTPEndpointsAndTracing(t *testing.T) {
 		t.Fatalf("unexpected receive-pack Content-Type: %q", ct)
 	}
 
-	// 4. Verify OTel spans and /healthz + /metrics
+	// 4. Verify OTel spans, OTel metrics (bounded cardinality), /healthz, and /metrics disabled
 	spans := env.tel.SpanExporter.GetSpans()
 	if len(spans) < 3 {
 		t.Fatalf("expected at least 3 edge.ingress spans, got %d", len(spans))
 	}
 	if spans[0].Name != "edge.ingress" {
 		t.Fatalf("expected root span edge.ingress, got %q", spans[0].Name)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := env.tel.MetricReader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect OTel metrics: %v", err)
+	}
+	var sawReqTotal, sawReqDur bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			switch m.Name {
+			case "stravin_edge_requests_total":
+				sawReqTotal = true
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				if !ok || len(sum.DataPoints) == 0 {
+					t.Fatalf("expected non-empty int64 sum for stravin_edge_requests_total, got %T", m.Data)
+				}
+				for _, dp := range sum.DataPoints {
+					if dp.Attributes.HasValue("tenant_id") || dp.Attributes.HasValue("repo_id") {
+						t.Fatalf("high-cardinality labels leaked into OTel counter: %v", dp.Attributes)
+					}
+				}
+			case "stravin_edge_request_duration_seconds":
+				sawReqDur = true
+				hist, ok := m.Data.(metricdata.Histogram[float64])
+				if !ok || len(hist.DataPoints) == 0 {
+					t.Fatalf("expected non-empty float64 histogram for stravin_edge_request_duration_seconds, got %T", m.Data)
+				}
+				for _, dp := range hist.DataPoints {
+					if dp.Attributes.HasValue("tenant_id") || dp.Attributes.HasValue("repo_id") {
+						t.Fatalf("high-cardinality labels leaked into OTel histogram: %v", dp.Attributes)
+					}
+				}
+			}
+		}
+	}
+	if !sawReqTotal || !sawReqDur {
+		t.Fatalf("expected OTel metrics stravin_edge_requests_total (%v) and stravin_edge_request_duration_seconds (%v)", sawReqTotal, sawReqDur)
 	}
 
 	healthRec := httptest.NewRecorder()
@@ -318,11 +356,11 @@ func TestHTTPHandler_SmartHTTPEndpointsAndTracing(t *testing.T) {
 
 	metricsRec := httptest.NewRecorder()
 	env.handler.ServeHTTP(metricsRec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	if metricsRec.Code != http.StatusOK || !strings.Contains(metricsRec.Body.String(), "stravin_edge_requests_total") {
-		t.Fatalf("unexpected /metrics response: status=%d body=%q", metricsRec.Code, metricsRec.Body.String())
+	if metricsRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for /metrics on public HTTPHandler, got status=%d body=%q", metricsRec.Code, metricsRec.Body.String())
 	}
-	if strings.Contains(metricsRec.Body.String(), "tenant_id") || strings.Contains(metricsRec.Body.String(), "repo_id") {
-		t.Fatalf("high-cardinality labels leaked into /metrics: %s", metricsRec.Body.String())
+	if strings.Contains(metricsRec.Body.String(), "stravin_edge_requests_total") {
+		t.Fatalf("metrics leaked in 404 body: %q", metricsRec.Body.String())
 	}
 }
 

@@ -27,7 +27,7 @@ const (
 	headerStatelessRPC  = "x-stravin-stateless-rpc"
 )
 
-// HTTPHandler serves Git Smart HTTP endpoints alongside /healthz and /metrics.
+// HTTPHandler serves Git Smart HTTP endpoints alongside /healthz.
 type HTTPHandler struct {
 	auth     Authenticator
 	limiter  Limiter
@@ -81,14 +81,10 @@ func NewHTTPHandler(
 	}, nil
 }
 
-// ServeHTTP dispatches /healthz, /metrics, and Smart HTTP Git endpoints.
+// ServeHTTP dispatches /healthz and Smart HTTP Git endpoints.
 func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	switch r.URL.Path {
-	case "/healthz":
+	if r.URL.Path == "/healthz" {
 		h.serveHealthz(w, r)
-		return
-	case "/metrics":
-		h.metrics.ServeHTTP(w, r)
 		return
 	}
 
