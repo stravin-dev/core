@@ -1,0 +1,321 @@
+services:
+  floci:
+    # Floci publishes official multi-arch images to Docker Hub (floci/floci) and
+    # Amazon ECR Public (public.ecr.aws/floci/floci), not GHCR.
+    image: floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
+    ports:
+      - "4566:4566"
+    environment:
+      FLOCI_SERVICES: "s3,dynamodb,dynamodbstreams,kms"
+      FLOCI_DEFAULT_REGION: "us-east-1"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - stravin-net
+
+  floci-init:
+    image: amazon/aws-cli:latest@sha256:b0102d2269f87d8531d931c1a59e248101ace586886e6c077058d94c1c37b846
+    depends_on:
+      floci:
+        condition: service_healthy
+    environment:
+      AWS_ENDPOINT_URL: "http://floci:4566"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      AWS_DEFAULT_REGION: "us-east-1"
+      AWS_PAGER: ""
+      STRAVIN_S3_BUCKET: "git-objects-us-east-1"
+      STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_KMS_ALIAS: "alias/stravin-local-dev"
+      STRAVIN_DEFAULT_TENANT: "local"
+      STRAVIN_DEFAULT_REPO: "demo"
+    entrypoint: ["/bin/sh", "/scripts/bootstrap-floci.sh"]
+    volumes:
+      - ./scripts/bootstrap-floci.sh:/scripts/bootstrap-floci.sh:ro
+    restart: "no"
+    networks:
+      - stravin-net
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    command:
+      - "-host=0.0.0.0"
+      - "-config=/etc/toxiproxy/toxiproxy.json"
+    depends_on:
+      floci:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8474:8474" # Toxiproxy HTTP admin API
+      - "18080:18080" # Proxied Git Smart HTTP -> stravin-edge:8080
+      - "12222:12222" # Proxied Git SSH -> stravin-edge:2222
+    volumes:
+      - ./deploy/local/toxiproxy.json:/etc/toxiproxy/toxiproxy.json:ro
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - stravin-net
+
+  stravin-edge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: edge
+    depends_on:
+      floci-init:
+        condition: service_completed_successfully
+      toxiproxy:
+        condition: service_healthy
+      stravin-node:
+        condition: service_healthy
+      stravin-ctrl:
+        condition: service_healthy
+    ports:
+      - "2222:2222" # Direct Git SSH (use 12222 for proxied chaos traffic)
+      - "8080:8080" # Direct Git Smart HTTP (use 18080 for proxied chaos traffic)
+    environment:
+      STRAVIN_REGION: "us-east-1"
+      STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_NODE_PEERS: "toxiproxy:19090"
+      STRAVIN_INTERNAL_GRPC_TOKEN: "${STRAVIN_INTERNAL_GRPC_TOKEN:-stravin-local-internal-grpc-token}"
+      STRAVIN_GRPC_ALLOW_INSECURE: "${STRAVIN_GRPC_ALLOW_INSECURE:-true}"
+      STRAVIN_AUTH_TOKENS: "${STRAVIN_AUTH_TOKENS:-local:dev:stravin-local-dev-token}"
+      STRAVIN_SSH_AUTHORIZED_KEYS: "${STRAVIN_SSH_AUTHORIZED_KEYS:-}"
+      STRAVIN_META_CACHE_TTL: "${STRAVIN_META_CACHE_TTL:-1s}"
+      AWS_ENDPOINT_URL: "http://floci:4566"
+      AWS_REGION: "us-east-1"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - stravin-net
+
+  stravin-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: node
+    depends_on:
+      floci-init:
+        condition: service_completed_successfully
+      toxiproxy:
+        condition: service_healthy
+      stravin-ctrl:
+        condition: service_healthy
+    ports:
+      - "8081:8081" # Health & metrics
+    environment:
+      STRAVIN_REGION: "us-east-1"
+      STRAVIN_S3_BUCKET: "git-objects-us-east-1"
+      STRAVIN_S3_FORCE_PATH_STYLE: "true"
+      STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_KMS_KEY_ID: "alias/stravin-local-dev"
+      STRAVIN_INTERNAL_GRPC_TOKEN: "${STRAVIN_INTERNAL_GRPC_TOKEN:-stravin-local-internal-grpc-token}"
+      STRAVIN_GRPC_ALLOW_INSECURE: "${STRAVIN_GRPC_ALLOW_INSECURE:-true}"
+      STRAVIN_LEASE_REFRESH_INTERVAL: "${STRAVIN_LEASE_REFRESH_INTERVAL:-1s}"
+      AWS_ENDPOINT_URL: "http://toxiproxy:14566"
+      AWS_REGION: "us-east-1"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    volumes:
+      - node-nvme-cache:/var/lib/stravin/cache
+    networks:
+      - stravin-net
+
+  stravin-pack:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: pack
+    depends_on:
+      floci-init:
+        condition: service_completed_successfully
+    ports:
+      - "8082:8082" # Health
+    environment:
+      STRAVIN_REGION: "us-east-1"
+      STRAVIN_S3_BUCKET: "git-objects-us-east-1"
+      STRAVIN_S3_FORCE_PATH_STYLE: "true"
+      STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_KMS_KEY_ID: "alias/stravin-local-dev"
+      STRAVIN_PACK_REPOS: "${STRAVIN_PACK_REPOS:-local/demo}"
+      STRAVIN_PACK_POLL_INTERVAL: "${STRAVIN_PACK_POLL_INTERVAL:-2s}"
+      STRAVIN_PACK_GC_INTERVAL: "${STRAVIN_PACK_GC_INTERVAL:-5m}"
+      STRAVIN_PACK_GC_GRACE: "${STRAVIN_PACK_GC_GRACE:-24h}"
+      AWS_ENDPOINT_URL: "http://floci:4566"
+      AWS_REGION: "us-east-1"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8082/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - stravin-net
+
+  stravin-ctrl:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ctrl
+    depends_on:
+      floci-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8083:8083" # Control plane admin API & health
+    environment:
+      STRAVIN_REGION: "us-east-1"
+      STRAVIN_S3_BUCKET: "git-objects-us-east-1"
+      STRAVIN_S3_FORCE_PATH_STYLE: "true"
+      STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_KMS_KEY_ID: "alias/stravin-local-dev"
+      STRAVIN_CTRL_LISTEN_ADDR: ":8083"
+      STRAVIN_CTRL_ADMIN_TOKEN: "${STRAVIN_CTRL_ADMIN_TOKEN:-stravin-local-ctrl-admin-token}"
+      STRAVIN_CTRL_LEASE_TTL: "${STRAVIN_CTRL_LEASE_TTL:-15s}"
+      STRAVIN_CTRL_HEARTBEAT_INTERVAL: "${STRAVIN_CTRL_HEARTBEAT_INTERVAL:-2s}"
+      AWS_ENDPOINT_URL: "http://floci:4566"
+      AWS_REGION: "us-east-1"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8083/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - stravin-net
+
+  stravin-hook:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: hook
+    depends_on:
+      floci-init:
+        condition: service_completed_successfully
+    ports:
+      - "8084:8084" # Health
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      STRAVIN_REGION: "us-east-1"
+      STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_KMS_KEY_ID: "alias/stravin-local-dev"
+      STRAVIN_HOOK_POLL_INTERVAL: "${STRAVIN_HOOK_POLL_INTERVAL:-250ms}"
+      STRAVIN_WEBHOOK_ALLOW_PRIVATE_NETWORKS: "${STRAVIN_WEBHOOK_ALLOW_PRIVATE_NETWORKS:-true}"
+      AWS_ENDPOINT_URL: "http://floci:4566"
+      AWS_REGION: "us-east-1"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8084/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - stravin-net
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    profiles: ["telemetry"]
+    ports:
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+    volumes:
+      - ./deploy/local/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    networks:
+      - stravin-net
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    profiles: ["telemetry"]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-otlp-receiver"
+      - "--enable-feature=exemplar-storage"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/local/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - stravin-net
+
+  loki:
+    image: grafana/loki:3.4.2
+    profiles: ["telemetry"]
+    command:
+      - "-config.file=/etc/loki/local-config.yaml"
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./deploy/local/loki.yaml:/etc/loki/local-config.yaml:ro
+    networks:
+      - stravin-net
+
+  tempo:
+    image: grafana/tempo:2.7.1
+    profiles: ["telemetry"]
+    command:
+      - "-config.file=/etc/tempo.yaml"
+    ports:
+      - "3200:3200"
+    volumes:
+      - ./deploy/local/tempo.yaml:/etc/tempo.yaml:ro
+    networks:
+      - stravin-net
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    profiles: ["telemetry"]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./deploy/local/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    networks:
+      - stravin-net
+
+volumes:
+  node-nvme-cache:
+
+networks:
+  stravin-net:
+    driver: bridge

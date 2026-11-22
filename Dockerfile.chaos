@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+
+FROM golang:1.24-alpine AS builder
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY cmd ./cmd
+COPY internal ./internal
+
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-chaos ./cmd/stravin-chaos
+
+FROM alpine:3.21 AS runtime
+RUN apk add --no-cache ca-certificates \
+ && addgroup -S stravin \
+ && adduser -S -G stravin stravin
+
+COPY --from=builder /out/stravin-chaos /usr/local/bin/stravin-chaos
+USER stravin
+ENTRYPOINT ["/usr/local/bin/stravin-chaos"]

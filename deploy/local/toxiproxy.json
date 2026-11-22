@@ -1,0 +1,26 @@
+[
+  {
+    "name": "edge_http",
+    "listen": "0.0.0.0:18080",
+    "upstream": "stravin-edge:8080",
+    "enabled": true
+  },
+  {
+    "name": "edge_ssh",
+    "listen": "0.0.0.0:12222",
+    "upstream": "stravin-edge:2222",
+    "enabled": true
+  },
+  {
+    "name": "edge_to_node_grpc",
+    "listen": "0.0.0.0:19090",
+    "upstream": "stravin-node:9090",
+    "enabled": true
+  },
+  {
+    "name": "node_to_floci",
+    "listen": "0.0.0.0:14566",
+    "upstream": "floci:4566",
+    "enabled": true
+  }
+]
