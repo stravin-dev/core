@@ -28,7 +28,7 @@ import (
 
 const (
 	serviceName            = "stravin-ctrl"
-	defaultListenAddr      = ":8083"
+	defaultListenAddr      = "127.0.0.1:8083"
 	defaultRegion          = "us-east-1"
 	defaultDDBTable        = "stravin-core"
 	defaultS3BucketPrefix  = "git-objects-"
@@ -37,6 +37,7 @@ const (
 
 type ctrlConfig struct {
 	ListenAddr        string
+	AdminToken        string
 	Region            string
 	AWSEndpoint       string
 	DDBTable          string
@@ -57,10 +58,11 @@ func loadConfig() ctrlConfig {
 	}
 	defaultHolderID := fmt.Sprintf("%s-%s-%d", serviceName, hostname, os.Getpid())
 
-	listenAddr := envOrDefault("STRAVIN_CTRL_ADDR", daemon.ListenAddrFromEnv(defaultListenAddr))
+	listenAddr := envOrDefault("STRAVIN_CTRL_ADDR", envOrDefault("STRAVIN_CTRL_LISTEN_ADDR", daemon.ListenAddrFromEnv(defaultListenAddr)))
 
 	return ctrlConfig{
 		ListenAddr:        listenAddr,
+		AdminToken:        strings.TrimSpace(os.Getenv("STRAVIN_CTRL_ADMIN_TOKEN")),
 		Region:            region,
 		AWSEndpoint:       strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL")),
 		DDBTable:          envOrDefault("STRAVIN_DDB_TABLE", defaultDDBTable),
@@ -121,6 +123,10 @@ func envInt(key string, fallback int) int {
 }
 
 func run(ctx context.Context, cfg ctrlConfig) error {
+	if strings.TrimSpace(cfg.AdminToken) == "" {
+		return errors.New("STRAVIN_CTRL_ADMIN_TOKEN is required")
+	}
+
 	telProvider, err := telemetry.Init(ctx, telemetry.Config{
 		ServiceName: serviceName,
 		Region:      cfg.Region,
@@ -199,6 +205,7 @@ func run(ctx context.Context, cfg ctrlConfig) error {
 		ServiceName: serviceName,
 		Leases:      leaseMgr,
 		Scrubber:    scrubber,
+		AdminToken:  cfg.AdminToken,
 	})
 	if err != nil {
 		return fmt.Errorf("init http handler: %w", err)

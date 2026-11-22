@@ -26,19 +26,20 @@ import (
 )
 
 type stackEnv struct {
-	awsEndpoint string
-	region      string
-	ddbTable    string
-	s3Bucket    string
-	kmsKeyID    string
-	edgeHTTPURL string
-	edgeSSHAddr string
-	packURL     string
-	ctrlURL     string
-	hookURL     string
-	authToken   string
-	sshKeyPath  string
-	webhookHost string
+	awsEndpoint    string
+	region         string
+	ddbTable       string
+	s3Bucket       string
+	kmsKeyID       string
+	edgeHTTPURL    string
+	edgeSSHAddr    string
+	packURL        string
+	ctrlURL        string
+	ctrlAdminToken string
+	hookURL        string
+	authToken      string
+	sshKeyPath     string
+	webhookHost    string
 
 	ddbClient *dynamodb.Client
 	ddbRepo   *ddb.Repository
@@ -97,24 +98,25 @@ func newStackEnv(t *testing.T) *stackEnv {
 	}
 
 	return &stackEnv{
-		awsEndpoint: endpoint,
-		region:      region,
-		ddbTable:    table,
-		s3Bucket:    bucket,
-		kmsKeyID:    kmsKeyID,
-		edgeHTTPURL: strings.TrimRight(envOrDefault("STRAVIN_EDGE_HTTP_URL", "http://127.0.0.1:8080"), "/"),
-		edgeSSHAddr: envOrDefault("STRAVIN_EDGE_SSH_ADDR", "127.0.0.1:2222"),
-		packURL:     strings.TrimRight(envOrDefault("STRAVIN_PACK_URL", "http://127.0.0.1:8082"), "/"),
-		ctrlURL:     strings.TrimRight(envOrDefault("STRAVIN_CTRL_URL", "http://127.0.0.1:8083"), "/"),
-		hookURL:     strings.TrimRight(envOrDefault("STRAVIN_HOOK_URL", "http://127.0.0.1:8084"), "/"),
-		authToken:   envOrDefault("STRAVIN_E2E_TOKEN", "stravin-local-dev-token"),
-		sshKeyPath:  strings.TrimSpace(os.Getenv("STRAVIN_E2E_SSH_KEY")),
-		webhookHost: envOrDefault("STRAVIN_E2E_WEBHOOK_HOST", "host.docker.internal"),
-		ddbClient:   ddbClient,
-		ddbRepo:     ddbRepo,
-		s3Store:     s3Store,
-		cipher:      cipher,
-		adminSvc:    adminSvc,
+		awsEndpoint:    endpoint,
+		region:         region,
+		ddbTable:       table,
+		s3Bucket:       bucket,
+		kmsKeyID:       kmsKeyID,
+		edgeHTTPURL:    strings.TrimRight(envOrDefault("STRAVIN_EDGE_HTTP_URL", "http://127.0.0.1:8080"), "/"),
+		edgeSSHAddr:    envOrDefault("STRAVIN_EDGE_SSH_ADDR", "127.0.0.1:2222"),
+		packURL:        strings.TrimRight(envOrDefault("STRAVIN_PACK_URL", "http://127.0.0.1:8082"), "/"),
+		ctrlURL:        strings.TrimRight(envOrDefault("STRAVIN_CTRL_URL", "http://127.0.0.1:8083"), "/"),
+		ctrlAdminToken: envOrDefault("STRAVIN_CTRL_ADMIN_TOKEN", "stravin-local-ctrl-admin-token"),
+		hookURL:        strings.TrimRight(envOrDefault("STRAVIN_HOOK_URL", "http://127.0.0.1:8084"), "/"),
+		authToken:      envOrDefault("STRAVIN_E2E_TOKEN", "stravin-local-dev-token"),
+		sshKeyPath:     strings.TrimSpace(os.Getenv("STRAVIN_E2E_SSH_KEY")),
+		webhookHost:    envOrDefault("STRAVIN_E2E_WEBHOOK_HOST", "host.docker.internal"),
+		ddbClient:      ddbClient,
+		ddbRepo:        ddbRepo,
+		s3Store:        s3Store,
+		cipher:         cipher,
+		adminSvc:       adminSvc,
 	}
 }
 
@@ -138,6 +140,29 @@ func (e *stackEnv) checkHealthz(t *testing.T, baseURL string) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET %s/healthz status = %d, want 200", baseURL, resp.StatusCode)
 	}
+}
+
+func (e *stackEnv) doCtrlRequest(t *testing.T, client *http.Client, method, path string, body []byte) *http.Response {
+	t.Helper()
+	var bodyReader *bytes.Reader
+	if body != nil {
+		bodyReader = bytes.NewReader(body)
+	} else {
+		bodyReader = bytes.NewReader(nil)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), method, e.ctrlURL+path, bodyReader)
+	if err != nil {
+		t.Fatalf("NewRequest %s %s: %v", method, path, err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Authorization", "Bearer "+e.ctrlAdminToken)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	return resp
 }
 
 func runGit(t *testing.T, dir string, extraEnv []string, args ...string) (string, error) {

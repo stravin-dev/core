@@ -184,12 +184,14 @@ services:
       floci-init-a:
         condition: service_completed_successfully
     ports:
-      - "8083:8083"
+      - "127.0.0.1:8083:8083"
     environment:
       STRAVIN_REGION: "us-east-1"
       STRAVIN_S3_BUCKET: "git-objects-us-east-1"
       STRAVIN_S3_FORCE_PATH_STYLE: "true"
       STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_CTRL_LISTEN_ADDR: ":8083"
+      STRAVIN_CTRL_ADMIN_TOKEN: "${STRAVIN_CTRL_ADMIN_TOKEN:-stravin-local-ctrl-admin-token}"
       STRAVIN_CTRL_LEASE_TTL: "${STRAVIN_CTRL_LEASE_TTL:-15s}"
       STRAVIN_CTRL_HEARTBEAT_INTERVAL: "${STRAVIN_CTRL_HEARTBEAT_INTERVAL:-2s}"
       AWS_ENDPOINT_URL: "http://floci-region-a:4566"
@@ -283,12 +285,14 @@ services:
       floci-init-b:
         condition: service_completed_successfully
     ports:
-      - "8085:8083"
+      - "127.0.0.1:8085:8083"
     environment:
       STRAVIN_REGION: "us-west-2"
       STRAVIN_S3_BUCKET: "git-objects-us-west-2"
       STRAVIN_S3_FORCE_PATH_STYLE: "true"
       STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_CTRL_LISTEN_ADDR: ":8083"
+      STRAVIN_CTRL_ADMIN_TOKEN: "${STRAVIN_CTRL_ADMIN_TOKEN:-stravin-local-ctrl-admin-token}"
       STRAVIN_CTRL_LEASE_TTL: "${STRAVIN_CTRL_LEASE_TTL:-15s}"
       STRAVIN_CTRL_HEARTBEAT_INTERVAL: "${STRAVIN_CTRL_HEARTBEAT_INTERVAL:-2s}"
       AWS_ENDPOINT_URL: "http://floci-region-b:4566"

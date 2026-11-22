@@ -205,9 +205,11 @@ func TestFlociIntegration_LeaseFencingAndFaultInjectedScrub(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewScrubber: %v", err)
 	}
+	const flociAdminToken = "floci-ctrl-admin-token"
 	handler, err := NewHandler(HandlerConfig{
-		Leases:   mgr,
-		Scrubber: scrubber,
+		Leases:     mgr,
+		Scrubber:   scrubber,
+		AdminToken: flociAdminToken,
 	})
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
@@ -220,7 +222,13 @@ func TestFlociIntegration_LeaseFencingAndFaultInjectedScrub(t *testing.T) {
 		"repo_id":          string(rk.RepoID),
 		"lookback_seconds": 1200,
 	})
-	resp, err := http.Post(srv.URL+"/v1/scrub", "application/json", bytes.NewReader(reqPayload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/v1/scrub", bytes.NewReader(reqPayload))
+	if err != nil {
+		t.Fatalf("NewRequest POST /v1/scrub: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+flociAdminToken)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("POST /v1/scrub: %v", err)
 	}

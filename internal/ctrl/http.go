@@ -2,6 +2,7 @@ package ctrl
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ type HandlerConfig struct {
 	ServiceName string
 	Leases      *LeaseManager
 	Scrubber    *Scrubber
+	AdminToken  string
 }
 
 // Handler serves stravin-ctrl's localhost/internal HTTP control and admin endpoints:
@@ -37,6 +39,7 @@ type Handler struct {
 	serviceName string
 	leases      *LeaseManager
 	scrubber    *Scrubber
+	adminToken  string
 	mux         *http.ServeMux
 }
 
@@ -57,20 +60,43 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 		serviceName: svc,
 		leases:      cfg.Leases,
 		scrubber:    cfg.Scrubber,
+		adminToken:  strings.TrimSpace(cfg.AdminToken),
 		mux:         http.NewServeMux(),
 	}
 	h.mux.HandleFunc("/healthz", h.handleHealthz)
-	h.mux.HandleFunc("/v1/lease", h.handleLeaseStatus)
-	h.mux.HandleFunc("/v1/lease/status", h.handleLeaseStatus)
-	h.mux.HandleFunc("/v1/lease/fence", h.handleLeaseFence)
-	h.mux.HandleFunc("/v1/epoch/advance", h.handleEpochAdvance)
-	h.mux.HandleFunc("/v1/scrub", h.handleScrub)
+	h.mux.HandleFunc("/v1/lease", h.requireAdminAuth(h.handleLeaseStatus))
+	h.mux.HandleFunc("/v1/lease/status", h.requireAdminAuth(h.handleLeaseStatus))
+	h.mux.HandleFunc("/v1/lease/fence", h.requireAdminAuth(h.handleLeaseFence))
+	h.mux.HandleFunc("/v1/epoch/advance", h.requireAdminAuth(h.handleEpochAdvance))
+	h.mux.HandleFunc("/v1/scrub", h.requireAdminAuth(h.handleScrub))
 	return h, nil
 }
 
 // ServeHTTP dispatches incoming HTTP admin requests.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
+}
+
+func (h *Handler) requireAdminAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.isAuthorized(r.Header.Get("Authorization")) {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (h *Handler) isAuthorized(authHeader string) bool {
+	if h.adminToken == "" {
+		return false
+	}
+	scheme, token, ok := strings.Cut(authHeader, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(h.adminToken)) == 1
 }
 
 func (h *Handler) handleHealthz(w http.ResponseWriter, r *http.Request) {
