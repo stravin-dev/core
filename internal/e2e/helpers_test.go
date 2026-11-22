@@ -17,7 +17,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/kms"
 
 	"stravin.dev/core/internal/admin"
 	"stravin.dev/core/internal/crypto"
@@ -78,18 +77,16 @@ func newStackEnv(t *testing.T) *stackEnv {
 		t.Fatalf("ddb.NewRepository: %v", err)
 	}
 
-	s3Client := s3.NewAWSClient(awsCfg, endpoint, true)
-	s3Store, err := s3.NewStore(s3Client, bucket)
-	if err != nil {
-		t.Fatalf("s3.NewStore: %v", err)
-	}
-
-	kmsClient := kms.NewFromConfig(awsCfg, func(o *kms.Options) {
-		o.BaseEndpoint = aws.String(endpoint)
-	})
+	kmsClient := crypto.NewKMSClient(awsCfg, endpoint)
 	cipher, err := crypto.NewKMSEnvelopeCipher(kmsClient, kmsKeyID)
 	if err != nil {
 		t.Fatalf("crypto.NewKMSEnvelopeCipher: %v", err)
+	}
+
+	s3Client := s3.NewAWSClient(awsCfg, endpoint, true)
+	s3Store, err := s3.NewStore(s3Client, bucket, s3.WithEnvelopeCipher(cipher))
+	if err != nil {
+		t.Fatalf("s3.NewStore: %v", err)
 	}
 
 	adminSvc, err := admin.NewService(ddbRepo, s3Store, cipher)

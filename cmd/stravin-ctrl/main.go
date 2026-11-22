@@ -18,6 +18,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
+	"stravin.dev/core/internal/crypto"
 	"stravin.dev/core/internal/ctrl"
 	"stravin.dev/core/internal/daemon"
 	"stravin.dev/core/internal/lease"
@@ -43,6 +44,7 @@ type ctrlConfig struct {
 	AWSEndpoint            string
 	DDBTable               string
 	S3Bucket               string
+	KMSKeyID               string
 	HolderID               string
 	LeaseTTL               time.Duration
 	HeartbeatInterval      time.Duration
@@ -78,6 +80,7 @@ func loadConfig() ctrlConfig {
 		AWSEndpoint:            strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL")),
 		DDBTable:               envOrDefault("STRAVIN_DDB_TABLE", defaultDDBTable),
 		S3Bucket:               envOrDefault("STRAVIN_S3_BUCKET", defaultS3BucketPrefix+region),
+		KMSKeyID:               s3.KMSKeyIDFromEnv(),
 		HolderID:               envOrDefault("STRAVIN_CTRL_HOLDER_ID", defaultHolderID),
 		LeaseTTL:               envDuration("STRAVIN_CTRL_LEASE_TTL", ctrl.DefaultLeaseTTL),
 		HeartbeatInterval:      envDuration("STRAVIN_CTRL_HEARTBEAT_INTERVAL", ctrl.DefaultHeartbeatInterval),
@@ -180,6 +183,14 @@ func envCSV(key string) []string {
 	return out
 }
 
+func buildS3Store(s3Client s3.API, bucket string, kmsClient crypto.KMSAPI, kmsKeyID string) (*s3.Store, error) {
+	kmsOpt, err := s3.WithKMSEnvelopeCipher(kmsClient, kmsKeyID)
+	if err != nil {
+		return nil, fmt.Errorf("init kms envelope cipher: %w", err)
+	}
+	return s3.NewStore(s3Client, bucket, kmsOpt)
+}
+
 func buildPromotionGuard(cfg ctrlConfig) (ctrl.PromotionGuard, error) {
 	if !cfg.RequirePromotionGuard {
 		return nil, nil
@@ -247,8 +258,12 @@ func run(ctx context.Context, cfg ctrlConfig) error {
 		return fmt.Errorf("init ddb audit store: %w", err)
 	}
 
+	var kmsClient crypto.KMSAPI
+	if cfg.KMSKeyID != "" {
+		kmsClient = crypto.NewKMSClient(awsCfg, cfg.AWSEndpoint)
+	}
 	s3Client := s3.NewAWSClient(awsCfg, cfg.AWSEndpoint, s3.ForcePathStyleFromEnv() || cfg.AWSEndpoint != "")
-	s3Store, err := s3.NewStore(s3Client, cfg.S3Bucket)
+	s3Store, err := buildS3Store(s3Client, cfg.S3Bucket, kmsClient, cfg.KMSKeyID)
 	if err != nil {
 		return fmt.Errorf("init s3 store: %w", err)
 	}
