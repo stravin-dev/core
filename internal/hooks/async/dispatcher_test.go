@@ -130,10 +130,11 @@ func TestWebhookDispatcher_SignedDeliveryAndTraceLinking(t *testing.T) {
 
 	dlq := NewMemoryDLQSink()
 	disp, err := NewWebhookDispatcher(DispatcherConfig{
-		Webhooks:  repo,
-		Cipher:    cipher,
-		DLQ:       dlq,
-		Telemetry: tel,
+		Webhooks:             repo,
+		Cipher:               cipher,
+		DLQ:                  dlq,
+		Telemetry:            tel,
+		AllowPrivateNetworks: true,
 	})
 	if err != nil {
 		t.Fatalf("NewWebhookDispatcher: %v", err)
@@ -229,8 +230,9 @@ func TestWebhookDispatcher_RetryBackoffAndDLQ(t *testing.T) {
 					Retry:     ddb.WebhookRetryConfig{MaxAttempts: 3, InitialBackoffMS: 50, MaxBackoffMS: 500},
 				}},
 			}},
-			Cipher: crypto.NoopCipher{},
-			DLQ:    dlq,
+			Cipher:               crypto.NoopCipher{},
+			DLQ:                  dlq,
+			AllowPrivateNetworks: true,
 			Sleep: func(_ context.Context, d time.Duration) error {
 				sleeps = append(sleeps, d)
 				return nil
@@ -276,8 +278,9 @@ func TestWebhookDispatcher_RetryBackoffAndDLQ(t *testing.T) {
 					Retry:     ddb.WebhookRetryConfig{MaxAttempts: 3, InitialBackoffMS: 25, MaxBackoffMS: 40},
 				}},
 			}},
-			Cipher: crypto.NoopCipher{},
-			DLQ:    dlq,
+			Cipher:               crypto.NoopCipher{},
+			DLQ:                  dlq,
+			AllowPrivateNetworks: true,
 			Sleep: func(_ context.Context, d time.Duration) error {
 				sleeps = append(sleeps, d)
 				return nil
@@ -345,6 +348,48 @@ func TestWebhookDispatcher_RetryBackoffAndDLQ(t *testing.T) {
 		}
 	})
 
+	t.Run("SSRF loopback blocked by default without retrying", func(t *testing.T) {
+		var hits atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hits.Add(1)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		dlq := NewMemoryDLQSink()
+		disp, err := NewWebhookDispatcher(DispatcherConfig{
+			Webhooks: &fakeWebhookRepo{hooks: map[tenant.RepoKey][]ddb.WebhookConfig{
+				rk: {{
+					WebhookID: "wh-ssrf-loopback",
+					URL:       srv.URL,
+					RefGlob:   "*",
+					Enabled:   true,
+					Retry:     ddb.WebhookRetryConfig{MaxAttempts: 3},
+				}},
+			}},
+			Cipher: crypto.NoopCipher{},
+			DLQ:    dlq,
+		})
+		if err != nil {
+			t.Fatalf("NewWebhookDispatcher: %v", err)
+		}
+
+		ev := RefHistoryEvent{Repo: rk, RefName: "refs/heads/main", OID: strings.Repeat("d", 40)}
+		if err := disp.OnEvent(context.Background(), ev); err != nil {
+			t.Fatalf("OnEvent: %v", err)
+		}
+		if hits.Load() != 0 {
+			t.Fatalf("expected 0 hits to loopback server, got %d", hits.Load())
+		}
+		entries := dlq.Entries()
+		if len(entries) != 1 {
+			t.Fatalf("DLQ entries = %d, want 1", len(entries))
+		}
+		if entries[0].Attempts != 1 || !strings.Contains(entries[0].LastError, "blocked") {
+			t.Errorf("unexpected SSRF loopback DLQ entry: %+v", entries[0])
+		}
+	})
+
 	t.Run("bounded response body read handles large responses safely", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
@@ -362,8 +407,9 @@ func TestWebhookDispatcher_RetryBackoffAndDLQ(t *testing.T) {
 					Enabled:   true,
 				}},
 			}},
-			Cipher: crypto.NoopCipher{},
-			DLQ:    dlq,
+			Cipher:               crypto.NoopCipher{},
+			DLQ:                  dlq,
+			AllowPrivateNetworks: true,
 		})
 		if err != nil {
 			t.Fatalf("NewWebhookDispatcher: %v", err)

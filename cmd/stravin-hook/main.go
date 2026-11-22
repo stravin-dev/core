@@ -43,9 +43,13 @@ func run() error {
 	pollInterval := envDurationOrDefault("STRAVIN_HOOK_POLL_INTERVAL", 500*time.Millisecond)
 	requestTimeout := envDurationOrDefault("STRAVIN_WEBHOOK_TIMEOUT", 10*time.Second)
 	maxAttempts := envIntOrDefault("STRAVIN_WEBHOOK_MAX_ATTEMPTS", 3)
+	allowPrivateNetworks := allowPrivateNetworksFromEnv()
 
 	logger := telemetry.NewLogger(os.Stdout, slog.LevelInfo)
 	slog.SetDefault(logger)
+	if allowPrivateNetworks {
+		logger.Warn("webhook private network delivery enabled via STRAVIN_WEBHOOK_ALLOW_PRIVATE_NETWORKS; do not enable in production")
+	}
 
 	telProvider, err := telemetry.Init(ctx, telemetry.Config{
 		ServiceName: "stravin-hook",
@@ -101,13 +105,14 @@ func run() error {
 	dlqSink := async.NewMultiDLQSink(async.NewLoggingDLQSink(logger), ddbDLQ)
 
 	dispatcher, err := async.NewWebhookDispatcher(async.DispatcherConfig{
-		Webhooks:       ddbRepo,
-		Cipher:         cipher,
-		DLQ:            dlqSink,
-		Telemetry:      telProvider,
-		Logger:         logger,
-		RequestTimeout: requestTimeout,
-		MaxAttempts:    maxAttempts,
+		Webhooks:             ddbRepo,
+		Cipher:               cipher,
+		DLQ:                  dlqSink,
+		Telemetry:            telProvider,
+		Logger:               logger,
+		RequestTimeout:       requestTimeout,
+		MaxAttempts:          maxAttempts,
+		AllowPrivateNetworks: allowPrivateNetworks,
 	})
 	if err != nil {
 		return fmt.Errorf("init webhook dispatcher: %w", err)
@@ -173,4 +178,13 @@ func envIntOrDefault(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func allowPrivateNetworksFromEnv() bool {
+	if v := strings.TrimSpace(os.Getenv("STRAVIN_WEBHOOK_ALLOW_PRIVATE_NETWORKS")); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return false
 }

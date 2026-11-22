@@ -68,34 +68,36 @@ type SleepFunc func(ctx context.Context, d time.Duration) error
 
 // DispatcherConfig configures WebhookDispatcher.
 type DispatcherConfig struct {
-	Webhooks       ddb.WebhookRepository
-	Cipher         crypto.EnvelopeCipher
-	DLQ            DLQSink
-	HTTPClient     *http.Client
-	Telemetry      *telemetry.Provider
-	Logger         *slog.Logger
-	RequestTimeout time.Duration
-	MaxAttempts    int
-	InitialBackoff time.Duration
-	MaxBackoff     time.Duration
-	Sleep          SleepFunc
+	Webhooks             ddb.WebhookRepository
+	Cipher               crypto.EnvelopeCipher
+	DLQ                  DLQSink
+	HTTPClient           *http.Client
+	Telemetry            *telemetry.Provider
+	Logger               *slog.Logger
+	RequestTimeout       time.Duration
+	MaxAttempts          int
+	InitialBackoff       time.Duration
+	MaxBackoff           time.Duration
+	Sleep                SleepFunc
+	AllowPrivateNetworks bool
 }
 
 // WebhookDispatcher implements EventObserver to fan out Ref History events to
 // matching Tier 2 webhooks with KMS secret decryption, HMAC-SHA256 signing,
 // traceparent span linking, retries, and DLQ recording.
 type WebhookDispatcher struct {
-	webhooks       ddb.WebhookRepository
-	cipher         crypto.EnvelopeCipher
-	dlq            DLQSink
-	httpClient     *http.Client
-	tracer         trace.Tracer
-	logger         *slog.Logger
-	maxAttempts    int
-	initialBackoff time.Duration
-	maxBackoff     time.Duration
-	sleep          SleepFunc
-	pipeline       DeliveryFunc
+	webhooks             ddb.WebhookRepository
+	cipher               crypto.EnvelopeCipher
+	dlq                  DLQSink
+	httpClient           *http.Client
+	tracer               trace.Tracer
+	logger               *slog.Logger
+	maxAttempts          int
+	initialBackoff       time.Duration
+	maxBackoff           time.Duration
+	sleep                SleepFunc
+	allowPrivateNetworks bool
+	pipeline             DeliveryFunc
 }
 
 // NewWebhookDispatcher constructs a WebhookDispatcher with a GoF Chain of Responsibility
@@ -117,7 +119,9 @@ func NewWebhookDispatcher(cfg DispatcherConfig) (*WebhookDispatcher, error) {
 		cfg.RequestTimeout = defaultRequestTimeout
 	}
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = NewSafeHTTPClient(cfg.RequestTimeout)
+		cfg.HTTPClient = NewSafeHTTPClientWithOptions(cfg.RequestTimeout, SafeClientOptions{
+			AllowPrivateNetworks: cfg.AllowPrivateNetworks,
+		})
 	}
 	if cfg.Telemetry == nil {
 		cfg.Telemetry = telemetry.NewNoopProvider()
@@ -136,16 +140,17 @@ func NewWebhookDispatcher(cfg DispatcherConfig) (*WebhookDispatcher, error) {
 	}
 
 	d := &WebhookDispatcher{
-		webhooks:       cfg.Webhooks,
-		cipher:         cfg.Cipher,
-		dlq:            cfg.DLQ,
-		httpClient:     cfg.HTTPClient,
-		tracer:         cfg.Telemetry.Tracer("stravin-hook"),
-		logger:         cfg.Logger,
-		maxAttempts:    cfg.MaxAttempts,
-		initialBackoff: cfg.InitialBackoff,
-		maxBackoff:     cfg.MaxBackoff,
-		sleep:          cfg.Sleep,
+		webhooks:             cfg.Webhooks,
+		cipher:               cfg.Cipher,
+		dlq:                  cfg.DLQ,
+		httpClient:           cfg.HTTPClient,
+		tracer:               cfg.Telemetry.Tracer("stravin-hook"),
+		logger:               cfg.Logger,
+		maxAttempts:          cfg.MaxAttempts,
+		initialBackoff:       cfg.InitialBackoff,
+		maxBackoff:           cfg.MaxBackoff,
+		sleep:                cfg.Sleep,
+		allowPrivateNetworks: cfg.AllowPrivateNetworks,
 	}
 
 	d.pipeline = chainMiddleware(
@@ -296,7 +301,9 @@ func (d *WebhookDispatcher) retryAndDLQMiddleware() DeliveryMiddleware {
 }
 
 func (d *WebhookDispatcher) sendHTTP(ctx context.Context, req DeliveryRequest) DeliveryResult {
-	parsedURL, err := ValidateTargetURL(req.Webhook.URL)
+	parsedURL, err := ValidateTargetURLWithOptions(req.Webhook.URL, SafeClientOptions{
+		AllowPrivateNetworks: d.allowPrivateNetworks,
+	})
 	if err != nil {
 		return DeliveryResult{Retryable: false, Err: err}
 	}
