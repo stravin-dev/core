@@ -88,6 +88,18 @@ func TestClassifyError(t *testing.T) {
 			want: ErrorUnexpected,
 		},
 		{
+			name: "expected invalid refspec reject is expected reject",
+			err:  &GitError{Op: "push", ExitCode: 128, Stderr: "fatal: invalid refspec 'HEAD:refs/heads/bad..ref'"},
+			opts: ClassifyOptions{ExpectReject: true},
+			want: ErrorExpectedReject,
+		},
+		{
+			name: "unexpected invalid refspec without ExpectReject is unexpected",
+			err:  &GitError{Op: "push", ExitCode: 128, Stderr: "fatal: invalid refspec 'HEAD:refs/heads/bad..ref'"},
+			opts: ClassifyOptions{ExpectReject: false},
+			want: ErrorUnexpected,
+		},
+		{
 			name: "generic error defaults to unexpected",
 			err:  errors.New("boom"),
 			want: ErrorUnexpected,

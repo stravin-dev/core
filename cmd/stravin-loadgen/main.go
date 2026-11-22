@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"stravin.dev/core/internal/loadgen"
+	"stravin.dev/core/internal/loadgen/scenarios"
 )
 
 type runtimeDeps struct {
@@ -29,7 +30,7 @@ func defaultDeps(logOut io.Writer) runtimeDeps {
 		},
 		newRegistry: func() *loadgen.Registry {
 			reg := loadgen.NewRegistry()
-			if err := loadgen.RegisterBaselineScenarios(reg); err != nil {
+			if err := scenarios.RegisterAll(reg); err != nil {
 				panic(err)
 			}
 			return reg
