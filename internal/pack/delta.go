@@ -29,7 +29,8 @@ func ApplyDelta(base, delta []byte, maxSize int64) ([]byte, error) {
 		cmd := delta[pos]
 		pos++
 
-		if cmd&0x80 != 0 {
+		switch {
+		case cmd&0x80 != 0:
 			var copyOffset, copySize uint64
 			if cmd&0x01 != 0 {
 				if pos >= len(delta) {
@@ -90,7 +91,7 @@ func ApplyDelta(base, delta []byte, maxSize int64) ([]byte, error) {
 				return nil, fmt.Errorf("delta copy exceeds target size %d: %w", targetSize, ErrCorruptEntry)
 			}
 			out = append(out, base[copyOffset:copyOffset+copySize]...)
-		} else if cmd != 0 {
+		case cmd != 0:
 			insertLen := int(cmd)
 			if pos+insertLen > len(delta) {
 				return nil, fmt.Errorf("delta insert truncated: %w", ErrCorruptEntry)
@@ -100,7 +101,7 @@ func ApplyDelta(base, delta []byte, maxSize int64) ([]byte, error) {
 			}
 			out = append(out, delta[pos:pos+insertLen]...)
 			pos += insertLen
-		} else {
+		default:
 			return nil, fmt.Errorf("reserved delta opcode 0x00: %w", ErrCorruptEntry)
 		}
 	}

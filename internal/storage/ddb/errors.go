@@ -79,7 +79,7 @@ func classifyTransactionError(err error, refIndex map[int]string) error {
 		}
 	}
 	if hasTransactionConflict {
-		return fmt.Errorf("%w: %v", ErrTransactionConflict, err)
+		return fmt.Errorf("%w: %w", ErrTransactionConflict, err)
 	}
 	return err
 }

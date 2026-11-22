@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/otel/attribute"
+
 	"stravin.dev/core/internal/telemetry"
 )
 
