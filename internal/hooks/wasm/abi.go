@@ -87,14 +87,34 @@ func (r *budgetedObjectReader) ListNewCommits(oldOID, newOID [20]byte, limit uin
 	return commits, nil
 }
 
-func (r *budgetedObjectReader) DiffTree(oldTreeOID, newTreeOID [20]byte, limit uint32) ([]TreeChange, error) {
+func clampDiffTreeLimit(limit uint32) uint32 {
+	if limit == 0 {
+		return DefaultDiffTreeLimit
+	}
+	if limit > MaxDiffTreeLimit {
+		return MaxDiffTreeLimit
+	}
+	return limit
+}
+
+func (r *budgetedObjectReader) DiffTree(ctx context.Context, oldTreeOID, newTreeOID [20]byte, limit uint32) ([]TreeChange, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := r.chargeHostCall(); err != nil {
 		return nil, err
 	}
 	if r.inner == nil {
 		return nil, nil
 	}
-	return r.inner.DiffTree(oldTreeOID, newTreeOID, limit)
+	effectiveLimit := clampDiffTreeLimit(limit)
+	if ctxReader, ok := r.inner.(ContextDiffTreeReader); ok {
+		return ctxReader.DiffTreeContext(ctx, oldTreeOID, newTreeOID, effectiveLimit)
+	}
+	return r.inner.DiffTree(oldTreeOID, newTreeOID, effectiveLimit)
 }
 
 func (r *budgetedObjectReader) ReadBlobChunk(blobOID [20]byte, offset uint64, maxBytes uint32) ([]byte, error) {
@@ -329,7 +349,7 @@ func hostDiffTree(ctx context.Context, mod api.Module, oldTreePtr, newTreePtr, l
 		return abiErrGeneric
 	}
 
-	changes, err := st.reader.DiffTree(oldTree, newTree, limit)
+	changes, err := st.reader.DiffTree(ctx, oldTree, newTree, limit)
 	if err != nil {
 		if errors.Is(err, ErrBudgetExceeded) {
 			return abiErrBudgetExceeded

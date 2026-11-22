@@ -2,6 +2,7 @@ package pack
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -12,6 +13,15 @@ const (
 	defaultCommitWalkLimit = 1000
 	maxAncestorScanLimit   = 10_000
 	treeDirMode            = 0o040000
+
+	// DefaultDiffTreeLimit is the default change cap applied when DiffTree is called with limit == 0.
+	DefaultDiffTreeLimit = 1000
+	// MaxDiffTreeLimit is the hard upper bound on changes returned by a single DiffTree call.
+	MaxDiffTreeLimit = 10_000
+	// MaxTreeDepth is the maximum directory nesting depth traversed by DiffTree.
+	MaxTreeDepth = 256
+	// MaxTreeNodesVisited is the maximum number of unique tree pairs visited in a single DiffTree call.
+	MaxTreeNodesVisited = 50_000
 )
 
 // ObjectReader is the read-only Git object inspection contract consumed by HookHostABI (#9)
@@ -182,28 +192,84 @@ func (r *PackReader) collectAncestors(root OID, dst map[OID]struct{}, maxScan in
 	}
 }
 
+type treePair struct {
+	oldOID OID
+	newOID OID
+}
+
+type diffTreeState struct {
+	limit        int
+	visitedNodes int
+	seen         map[treePair]struct{}
+	out          []TreeChange
+}
+
+func clampDiffTreeLimit(limit uint32) int {
+	if limit == 0 {
+		return DefaultDiffTreeLimit
+	}
+	if limit > MaxDiffTreeLimit {
+		return MaxDiffTreeLimit
+	}
+	return int(limit)
+}
+
 // DiffTree recursively diffs two Git tree objects and returns up to limit file-level changes.
 func (r *PackReader) DiffTree(oldTreeOID, newTreeOID OID, limit uint32) ([]TreeChange, error) {
+	return r.DiffTreeContext(context.Background(), oldTreeOID, newTreeOID, limit)
+}
+
+// DiffTreeContext recursively diffs two Git tree objects while enforcing recursion depth,
+// visited-node budget, shared-subtree deduplication, limit clamping, and context cancellation.
+func (r *PackReader) DiffTreeContext(ctx context.Context, oldTreeOID, newTreeOID OID, limit uint32) ([]TreeChange, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if oldTreeOID == newTreeOID {
 		return nil, nil
 	}
-	var out []TreeChange
-	if err := r.diffTreeRecursive("", oldTreeOID, newTreeOID, int(limit), &out); err != nil {
+	state := &diffTreeState{
+		limit: clampDiffTreeLimit(limit),
+		seen:  make(map[treePair]struct{}),
+	}
+	if err := r.diffTreeRecursive(ctx, "", oldTreeOID, newTreeOID, 0, state); err != nil {
 		return nil, err
 	}
-	return out, nil
+	return state.out, nil
 }
 
-func (r *PackReader) diffTreeRecursive(prefix string, oldTreeOID, newTreeOID OID, limit int, out *[]TreeChange) error {
-	if limit > 0 && len(*out) >= limit {
+func (r *PackReader) diffTreeRecursive(ctx context.Context, prefix string, oldTreeOID, newTreeOID OID, depth int, state *diffTreeState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(state.out) >= state.limit {
 		return nil
 	}
 	if oldTreeOID == newTreeOID {
 		return nil
+	}
+	if depth > MaxTreeDepth {
+		return fmt.Errorf("tree depth %d exceeds max %d: %w", depth, MaxTreeDepth, ErrMaxTreeDepthExceeded)
+	}
+
+	pair := treePair{oldOID: oldTreeOID, newOID: newTreeOID}
+	if _, alreadySeen := state.seen[pair]; alreadySeen {
+		return nil
+	}
+	state.seen[pair] = struct{}{}
+	state.visitedNodes++
+	if state.visitedNodes > MaxTreeNodesVisited {
+		return fmt.Errorf("visited %d tree nodes (max %d): %w", state.visitedNodes, MaxTreeNodesVisited, ErrLimitExceeded)
 	}
 
 	oldEntries, err := r.loadTreeEntries(oldTreeOID)
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	newEntries, err := r.loadTreeEntries(newTreeOID)
@@ -222,19 +288,22 @@ func (r *PackReader) diffTreeRecursive(prefix string, oldTreeOID, newTreeOID OID
 
 	// Process entries present in newTree (additions and modifications).
 	for _, ne := range newEntries {
-		if limit > 0 && len(*out) >= limit {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(state.out) >= state.limit {
 			return nil
 		}
 		path := joinTreePath(prefix, ne.Name)
 		oe, existed := oldByName[ne.Name]
 		if !existed {
 			if ne.IsDir() {
-				if err := r.diffTreeRecursive(path, OID{}, ne.OID, limit, out); err != nil {
+				if err := r.diffTreeRecursive(ctx, path, OID{}, ne.OID, depth+1, state); err != nil {
 					return err
 				}
 				continue
 			}
-			*out = append(*out, TreeChange{
+			state.out = append(state.out, TreeChange{
 				Path:    path,
 				Kind:    ChangeAdd,
 				NewMode: ne.Mode,
@@ -250,15 +319,15 @@ func (r *PackReader) diffTreeRecursive(prefix string, oldTreeOID, newTreeOID OID
 
 		switch {
 		case oe.IsDir() && ne.IsDir():
-			if err := r.diffTreeRecursive(path, oe.OID, ne.OID, limit, out); err != nil {
+			if err := r.diffTreeRecursive(ctx, path, oe.OID, ne.OID, depth+1, state); err != nil {
 				return err
 			}
 		case oe.IsDir() && !ne.IsDir():
-			if err := r.diffTreeRecursive(path, oe.OID, OID{}, limit, out); err != nil {
+			if err := r.diffTreeRecursive(ctx, path, oe.OID, OID{}, depth+1, state); err != nil {
 				return err
 			}
-			if limit == 0 || len(*out) < limit {
-				*out = append(*out, TreeChange{
+			if len(state.out) < state.limit {
+				state.out = append(state.out, TreeChange{
 					Path:    path,
 					Kind:    ChangeAdd,
 					NewMode: ne.Mode,
@@ -267,18 +336,18 @@ func (r *PackReader) diffTreeRecursive(prefix string, oldTreeOID, newTreeOID OID
 				})
 			}
 		case !oe.IsDir() && ne.IsDir():
-			*out = append(*out, TreeChange{
+			state.out = append(state.out, TreeChange{
 				Path:    path,
 				Kind:    ChangeDelete,
 				OldMode: oe.Mode,
 				OldOID:  oe.OID,
 				OldSize: r.blobSize(oe.OID),
 			})
-			if err := r.diffTreeRecursive(path, OID{}, ne.OID, limit, out); err != nil {
+			if err := r.diffTreeRecursive(ctx, path, OID{}, ne.OID, depth+1, state); err != nil {
 				return err
 			}
 		default:
-			*out = append(*out, TreeChange{
+			state.out = append(state.out, TreeChange{
 				Path:    path,
 				Kind:    ChangeModify,
 				OldMode: oe.Mode,
@@ -293,7 +362,10 @@ func (r *PackReader) diffTreeRecursive(prefix string, oldTreeOID, newTreeOID OID
 
 	// Process entries deleted from oldTree.
 	for _, oe := range oldEntries {
-		if limit > 0 && len(*out) >= limit {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(state.out) >= state.limit {
 			return nil
 		}
 		if _, exists := newByName[oe.Name]; exists {
@@ -301,12 +373,12 @@ func (r *PackReader) diffTreeRecursive(prefix string, oldTreeOID, newTreeOID OID
 		}
 		path := joinTreePath(prefix, oe.Name)
 		if oe.IsDir() {
-			if err := r.diffTreeRecursive(path, oe.OID, OID{}, limit, out); err != nil {
+			if err := r.diffTreeRecursive(ctx, path, oe.OID, OID{}, depth+1, state); err != nil {
 				return err
 			}
 			continue
 		}
-		*out = append(*out, TreeChange{
+		state.out = append(state.out, TreeChange{
 			Path:    path,
 			Kind:    ChangeDelete,
 			OldMode: oe.Mode,

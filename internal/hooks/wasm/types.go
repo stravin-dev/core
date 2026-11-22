@@ -19,6 +19,8 @@ const (
 	DefaultMaxCommitsWalked = 1000
 	DefaultMaxBlobBytesRead = 10 << 20 // 10 MiB
 	DefaultMaxHostCalls     = 1024
+	DefaultDiffTreeLimit    = 1000
+	MaxDiffTreeLimit        = 10_000
 	wasmPagesPerMB          = 16 // 1 Wasm linear memory page = 64 KiB
 )
 
@@ -51,6 +53,12 @@ type ObjectReader interface {
 	ListNewCommits(oldOID, newOID [20]byte, limit uint32) ([]CommitMeta, error)
 	DiffTree(oldTreeOID, newTreeOID [20]byte, limit uint32) ([]TreeChange, error)
 	ReadBlobChunk(blobOID [20]byte, offset uint64, maxBytes uint32) ([]byte, error)
+}
+
+// ContextDiffTreeReader is an optional extension of ObjectReader that accepts a
+// context.Context so host-side tree traversal aborts promptly on hook timeout.
+type ContextDiffTreeReader interface {
+	DiffTreeContext(ctx context.Context, oldTreeOID, newTreeOID [20]byte, limit uint32) ([]TreeChange, error)
 }
 
 // FailMode controls whether a hook runtime failure blocks or warns on a push.
