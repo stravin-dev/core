@@ -96,10 +96,10 @@ jobs:
       - name: Unit tests with race detector and coverage
         run: go test -race -cover ./...
 
-      - name: Build all 5 daemons
+      - name: Build all daemons and admin CLI
         run: |
           mkdir -p bin
-          for d in edge node pack ctrl hook; do
+          for d in edge node pack ctrl hook admin; do
             CGO_ENABLED=0 go build -o "bin/stravin-$d" "./cmd/stravin-$d"
           done
 
@@ -154,3 +154,23 @@ jobs:
       - name: Tear down Docker Compose stack
         if: always()
         run: docker compose down -v --remove-orphans
+
+  e2e-tests:
+    name: E2E Suite (6/6 Docker Compose + Floci)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read Go version from .tool-versions
+        id: tools
+        run: echo "go=$(awk '$1 == "golang" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.tools.outputs.go }}
+          cache: true
+
+      - name: Run 6/6 E2E suite against Docker Compose + Floci
+        run: make e2e

@@ -143,6 +143,13 @@ func loadAuthenticatorFromEnv() (edge.Authenticator, error) {
 	}
 
 	var keys []edge.SSHKeyEntry
+	if raw := strings.TrimSpace(os.Getenv("STRAVIN_SSH_AUTHORIZED_KEYS")); raw != "" {
+		parsed, err := edge.ParseAuthorizedKeys([]byte(raw))
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, parsed...)
+	}
 	if path := strings.TrimSpace(os.Getenv("STRAVIN_SSH_AUTHORIZED_KEYS_FILE")); path != "" {
 		parsed, err := edge.LoadAuthorizedKeysFile(path)
 		if err != nil {

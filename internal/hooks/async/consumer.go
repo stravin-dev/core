@@ -249,8 +249,31 @@ func (c *Consumer) pollShard(ctx context.Context, streamARN, shardID string) err
 		ShardIterator: aws.String(iter),
 		Limit:         aws.Int32(c.batchLimit),
 	})
+	if err != nil && isTrimmedDataAccess(err) {
+		c.logger.WarnContext(ctx, "shard iterator trimmed during GetRecords; resetting to TRIM_HORIZON",
+			"shard_id", shardID,
+		)
+		c.mu.Lock()
+		delete(c.iterators, shardID)
+		c.mu.Unlock()
+
+		freshIter, freshErr := c.resolveTrimHorizonIterator(ctx, streamARN, shardID)
+		if freshErr != nil {
+			return freshErr
+		}
+		if freshIter == "" {
+			c.mu.Lock()
+			c.closedShards[shardID] = true
+			c.mu.Unlock()
+			return nil
+		}
+		out, err = c.streams.GetRecords(ctx, &dynamodbstreams.GetRecordsInput{
+			ShardIterator: aws.String(freshIter),
+			Limit:         aws.Int32(c.batchLimit),
+		})
+	}
 	if err != nil {
-		if isIteratorExpired(err) {
+		if isIteratorExpired(err) || isTrimmedDataAccess(err) {
 			c.mu.Lock()
 			delete(c.iterators, shardID)
 			c.mu.Unlock()
@@ -258,10 +281,16 @@ func (c *Consumer) pollShard(ctx context.Context, streamARN, shardID string) err
 		return fmt.Errorf("async: get records: %w", err)
 	}
 
-	var lastSeq string
+	var (
+		lastSeq          string
+		hasNonCheckpoint bool
+	)
 	for _, rec := range out.Records {
 		if rec.Dynamodb != nil && aws.ToString(rec.Dynamodb.SequenceNumber) != "" {
 			lastSeq = aws.ToString(rec.Dynamodb.SequenceNumber)
+		}
+		if !isCheckpointRecord(rec) {
+			hasNonCheckpoint = true
 		}
 		ev, ok, parseErr := ParseRefHistoryRecord(rec)
 		if parseErr != nil {
@@ -282,7 +311,7 @@ func (c *Consumer) pollShard(ctx context.Context, streamARN, shardID string) err
 		}
 	}
 
-	if lastSeq != "" {
+	if lastSeq != "" && hasNonCheckpoint {
 		if err := c.checkpoints.PutStreamCheckpoint(ctx, ddb.StreamCheckpoint{
 			ShardID:        shardID,
 			SequenceNumber: lastSeq,
@@ -329,6 +358,10 @@ func (c *Consumer) resolveShardIterator(ctx context.Context, streamARN, shardID 
 		)
 	}
 
+	return c.resolveTrimHorizonIterator(ctx, streamARN, shardID)
+}
+
+func (c *Consumer) resolveTrimHorizonIterator(ctx context.Context, streamARN, shardID string) (string, error) {
 	out, iterErr := c.streams.GetShardIterator(ctx, &dynamodbstreams.GetShardIteratorInput{
 		StreamArn:         aws.String(streamARN),
 		ShardId:           aws.String(shardID),
@@ -348,4 +381,14 @@ func isTrimmedDataAccess(err error) bool {
 func isIteratorExpired(err error) bool {
 	var expired *streamtypes.ExpiredIteratorException
 	return errors.As(err, &expired)
+}
+
+func isCheckpointRecord(rec streamtypes.Record) bool {
+	if rec.Dynamodb == nil {
+		return false
+	}
+	if streamAttrString(rec.Dynamodb.NewImage, ddb.AttrPK) == "STREAMS#CHECKPOINT" {
+		return true
+	}
+	return streamAttrString(rec.Dynamodb.Keys, ddb.AttrPK) == "STREAMS#CHECKPOINT"
 }

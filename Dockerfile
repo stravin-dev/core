@@ -13,7 +13,8 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-edge ./cmd
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-node ./cmd/stravin-node \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-pack ./cmd/stravin-pack \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-ctrl ./cmd/stravin-ctrl \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-hook ./cmd/stravin-hook
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-hook ./cmd/stravin-hook \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-admin ./cmd/stravin-admin
 
 FROM alpine:3.21 AS runtime-base
 RUN apk add --no-cache ca-certificates \
@@ -32,6 +33,7 @@ ENTRYPOINT ["/usr/local/bin/stravin-edge"]
 
 FROM runtime-git AS node
 COPY --from=builder /out/stravin-node /usr/local/bin/stravin-node
+RUN mkdir -p /var/lib/stravin/cache && chown -R stravin:stravin /var/lib/stravin/cache
 USER stravin
 EXPOSE 8081 9090
 ENTRYPOINT ["/usr/local/bin/stravin-node"]
@@ -53,3 +55,8 @@ COPY --from=builder /out/stravin-hook /usr/local/bin/stravin-hook
 USER stravin
 EXPOSE 8084
 ENTRYPOINT ["/usr/local/bin/stravin-hook"]
+
+FROM runtime-base AS admin
+COPY --from=builder /out/stravin-admin /usr/local/bin/stravin-admin
+USER stravin
+ENTRYPOINT ["/usr/local/bin/stravin-admin"]

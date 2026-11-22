@@ -33,6 +33,7 @@ type fakeStreamsClient struct {
 	iterRequests     []*dynamodbstreams.GetShardIteratorInput
 	recordsByIter    map[string][]streamtypes.Record
 	nextIterByIter   map[string]string
+	errByIter        map[string]error
 	trimmedOnAfterSq bool
 }
 
@@ -61,6 +62,12 @@ func (f *fakeStreamsClient) GetRecords(_ context.Context, in *dynamodbstreams.Ge
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	iter := aws.ToString(in.ShardIterator)
+	if f.errByIter != nil {
+		if err, ok := f.errByIter[iter]; ok {
+			delete(f.errByIter, iter)
+			return nil, err
+		}
+	}
 	recs := f.recordsByIter[iter]
 	delete(f.recordsByIter, iter)
 	var next *string
@@ -271,5 +278,43 @@ func TestConsumer_RunStopsOnContextCancel(t *testing.T) {
 	defer cancel()
 	if err := consumer.Run(ctx); err != nil {
 		t.Fatalf("Run returned unexpected error on cancel: %v", err)
+	}
+}
+
+func TestConsumer_RecoversFromTrimmedDataAccessDuringGetRecords(t *testing.T) {
+	streams := &fakeStreamsClient{
+		shards: []streamtypes.Shard{{ShardId: aws.String("shard-1")}},
+		errByIter: map[string]error{
+			"iter-shard-1-AFTER_SEQUENCE_NUMBER": &streamtypes.TrimmedDataAccessException{Message: aws.String("trimmed")},
+		},
+		recordsByIter: map[string][]streamtypes.Record{
+			"iter-shard-1-TRIM_HORIZON": {},
+		},
+		nextIterByIter: map[string]string{
+			"iter-shard-1-TRIM_HORIZON": "iter-shard-1-next",
+		},
+	}
+	checkpoints := &fakeCheckpointRepo{
+		checkpoints: map[string]ddb.StreamCheckpoint{
+			"shard-1": {ShardID: "shard-1", SequenceNumber: "seq-old"},
+		},
+	}
+
+	consumer, err := NewConsumer(ConsumerConfig{
+		TableName:   "stravin-core",
+		Tables:      &fakeTableDescriber{streamARN: "arn:stream"},
+		Streams:     streams,
+		Checkpoints: checkpoints,
+	})
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+
+	if err := consumer.PollOnce(context.Background()); err != nil {
+		t.Fatalf("PollOnce should recover from TrimmedDataAccessException: %v", err)
+	}
+	if len(streams.iterRequests) != 2 ||
+		streams.iterRequests[1].ShardIteratorType != streamtypes.ShardIteratorTypeTrimHorizon {
+		t.Fatalf("expected TRIM_HORIZON recovery iterator, got %+v", streams.iterRequests)
 	}
 }

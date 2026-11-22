@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/metadata"
+
 	"stravin.dev/core/internal/rpc"
 	"stravin.dev/core/internal/telemetry"
 	"stravin.dev/core/internal/tenant"
@@ -20,6 +22,9 @@ import (
 const (
 	httpReadHeaderTimeout = 10 * time.Second
 	httpIdleTimeout       = 120 * time.Second
+
+	headerAdvertiseRefs = "x-stravin-advertise-refs"
+	headerStatelessRPC  = "x-stravin-stateless-rpc"
 )
 
 // HTTPHandler serves Git Smart HTTP endpoints alongside /healthz and /metrics.
@@ -178,11 +183,16 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var stdin = NewByteLimitingReader(ctx, r.Body, h.limiter, route.repo.TenantID)
-	if route.kind == routeInfoRefs {
+	proxyCtx := ctx
+	switch route.kind {
+	case routeInfoRefs:
 		stdin = nil
+		proxyCtx = metadata.AppendToOutgoingContext(ctx, headerAdvertiseRefs, "true")
+	case routeUploadPack, routeReceivePack:
+		proxyCtx = metadata.AppendToOutgoingContext(ctx, headerStatelessRPC, "true")
 	}
 
-	exitCode, err := h.proxy.ProxyStream(ctx, peer, rpcMeta, stdin, sw, nil)
+	exitCode, err := h.proxy.ProxyStream(proxyCtx, peer, rpcMeta, stdin, sw, nil)
 	if err != nil {
 		h.handleProxyError(w, ctx, sw, route.metricOp, err, start)
 		return

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	"stravin.dev/core/internal/lease"
 	"stravin.dev/core/internal/rpc"
@@ -25,13 +26,14 @@ import (
 type mockGitNode struct {
 	mu           sync.Mutex
 	lastMeta     rpc.RequestMeta
+	lastMD       metadata.MD
 	lastPayload  []byte
 	responseData []byte
 	errMessage   string
 	exitCode     int32
 }
 
-func (m *mockGitNode) HandleGitWire(_ context.Context, meta rpc.RequestMeta, stream rpc.GitWireStream) error {
+func (m *mockGitNode) HandleGitWire(ctx context.Context, meta rpc.RequestMeta, stream rpc.GitWireStream) error {
 	var received bytes.Buffer
 	for {
 		frame, err := stream.Recv()
@@ -49,8 +51,11 @@ func (m *mockGitNode) HandleGitWire(_ context.Context, meta rpc.RequestMeta, str
 		}
 	}
 
+	inMD, _ := metadata.FromIncomingContext(ctx)
+
 	m.mu.Lock()
 	m.lastMeta = meta
+	m.lastMD = inMD.Copy()
 	m.lastPayload = received.Bytes()
 	resp := append([]byte(nil), m.responseData...)
 	errMsg := m.errMessage
@@ -413,5 +418,46 @@ func TestHTTPHandler_BandwidthLimitReturns429WithoutDeadlock(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("ProxyStream deadlocked when ByteLimitingReader returned ErrBandwidthLimited")
+	}
+}
+
+func TestHTTPHandler_SetsSmartHTTPGRPCMetadataHeaders(t *testing.T) {
+	env := newTestEdgeEnv(t, LimiterConfig{})
+	defer env.close()
+
+	req := httptest.NewRequest(http.MethodGet, "/acme/core.git/info/refs?service=git-upload-pack", nil)
+	req.Header.Set("Authorization", "Bearer tok-acme")
+	rec := httptest.NewRecorder()
+	env.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("info/refs status = %d, want 200", rec.Code)
+	}
+	env.node.mu.Lock()
+	advVals := env.node.lastMD.Get(headerAdvertiseRefs)
+	statelessVals := env.node.lastMD.Get(headerStatelessRPC)
+	env.node.mu.Unlock()
+	if len(advVals) != 1 || advVals[0] != "true" {
+		t.Fatalf("info/refs %s = %v, want [true]", headerAdvertiseRefs, advVals)
+	}
+	if len(statelessVals) != 0 {
+		t.Fatalf("info/refs %s = %v, want empty", headerStatelessRPC, statelessVals)
+	}
+
+	reqPost := httptest.NewRequest(http.MethodPost, "/acme/core.git/git-receive-pack", strings.NewReader("0000"))
+	reqPost.Header.Set("Authorization", "Bearer tok-acme")
+	recPost := httptest.NewRecorder()
+	env.handler.ServeHTTP(recPost, reqPost)
+	if recPost.Code != http.StatusOK {
+		t.Fatalf("receive-pack status = %d, want 200", recPost.Code)
+	}
+	env.node.mu.Lock()
+	advVals = env.node.lastMD.Get(headerAdvertiseRefs)
+	statelessVals = env.node.lastMD.Get(headerStatelessRPC)
+	env.node.mu.Unlock()
+	if len(statelessVals) != 1 || statelessVals[0] != "true" {
+		t.Fatalf("receive-pack %s = %v, want [true]", headerStatelessRPC, statelessVals)
+	}
+	if len(advVals) != 0 {
+		t.Fatalf("receive-pack %s = %v, want empty", headerAdvertiseRefs, advVals)
 	}
 }
