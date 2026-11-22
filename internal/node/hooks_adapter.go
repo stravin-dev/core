@@ -87,7 +87,14 @@ type packObjectReaderAdapter struct {
 	inner pack.ObjectReader
 }
 
-var _ wasm.ObjectReader = (*packObjectReaderAdapter)(nil)
+var (
+	_ wasm.ObjectReader          = (*packObjectReaderAdapter)(nil)
+	_ wasm.ContextDiffTreeReader = (*packObjectReaderAdapter)(nil)
+)
+
+type packContextDiffTreeReader interface {
+	DiffTreeContext(ctx context.Context, oldTreeOID, newTreeOID pack.OID, limit uint32) ([]pack.TreeChange, error)
+}
 
 // NewPackObjectReaderAdapter wraps a pack.ObjectReader for HookHostABI consumption.
 func NewPackObjectReaderAdapter(inner pack.ObjectReader) wasm.ObjectReader {
@@ -135,6 +142,29 @@ func (a *packObjectReaderAdapter) DiffTree(oldTreeOID, newTreeOID [20]byte, limi
 	if err != nil {
 		return nil, err
 	}
+	return convertTreeChanges(changes), nil
+}
+
+func (a *packObjectReaderAdapter) DiffTreeContext(ctx context.Context, oldTreeOID, newTreeOID [20]byte, limit uint32) ([]wasm.TreeChange, error) {
+	var (
+		changes []pack.TreeChange
+		err     error
+	)
+	if ctxReader, ok := a.inner.(packContextDiffTreeReader); ok {
+		changes, err = ctxReader.DiffTreeContext(ctx, pack.OID(oldTreeOID), pack.OID(newTreeOID), limit)
+	} else {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		changes, err = a.inner.DiffTree(pack.OID(oldTreeOID), pack.OID(newTreeOID), limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return convertTreeChanges(changes), nil
+}
+
+func convertTreeChanges(changes []pack.TreeChange) []wasm.TreeChange {
 	out := make([]wasm.TreeChange, 0, len(changes))
 	for _, ch := range changes {
 		out = append(out, wasm.TreeChange{
@@ -148,7 +178,7 @@ func (a *packObjectReaderAdapter) DiffTree(oldTreeOID, newTreeOID [20]byte, limi
 			NewSize: ch.NewSize,
 		})
 	}
-	return out, nil
+	return out
 }
 
 func (a *packObjectReaderAdapter) ReadBlobChunk(blobOID [20]byte, offset uint64, maxBytes uint32) ([]byte, error) {

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 
@@ -206,6 +207,22 @@ func (h *ReceivePackHandler) HandleReceivePack(ctx context.Context, meta rpc.Req
 		for _, c := range cmds {
 			if stale[c.RefName] {
 				statuses = append(statuses, refStatus{RefName: c.RefName, Err: "stale old_oid"})
+			} else {
+				statuses = append(statuses, refStatus{RefName: c.RefName, Err: "atomic push failed"})
+			}
+		}
+		return h.sendStatusAndFinish(stream, reportStatus, useSideBand, "unpack ok", statuses, nil)
+	}
+
+	// 5b. Reject ref/directory prefix collisions in the effective post-push ref set.
+	if collisions := findRefCollisions(cmds, currentRefs); len(collisions) > 0 {
+		statuses := make([]refStatus, 0, len(cmds))
+		for _, c := range cmds {
+			if other, ok := collisions[c.RefName]; ok {
+				statuses = append(statuses, refStatus{
+					RefName: c.RefName,
+					Err:     fmt.Sprintf("ref/directory collision with %s", other),
+				})
 			} else {
 				statuses = append(statuses, refStatus{RefName: c.RefName, Err: "atomic push failed"})
 			}
@@ -667,6 +684,61 @@ func findStaleRefUpdates(cmds []ddb.RefUpdate, currentRefs []ddb.RefState) map[s
 		}
 	}
 	return stale
+}
+
+// findRefCollisions computes the effective post-push ref set (currentRefs minus
+// deleted cmds plus created/updated cmds) and returns a map of colliding ref
+// names in cmds to a conflicting ref name (file/directory prefix collision).
+func findRefCollisions(cmds []ddb.RefUpdate, currentRefs []ddb.RefState) map[string]string {
+	effective := make(map[string]struct{}, len(currentRefs)+len(cmds))
+	for _, r := range currentRefs {
+		effective[r.RefName] = struct{}{}
+	}
+	for _, c := range cmds {
+		if c.IsDelete() {
+			delete(effective, c.RefName)
+		}
+	}
+	for _, c := range cmds {
+		if !c.IsDelete() {
+			effective[c.RefName] = struct{}{}
+		}
+	}
+
+	sorted := make([]string, 0, len(effective))
+	for ref := range effective {
+		sorted = append(sorted, ref)
+	}
+	sort.Strings(sorted)
+
+	allCollisions := make(map[string]string)
+	for _, ref := range sorted {
+		for idx := strings.LastIndexByte(ref, '/'); idx > 0; idx = strings.LastIndexByte(ref[:idx], '/') {
+			prefix := ref[:idx]
+			if _, exists := effective[prefix]; exists {
+				if _, seen := allCollisions[ref]; !seen {
+					allCollisions[ref] = prefix
+				}
+				if _, seen := allCollisions[prefix]; !seen {
+					allCollisions[prefix] = ref
+				}
+			}
+		}
+	}
+
+	if len(allCollisions) == 0 {
+		return nil
+	}
+	cmdCollisions := make(map[string]string)
+	for _, c := range cmds {
+		if c.IsDelete() {
+			continue
+		}
+		if other, ok := allCollisions[c.RefName]; ok {
+			cmdCollisions[c.RefName] = other
+		}
+	}
+	return cmdCollisions
 }
 
 func pushNeedsPack(cmds []ddb.RefUpdate) bool {

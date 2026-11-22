@@ -387,8 +387,9 @@ func materializeDisposableRefs(repoPath string, refs []ddb.RefState, defaultBran
 	defer func() { _ = root.Close() }()
 
 	var staleRelPaths []string
+	var subDirs []string
 	if err := filepath.WalkDir(refsDir, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil || d.IsDir() {
+		if walkErr != nil {
 			return walkErr
 		}
 		rel, relErr := filepath.Rel(repoPath, path)
@@ -396,6 +397,12 @@ func materializeDisposableRefs(repoPath string, refs []ddb.RefState, defaultBran
 			return relErr
 		}
 		refName := filepath.ToSlash(rel)
+		if d.IsDir() {
+			if refName != "refs" && refName != "refs/heads" && refName != "refs/tags" {
+				subDirs = append(subDirs, rel)
+			}
+			return nil
+		}
 		if _, keep := desired[refName]; !keep {
 			staleRelPaths = append(staleRelPaths, rel)
 		}
@@ -405,6 +412,11 @@ func materializeDisposableRefs(repoPath string, refs []ddb.RefState, defaultBran
 	}
 	for _, rel := range staleRelPaths {
 		_ = root.Remove(rel)
+	}
+	// Prune now-empty ref subdirectories bottom-up so replacing refs/heads/a/b
+	// with refs/heads/a does not fail on a lingering directory.
+	for i := len(subDirs) - 1; i >= 0; i-- {
+		_ = root.Remove(subDirs[i])
 	}
 
 	// Also remove packed-refs if present so git never reads stale packed refs.
@@ -425,12 +437,30 @@ func materializeDisposableRefs(repoPath string, refs []ddb.RefState, defaultBran
 	return writeFileAtomicLocal(filepath.Join(repoPath, "HEAD"), []byte("ref: "+defaultBranch+"\n"))
 }
 
+// isSafeRefName enforces git-check-ref-format rules and requires a refs/ prefix
+// with at least one non-empty path component after refs/.
 func isSafeRefName(refName string) bool {
-	if !strings.HasPrefix(refName, "refs/") {
+	rest, ok := strings.CutPrefix(refName, "refs/")
+	if !ok || rest == "" {
 		return false
 	}
-	if strings.Contains(refName, "..") || strings.ContainsAny(refName, "\\\x00\r\n") {
+	if strings.HasSuffix(refName, ".") || strings.Contains(refName, "..") || strings.Contains(refName, "@{") {
 		return false
+	}
+	for i := 0; i < len(refName); i++ {
+		b := refName[i]
+		if b < 0x20 || b == 0x7f {
+			return false
+		}
+		switch b {
+		case ' ', '~', '^', ':', '?', '*', '[', '\\':
+			return false
+		}
+	}
+	for _, part := range strings.Split(rest, "/") {
+		if part == "" || part == "@" || strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
+			return false
+		}
 	}
 	return true
 }

@@ -324,3 +324,83 @@ func TestMaterializer_DoesNotAdvanceWatermarkOnS3Failure(t *testing.T) {
 		t.Fatalf("watermark advanced despite S3 failure: got %q, want empty", got)
 	}
 }
+
+func TestIsSafeRefName(t *testing.T) {
+	valid := []string{
+		"refs/heads/main",
+		"refs/heads/feature/foo-bar_1",
+		"refs/tags/v1.0.0",
+		"refs/heads/a.b",
+		"refs/heads/a@b",
+		"refs/pull/42/head",
+		"refs/heads/café",
+	}
+	for _, ref := range valid {
+		if !isSafeRefName(ref) {
+			t.Errorf("isSafeRefName(%q) = false, want true", ref)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"HEAD",
+		"heads/main",
+		"refs/",
+		"/refs/heads/main",
+		"refs/heads/",
+		"refs/heads//a",
+		"refs/heads/.hidden",
+		"refs/heads/.",
+		"refs/heads/..",
+		"refs/heads/foo.lock",
+		"refs/heads/a.lock/b",
+		"refs/heads/a..b",
+		"refs/heads/a@{b}",
+		"refs/heads/@",
+		"refs/heads/a.",
+		"refs/heads/a b",
+		"refs/heads/a~1",
+		"refs/heads/a^1",
+		"refs/heads/a:b",
+		"refs/heads/a?b",
+		"refs/heads/a*",
+		"refs/heads/a[0]",
+		`refs/heads/a\b`,
+		"refs/heads/a\x00b",
+		"refs/heads/a\x01b",
+		"refs/heads/a\x1fb",
+		"refs/heads/a\x7fb",
+		"refs/heads/a\tb",
+		"refs/heads/a\nb",
+		"refs/heads/a\rb",
+	}
+	for _, ref := range invalid {
+		if isSafeRefName(ref) {
+			t.Errorf("isSafeRefName(%q) = true, want false", ref)
+		}
+	}
+}
+
+func TestMaterializeDisposableRefs_PrunesEmptyDirsOnRefReplacement(t *testing.T) {
+	repoPath := t.TempDir()
+	oid1 := strings.Repeat("1", 40)
+	oid2 := strings.Repeat("2", 40)
+
+	if err := materializeDisposableRefs(repoPath, []ddb.RefState{
+		{RefName: "refs/heads/a/b", OID: oid1},
+	}, "refs/heads/main"); err != nil {
+		t.Fatalf("first materializeDisposableRefs: %v", err)
+	}
+
+	// Replace refs/heads/a/b with refs/heads/a (requires pruning empty dir refs/heads/a).
+	if err := materializeDisposableRefs(repoPath, []ddb.RefState{
+		{RefName: "refs/heads/a", OID: oid2},
+	}, "refs/heads/main"); err != nil {
+		t.Fatalf("second materializeDisposableRefs (replace dir with file): %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(repoPath, "refs", "heads", "a"))
+	if err != nil || strings.TrimSpace(string(got)) != oid2 {
+		t.Fatalf("refs/heads/a = %q (err=%v), want %s", string(got), err, oid2)
+	}
+}
