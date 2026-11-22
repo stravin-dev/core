@@ -4,11 +4,11 @@ import (
 	"log/slog"
 	"os"
 
-	"stravin.dev/core/internal/daemon"
+	"stravin.dev/core/internal/node"
 )
 
 func main() {
-	if err := daemon.RunWithSignals("stravin-node", ":8081"); err != nil {
+	if err := node.RunWithSignals(); err != nil {
 		slog.Error("stravin-node exited with error", "error", err)
 		os.Exit(1)
 	}
