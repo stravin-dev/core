@@ -599,20 +599,26 @@ func TestE2E_Scenario6_StravinCtrlFencingAndScrubRewind(t *testing.T) {
 		t.Fatalf("could not locate pack_id for commit %s in RefHistory: %+v", c2, hist)
 	}
 
-	// 2. Verify stravin-ctrl holds the active write lease, then advance failover_epoch via HTTP API.
+	// 2. Verify stravin-ctrl requires Bearer auth on /v1/*, holds the active write lease, then advance failover_epoch via HTTP API.
 	httpClient := &http.Client{Timeout: 10 * time.Second}
-	statusResp, err := httpClient.Get(env.ctrlURL + "/v1/lease/status")
+	unauthResp, err := httpClient.Get(env.ctrlURL + "/v1/lease/status")
 	if err != nil {
-		t.Fatalf("GET /v1/lease/status: %v", err)
+		t.Fatalf("unauthenticated GET /v1/lease/status: %v", err)
 	}
+	_ = unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET /v1/lease/status = %d, want 401", unauthResp.StatusCode)
+	}
+
+	statusResp := env.doCtrlRequest(t, httpClient, http.MethodGet, "/v1/lease/status", nil)
 	var leaseStatus ctrl.LeaseStatus
 	if err := json.NewDecoder(statusResp.Body).Decode(&leaseStatus); err != nil {
 		_ = statusResp.Body.Close()
 		t.Fatalf("decode lease status: %v", err)
 	}
 	_ = statusResp.Body.Close()
-	if !leaseStatus.Valid || !leaseStatus.AllowsWrites || leaseStatus.Epoch < 1 {
-		t.Fatalf("expected stravin-ctrl to hold active lease, got %+v", leaseStatus)
+	if statusResp.StatusCode != http.StatusOK || !leaseStatus.Valid || !leaseStatus.AllowsWrites || leaseStatus.Epoch < 1 {
+		t.Fatalf("expected stravin-ctrl to hold active lease (status=%d), got %+v", statusResp.StatusCode, leaseStatus)
 	}
 
 	prevEpoch := leaseStatus.Epoch
@@ -621,10 +627,7 @@ func TestE2E_Scenario6_StravinCtrlFencingAndScrubRewind(t *testing.T) {
 		"repo_id":   repoID,
 		"mode":      "ACTIVE",
 	})
-	advResp, err := httpClient.Post(env.ctrlURL+"/v1/epoch/advance", "application/json", bytes.NewReader(advBody))
-	if err != nil {
-		t.Fatalf("POST /v1/epoch/advance: %v", err)
-	}
+	advResp := env.doCtrlRequest(t, httpClient, http.MethodPost, "/v1/epoch/advance", advBody)
 	var fenceRes ctrl.FenceResult
 	if err := json.NewDecoder(advResp.Body).Decode(&fenceRes); err != nil {
 		_ = advResp.Body.Close()
@@ -659,10 +662,7 @@ func TestE2E_Scenario6_StravinCtrlFencingAndScrubRewind(t *testing.T) {
 		"repo_id":          repoID,
 		"lookback_seconds": 1200,
 	})
-	scrubResp, err := httpClient.Post(env.ctrlURL+"/v1/scrub", "application/json", bytes.NewReader(scrubBody))
-	if err != nil {
-		t.Fatalf("POST /v1/scrub: %v", err)
-	}
+	scrubResp := env.doCtrlRequest(t, httpClient, http.MethodPost, "/v1/scrub", scrubBody)
 	var report ctrl.ScrubReport
 	if err := json.NewDecoder(scrubResp.Body).Decode(&report); err != nil {
 		_ = scrubResp.Body.Close()
