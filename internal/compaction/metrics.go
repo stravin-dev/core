@@ -22,6 +22,8 @@ type Metrics struct {
 	bytesReclaimed     metric.Int64Counter
 	leaseContention    metric.Int64Counter
 	gcReaped           metric.Int64Counter
+	gcCRRBlocked       metric.Int64Counter
+	gcCRRBreakerOpen   metric.Int64Gauge
 	uncompactedPacks   metric.Int64Gauge
 	compactionDuration metric.Float64Histogram
 }
@@ -67,6 +69,22 @@ func NewMetrics(provider *telemetry.Provider) (*Metrics, error) {
 		return nil, err
 	}
 
+	gcCRRBlocked, err := meter.Int64Counter(
+		"stravin_pack_gc_crr_blocked_total",
+		metric.WithDescription("Total delayed GC deletions blocked by S3 CRR replication gate or circuit breaker"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	gcCRRBreakerOpen, err := meter.Int64Gauge(
+		"stravin_pack_gc_crr_breaker_open",
+		metric.WithDescription("Whether the stravin-pack GC CRR-lag circuit breaker is currently open (1=open, 0=closed)"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	uncompacted, err := meter.Int64Gauge(
 		"stravin_pack_uncompacted_packs",
 		metric.WithDescription("Active pack count observed in a manifest shard before compaction"),
@@ -90,6 +108,8 @@ func NewMetrics(provider *telemetry.Provider) (*Metrics, error) {
 		bytesReclaimed:     reclaimed,
 		leaseContention:    contention,
 		gcReaped:           gcReaped,
+		gcCRRBlocked:       gcCRRBlocked,
+		gcCRRBreakerOpen:   gcCRRBreakerOpen,
 		uncompactedPacks:   uncompacted,
 		compactionDuration: duration,
 	}, nil
@@ -144,4 +164,22 @@ func (m *Metrics) recordUncompactedPacks(ctx context.Context, shard int, count i
 	m.uncompactedPacks.Record(ctx, int64(count), metric.WithAttributes(
 		telemetry.AttrShardBucket.String(strconv.Itoa(shard)),
 	))
+}
+
+func (m *Metrics) recordGCCRRBlocked(ctx context.Context, reason string) {
+	if m == nil {
+		return
+	}
+	m.gcCRRBlocked.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
+}
+
+func (m *Metrics) recordGCCRRBreakerOpen(ctx context.Context, open bool) {
+	if m == nil {
+		return
+	}
+	var val int64
+	if open {
+		val = 1
+	}
+	m.gcCRRBreakerOpen.Record(ctx, val)
 }

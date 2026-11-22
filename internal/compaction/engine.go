@@ -292,7 +292,7 @@ func (e *Engine) CompactShard(ctx context.Context, target ShardTarget) (JobResul
 
 	// Phase 2 (Supersede): Mark old source packs COMPACTED with GC grace window.
 	if len(toSupersede) > 0 {
-		if err := e.supersedePhase(leaseCtx, target, toSupersede, now); err != nil {
+		if err := e.supersedePhase(leaseCtx, target, toSupersede, now, newManifest.PackID); err != nil {
 			e.metrics.recordCompactionCycle(spanCtx, target.Tier, "error", e.clock.Now().Sub(start))
 			rootSpan.RecordError(err)
 			rootSpan.SetStatus(codes.Error, err.Error())
@@ -343,7 +343,7 @@ func (e *Engine) publishPhase(ctx context.Context, target ShardTarget, newManife
 	return nil
 }
 
-func (e *Engine) supersedePhase(ctx context.Context, target ShardTarget, oldPacks []ddb.PackManifest, compactedAt time.Time) error {
+func (e *Engine) supersedePhase(ctx context.Context, target ShardTarget, oldPacks []ddb.PackManifest, compactedAt time.Time, replacementPackID string) error {
 	supCtx, span := e.metrics.Tracer().Start(ctx, "ddb.manifest_supersede",
 		trace.WithAttributes(
 			append(
@@ -366,7 +366,13 @@ func (e *Engine) supersedePhase(ctx context.Context, target ShardTarget, oldPack
 
 	if e.manifestGC != nil {
 		gcAfter := compactedAt.Add(e.gcGraceWindow)
-		if err := e.manifestGC.MarkGCEligible(supCtx, target.Repo, target.ManifestShards, oldPacks, compactedAt, gcAfter); err != nil {
+		var err error
+		if tracker, ok := e.manifestGC.(ReplacementTracker); ok {
+			err = tracker.MarkGCEligibleWithReplacement(supCtx, target.Repo, target.ManifestShards, oldPacks, compactedAt, gcAfter, replacementPackID)
+		} else {
+			err = e.manifestGC.MarkGCEligible(supCtx, target.Repo, target.ManifestShards, oldPacks, compactedAt, gcAfter)
+		}
+		if err != nil {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 			return fmt.Errorf("compaction: mark gc eligibility: %w", err)

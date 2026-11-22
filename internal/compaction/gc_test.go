@@ -36,8 +36,9 @@ func (c *staticClock) Advance(d time.Duration) {
 }
 
 type fakeS3Object struct {
-	data         []byte
-	lastModified time.Time
+	data              []byte
+	lastModified      time.Time
+	replicationStatus string
 }
 
 type fakePackObjectStore struct {
@@ -46,6 +47,8 @@ type fakePackObjectStore struct {
 	clock       *staticClock
 	onPutPack   func(packSHA string)
 	deletedKeys []string
+	headErr     error
+	headCalls   int
 }
 
 func newFakePackObjectStore(clk *staticClock) *fakePackObjectStore {
@@ -167,10 +170,39 @@ func (f *fakePackObjectStore) exists(key string) bool {
 	return ok
 }
 
+func (f *fakePackObjectStore) setReplicationStatus(key, status string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if obj, ok := f.objects[key]; ok {
+		obj.replicationStatus = status
+		f.objects[key] = obj
+	}
+}
+
+func (f *fakePackObjectStore) HeadObject(_ context.Context, key string) (s3.ObjectMeta, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.headCalls++
+	if f.headErr != nil {
+		return s3.ObjectMeta{}, f.headErr
+	}
+	obj, ok := f.objects[key]
+	if !ok {
+		return s3.ObjectMeta{}, s3.ErrNotFound
+	}
+	return s3.ObjectMeta{
+		Key:               key,
+		SizeBytes:         int64(len(obj.data)),
+		LastModified:      obj.lastModified,
+		ReplicationStatus: obj.replicationStatus,
+	}, nil
+}
+
 type fakeManifestStore struct {
 	mu             sync.Mutex
 	items          map[string]ddb.PackManifest
 	gcAfter        map[string]time.Time
+	replacedBy     map[string]string
 	events         []string
 	failPublish    error
 	failSupersede  error
@@ -181,6 +213,7 @@ func newFakeManifestStore(manifestShards int) *fakeManifestStore {
 	return &fakeManifestStore{
 		items:          make(map[string]ddb.PackManifest),
 		gcAfter:        make(map[string]time.Time),
+		replacedBy:     make(map[string]string),
 		manifestShards: manifestShards,
 	}
 }
@@ -275,6 +308,29 @@ func (f *fakeManifestStore) MarkGCEligible(_ context.Context, repo tenant.RepoKe
 		f.gcAfter[manifestItemKey(p)] = gcAfter
 	}
 	return nil
+}
+
+func (f *fakeManifestStore) MarkGCEligibleWithReplacement(_ context.Context, repo tenant.RepoKey, _ int, packs []ddb.PackManifest, _, gcAfter time.Time, replacementPackID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, "mark_gc")
+	for _, p := range packs {
+		p.Repo = repo
+		k := manifestItemKey(p)
+		f.gcAfter[k] = gcAfter
+		if replacementPackID != "" {
+			f.replacedBy[k] = replacementPackID
+		}
+	}
+	return nil
+}
+
+func (f *fakeManifestStore) GetReplacementPackID(_ context.Context, repo tenant.RepoKey, _ int, pack ddb.PackManifest) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	pack.Repo = repo
+	id, ok := f.replacedBy[manifestItemKey(pack)]
+	return id, ok && id != "", nil
 }
 
 func (f *fakeManifestStore) GetGCEligibility(_ context.Context, repo tenant.RepoKey, _ int, pack ddb.PackManifest) (time.Time, bool, error) {

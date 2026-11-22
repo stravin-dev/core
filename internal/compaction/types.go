@@ -62,12 +62,13 @@ type JobResult struct {
 
 // GCResult summarizes the outcome of a single repository delayed-GC sweep.
 type GCResult struct {
-	Repo            tenant.RepoKey
-	CompactedReaped int
-	OrphanedReaped  int
-	BytesReclaimed  int64
-	SkippedActive   int
-	SkippedGrace    int
+	Repo               tenant.RepoKey
+	CompactedReaped    int
+	OrphanedReaped     int
+	BytesReclaimed     int64
+	SkippedActive      int
+	SkippedGrace       int
+	SkippedReplication int
 }
 
 // LeaseStore is the narrow DynamoDB compaction-lease contract.
@@ -91,6 +92,14 @@ type ManifestGCStore interface {
 	MarkGCEligible(ctx context.Context, repo tenant.RepoKey, manifestShards int, packs []ddb.PackManifest, compactedAt, gcAfter time.Time) error
 	GetGCEligibility(ctx context.Context, repo tenant.RepoKey, manifestShards int, pack ddb.PackManifest) (gcAfter time.Time, ok bool, err error)
 	DeleteManifest(ctx context.Context, repo tenant.RepoKey, manifestShards int, pack ddb.PackManifest) error
+}
+
+// ReplacementTracker optionally records and retrieves the replacement compacted
+// pack ID on superseded COMPACTED manifest entries so delayed GC can verify
+// S3 CRR replication of the exact replacement pack before deletion.
+type ReplacementTracker interface {
+	MarkGCEligibleWithReplacement(ctx context.Context, repo tenant.RepoKey, manifestShards int, packs []ddb.PackManifest, compactedAt, gcAfter time.Time, replacementPackID string) error
+	GetReplacementPackID(ctx context.Context, repo tenant.RepoKey, manifestShards int, pack ddb.PackManifest) (packID string, ok bool, err error)
 }
 
 // RefLister provides repository refs so Tier-1 commit-graph generation can walk

@@ -24,6 +24,13 @@ const (
 	// EnvForcePathStyle enables S3 path-style addressing when set to a truthy boolean.
 	EnvForcePathStyle = "STRAVIN_S3_FORCE_PATH_STYLE"
 
+	// ReplicationStatus constants mirror AWS S3 HeadObject x-amz-replication-status values.
+	ReplicationStatusCompleted = "COMPLETED"
+	ReplicationStatusComplete  = "COMPLETE"
+	ReplicationStatusPending   = "PENDING"
+	ReplicationStatusFailed    = "FAILED"
+	ReplicationStatusReplica   = "REPLICA"
+
 	contentTypeOctetStream = "application/octet-stream"
 	contentTypeWasm        = "application/wasm"
 )
@@ -42,11 +49,12 @@ var _ API = (*awss3.Client)(nil)
 
 // ObjectMeta describes metadata returned by HeadObject.
 type ObjectMeta struct {
-	Key          string
-	SizeBytes    int64
-	ETag         string
-	ContentType  string
-	LastModified time.Time
+	Key               string
+	SizeBytes         int64
+	ETag              string
+	ContentType       string
+	LastModified      time.Time
+	ReplicationStatus string
 }
 
 // PackObjectInfo describes a packfile discovered by ListRepoPacks.
@@ -328,11 +336,12 @@ func (s *Store) HeadObject(ctx context.Context, key string) (ObjectMeta, error) 
 		return ObjectMeta{}, fmt.Errorf("s3: head %s: %w", key, err)
 	}
 	return ObjectMeta{
-		Key:          key,
-		SizeBytes:    aws.ToInt64(out.ContentLength),
-		ETag:         aws.ToString(out.ETag),
-		ContentType:  aws.ToString(out.ContentType),
-		LastModified: aws.ToTime(out.LastModified),
+		Key:               key,
+		SizeBytes:         aws.ToInt64(out.ContentLength),
+		ETag:              aws.ToString(out.ETag),
+		ContentType:       aws.ToString(out.ContentType),
+		LastModified:      aws.ToTime(out.LastModified),
+		ReplicationStatus: string(out.ReplicationStatus),
 	}, nil
 }
 

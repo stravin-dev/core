@@ -40,18 +40,21 @@ const (
 )
 
 type packConfig struct {
-	HealthAddr    string
-	Region        string
-	AWSEndpoint   string
-	DDBTable      string
-	S3Bucket      string
-	WorkerID      string
-	WorkDir       string
-	PollInterval  time.Duration
-	GCInterval    time.Duration
-	GCGraceWindow time.Duration
-	LeaseTTL      time.Duration
-	StaticRepos   []string
+	HealthAddr            string
+	Region                string
+	AWSEndpoint           string
+	DDBTable              string
+	S3Bucket              string
+	WorkerID              string
+	WorkDir               string
+	PollInterval          time.Duration
+	GCInterval            time.Duration
+	GCGraceWindow         time.Duration
+	LeaseTTL              time.Duration
+	RequireCRRReplication bool
+	CRRBreakerThreshold   int
+	CRRBreakerCooldown    time.Duration
+	StaticRepos           []string
 }
 
 func loadConfig() packConfig {
@@ -72,19 +75,46 @@ func loadConfig() packConfig {
 	}
 
 	return packConfig{
-		HealthAddr:    daemon.ListenAddrFromEnv(defaultHealthAddr),
-		Region:        region,
-		AWSEndpoint:   strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL")),
-		DDBTable:      envOrDefault("STRAVIN_DDB_TABLE", defaultDDBTable),
-		S3Bucket:      envOrDefault("STRAVIN_S3_BUCKET", defaultS3BucketPrefix+region),
-		WorkerID:      envOrDefault("STRAVIN_PACK_WORKER_ID", defaultWorkerID),
-		WorkDir:       strings.TrimSpace(os.Getenv("STRAVIN_PACK_WORK_DIR")),
-		PollInterval:  envDuration("STRAVIN_PACK_POLL_INTERVAL", defaultPollInterval),
-		GCInterval:    envDuration("STRAVIN_PACK_GC_INTERVAL", defaultGCInterval),
-		GCGraceWindow: envDuration("STRAVIN_PACK_GC_GRACE", defaultGCGraceWindow),
-		LeaseTTL:      envDuration("STRAVIN_PACK_LEASE_TTL", defaultLeaseTTL),
-		StaticRepos:   staticRepos,
+		HealthAddr:            daemon.ListenAddrFromEnv(defaultHealthAddr),
+		Region:                region,
+		AWSEndpoint:           strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL")),
+		DDBTable:              envOrDefault("STRAVIN_DDB_TABLE", defaultDDBTable),
+		S3Bucket:              envOrDefault("STRAVIN_S3_BUCKET", defaultS3BucketPrefix+region),
+		WorkerID:              envOrDefault("STRAVIN_PACK_WORKER_ID", defaultWorkerID),
+		WorkDir:               strings.TrimSpace(os.Getenv("STRAVIN_PACK_WORK_DIR")),
+		PollInterval:          envDuration("STRAVIN_PACK_POLL_INTERVAL", defaultPollInterval),
+		GCInterval:            envDuration("STRAVIN_PACK_GC_INTERVAL", defaultGCInterval),
+		GCGraceWindow:         envDuration("STRAVIN_PACK_GC_GRACE", defaultGCGraceWindow),
+		LeaseTTL:              envDuration("STRAVIN_PACK_LEASE_TTL", defaultLeaseTTL),
+		RequireCRRReplication: envBool("STRAVIN_PACK_REQUIRE_CRR_REPLICATION", false),
+		CRRBreakerThreshold:   envInt("STRAVIN_PACK_CRR_BREAKER_THRESHOLD", compaction.DefaultCRRBreakerThreshold),
+		CRRBreakerCooldown:    envDuration("STRAVIN_PACK_CRR_BREAKER_COOLDOWN", compaction.DefaultCRRBreakerCooldown),
+		StaticRepos:           staticRepos,
 	}
+}
+
+func envBool(key string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func envInt(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return fallback
+	}
+	return v
 }
 
 func envOrDefault(key, fallback string) string {
@@ -250,10 +280,27 @@ func run(ctx context.Context, cfg packConfig) error {
 		return fmt.Errorf("init compaction engine: %w", err)
 	}
 
+	var replicationGate compaction.ReplicationGate
+	if cfg.RequireCRRReplication {
+		breaker := compaction.NewCRRCircuitBreaker(compaction.CRRCircuitBreakerConfig{
+			Threshold: cfg.CRRBreakerThreshold,
+			Cooldown:  cfg.CRRBreakerCooldown,
+		})
+		replicationGate, err = compaction.NewS3ReplicationGate(compaction.S3ReplicationGateConfig{
+			Objects: s3Store,
+			Breaker: breaker,
+			Metrics: metrics,
+		})
+		if err != nil {
+			return fmt.Errorf("init crr replication gate: %w", err)
+		}
+	}
+
 	sweeper, err := compaction.NewGCSweeper(compaction.GCSweeperConfig{
 		Manifests:         ddbRepo,
 		ManifestGC:        gcAdapter,
 		Objects:           s3Store,
+		ReplicationGate:   replicationGate,
 		GraceWindow:       cfg.GCGraceWindow,
 		OrphanGraceWindow: cfg.GCGraceWindow,
 		Metrics:           metrics,
