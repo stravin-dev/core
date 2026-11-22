@@ -23,10 +23,11 @@ import (
 )
 
 type fakeS3Object struct {
-	data        []byte
-	contentType string
-	etag        string
-	modifiedAt  time.Time
+	data              []byte
+	contentType       string
+	etag              string
+	modifiedAt        time.Time
+	replicationStatus types.ReplicationStatus
 }
 
 type fakeS3API struct {
@@ -104,10 +105,11 @@ func (f *fakeS3API) HeadObject(ctx context.Context, in *awss3.HeadObjectInput, _
 		}
 	}
 	return &awss3.HeadObjectOutput{
-		ContentLength: aws.Int64(int64(len(obj.data))),
-		ContentType:   aws.String(obj.contentType),
-		ETag:          aws.String(obj.etag),
-		LastModified:  aws.Time(obj.modifiedAt),
+		ContentLength:     aws.Int64(int64(len(obj.data))),
+		ContentType:       aws.String(obj.contentType),
+		ETag:              aws.String(obj.etag),
+		LastModified:      aws.Time(obj.modifiedAt),
+		ReplicationStatus: obj.replicationStatus,
 	}, nil
 }
 
@@ -422,5 +424,55 @@ func TestForcePathStyleFromEnv(t *testing.T) {
 	t.Setenv(EnvForcePathStyle, "")
 	if ForcePathStyleFromEnv() {
 		t.Fatal("expected ForcePathStyleFromEnv() = false when env empty")
+	}
+}
+
+func TestStoreHeadObjectReplicationStatus(t *testing.T) {
+	fake := newFakeS3API()
+	store, err := NewStore(fake, "git-objects-us-east-1")
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+
+	ctx := context.Background()
+	rk := mustRepoKey(t, "acme", "core")
+	packKey, err := PackKey(rk, testPackSHA)
+	if err != nil {
+		t.Fatalf("PackKey: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		status types.ReplicationStatus
+		want   string
+	}{
+		{name: "completed", status: types.ReplicationStatusCompleted, want: ReplicationStatusCompleted},
+		{name: "complete", status: types.ReplicationStatusComplete, want: ReplicationStatusComplete},
+		{name: "pending", status: types.ReplicationStatusPending, want: ReplicationStatusPending},
+		{name: "failed", status: types.ReplicationStatusFailed, want: ReplicationStatusFailed},
+		{name: "replica", status: types.ReplicationStatusReplica, want: ReplicationStatusReplica},
+		{name: "empty_single_region", status: "", want: ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake.mu.Lock()
+			fake.objects[packKey] = fakeS3Object{
+				data:              []byte("PACK-data"),
+				contentType:       contentTypeOctetStream,
+				etag:              `"etag-crr"`,
+				modifiedAt:        time.Now().UTC(),
+				replicationStatus: tc.status,
+			}
+			fake.mu.Unlock()
+
+			meta, err := store.HeadObject(ctx, packKey)
+			if err != nil {
+				t.Fatalf("HeadObject: %v", err)
+			}
+			if meta.ReplicationStatus != tc.want {
+				t.Fatalf("ReplicationStatus = %q, want %q", meta.ReplicationStatus, tc.want)
+			}
+		})
 	}
 }

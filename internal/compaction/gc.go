@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -24,6 +25,7 @@ type GCSweeperConfig struct {
 	Manifests         ManifestStore
 	ManifestGC        ManifestGCStore
 	Objects           PackObjectStore
+	ReplicationGate   ReplicationGate
 	GraceWindow       time.Duration
 	OrphanGraceWindow time.Duration
 	Clock             lease.Clock
@@ -38,6 +40,7 @@ type GCSweeper struct {
 	manifests         ManifestStore
 	manifestGC        ManifestGCStore
 	objects           PackObjectStore
+	replicationGate   ReplicationGate
 	graceWindow       time.Duration
 	orphanGraceWindow time.Duration
 	clock             lease.Clock
@@ -73,6 +76,7 @@ func NewGCSweeper(cfg GCSweeperConfig) (*GCSweeper, error) {
 		manifests:         cfg.Manifests,
 		manifestGC:        cfg.ManifestGC,
 		objects:           cfg.Objects,
+		replicationGate:   cfg.ReplicationGate,
 		graceWindow:       grace,
 		orphanGraceWindow: orphanGrace,
 		clock:             clk,
@@ -127,6 +131,16 @@ func (g *GCSweeper) SweepRepo(ctx context.Context, repo tenant.RepoKey, manifest
 	now := g.clock.Now().UTC()
 	res := GCResult{Repo: repo}
 
+	activePackList := make([]string, 0, len(activePackIDs))
+	for id := range activePackIDs {
+		activePackList = append(activePackList, id)
+	}
+	sort.Strings(activePackList)
+
+	// Per-sweep cache of replacement packs already confirmed COMPLETED to avoid
+	// redundant HeadObject calls when many COMPACTED entries share one replacement.
+	verifiedReplacements := make(map[string]bool)
+
 	// Pass 1: Reap COMPACTED packs past grace window.
 	for _, entry := range compacted {
 		if err := spanCtx.Err(); err != nil {
@@ -146,6 +160,19 @@ func (g *GCSweeper) SweepRepo(ctx context.Context, repo tenant.RepoKey, manifest
 		if now.Before(gcAfter) {
 			res.SkippedGrace++
 			continue
+		}
+
+		if g.replicationGate != nil {
+			replIDs, err := g.resolveReplacementPackIDs(spanCtx, repo, manifestShards, entry, activePackList)
+			if err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return res, fmt.Errorf("compaction gc: resolve replacement pack for %s: %w", entry.PackID, err)
+			}
+			if !g.checkReplicationGate(spanCtx, repo, replIDs, verifiedReplacements) {
+				res.SkippedReplication++
+				continue
+			}
 		}
 
 		if err := g.deletePackAndIndex(spanCtx, repo, entry.PackID); err != nil {
@@ -189,6 +216,12 @@ func (g *GCSweeper) SweepRepo(ctx context.Context, repo tenant.RepoKey, manifest
 			res.SkippedGrace++
 			continue
 		}
+		if g.replicationGate != nil && g.replicationGate.IsBreakerOpen() {
+			g.metrics.recordGCCRRBreakerOpen(spanCtx, true)
+			g.metrics.recordGCCRRBlocked(spanCtx, "breaker_open")
+			res.SkippedReplication++
+			continue
+		}
 
 		if err := g.deletePackAndIndex(spanCtx, repo, obj.PackSHA256); err != nil {
 			span.RecordError(err)
@@ -206,10 +239,59 @@ func (g *GCSweeper) SweepRepo(ctx context.Context, repo tenant.RepoKey, manifest
 	span.SetAttributes(
 		attribute.Int("gc.compacted_reaped", res.CompactedReaped),
 		attribute.Int("gc.orphaned_reaped", res.OrphanedReaped),
+		attribute.Int("gc.skipped_replication", res.SkippedReplication),
 		attribute.Int64("gc.bytes_reclaimed", res.BytesReclaimed),
 	)
 
 	return res, nil
+}
+
+func (g *GCSweeper) resolveReplacementPackIDs(
+	ctx context.Context,
+	repo tenant.RepoKey,
+	manifestShards int,
+	entry ddb.PackManifest,
+	activePackList []string,
+) ([]string, error) {
+	if tracker, ok := g.manifestGC.(ReplacementTracker); ok {
+		packID, found, err := tracker.GetReplacementPackID(ctx, repo, manifestShards, entry)
+		if err != nil {
+			return nil, err
+		}
+		if found && packID != "" {
+			return []string{packID}, nil
+		}
+	}
+	return activePackList, nil
+}
+
+func (g *GCSweeper) checkReplicationGate(
+	ctx context.Context,
+	repo tenant.RepoKey,
+	replacementPackIDs []string,
+	verifiedCache map[string]bool,
+) bool {
+	if len(replacementPackIDs) > 0 && !g.replicationGate.IsBreakerOpen() {
+		allCached := true
+		for _, id := range replacementPackIDs {
+			if !verifiedCache[id] {
+				allCached = false
+				break
+			}
+		}
+		if allCached {
+			return true
+		}
+	}
+
+	decision := g.replicationGate.AllowDeletion(ctx, repo, replacementPackIDs)
+	if decision.Allowed {
+		for _, id := range replacementPackIDs {
+			verifiedCache[id] = true
+		}
+		return true
+	}
+	return false
 }
 
 func (g *GCSweeper) resolveGCAfter(ctx context.Context, repo tenant.RepoKey, manifestShards int, entry ddb.PackManifest) (time.Time, error) {

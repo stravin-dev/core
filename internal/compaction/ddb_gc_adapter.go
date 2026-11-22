@@ -45,30 +45,86 @@ func (a *DDBManifestGCAdapter) MarkGCEligible(
 	packs []ddb.PackManifest,
 	compactedAt, gcAfter time.Time,
 ) error {
+	return a.MarkGCEligibleWithReplacement(ctx, repo, manifestShards, packs, compactedAt, gcAfter, "")
+}
+
+// MarkGCEligibleWithReplacement stamps compacted_at, gc_after, and (when
+// non-empty) replaced_by_pack_id on COMPACTED manifest entries.
+func (a *DDBManifestGCAdapter) MarkGCEligibleWithReplacement(
+	ctx context.Context,
+	repo tenant.RepoKey,
+	manifestShards int,
+	packs []ddb.PackManifest,
+	compactedAt, gcAfter time.Time,
+	replacementPackID string,
+) error {
+	replacementPackID = strings.TrimSpace(replacementPackID)
+	updateExpr := "SET compacted_at = :compacted_at, gc_after = :gc_after"
+	if replacementPackID != "" {
+		updateExpr += ", replaced_by_pack_id = :replaced_by"
+	}
+
 	for _, p := range packs {
 		key, err := ddb.ManifestKey(repo, p.ULID, p.PackID, manifestShards)
 		if err != nil {
 			return err
 		}
+		exprValues := map[string]types.AttributeValue{
+			":compacted_at": &types.AttributeValueMemberS{Value: compactedAt.UTC().Format(time.RFC3339Nano)},
+			":gc_after":     &types.AttributeValueMemberS{Value: gcAfter.UTC().Format(time.RFC3339Nano)},
+			":compacted":    &types.AttributeValueMemberS{Value: string(ddb.PackStatusCompacted)},
+		}
+		if replacementPackID != "" {
+			exprValues[":replaced_by"] = &types.AttributeValueMemberS{Value: replacementPackID}
+		}
 		_, err = a.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 			TableName:           aws.String(a.tableName),
 			Key:                 key.AttributeMap(),
-			UpdateExpression:    aws.String("SET compacted_at = :compacted_at, gc_after = :gc_after"),
+			UpdateExpression:    aws.String(updateExpr),
 			ConditionExpression: aws.String("#status = :compacted"),
 			ExpressionAttributeNames: map[string]string{
 				"#status": "status",
 			},
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":compacted_at": &types.AttributeValueMemberS{Value: compactedAt.UTC().Format(time.RFC3339Nano)},
-				":gc_after":     &types.AttributeValueMemberS{Value: gcAfter.UTC().Format(time.RFC3339Nano)},
-				":compacted":    &types.AttributeValueMemberS{Value: string(ddb.PackStatusCompacted)},
-			},
+			ExpressionAttributeValues: exprValues,
 		})
 		if err != nil {
 			return fmt.Errorf("compaction: mark gc_after for %s: %w", p.PackID, err)
 		}
 	}
 	return nil
+}
+
+// GetReplacementPackID reads the replaced_by_pack_id stamped on a COMPACTED manifest entry.
+func (a *DDBManifestGCAdapter) GetReplacementPackID(
+	ctx context.Context,
+	repo tenant.RepoKey,
+	manifestShards int,
+	pack ddb.PackManifest,
+) (string, bool, error) {
+	key, err := ddb.ManifestKey(repo, pack.ULID, pack.PackID, manifestShards)
+	if err != nil {
+		return "", false, err
+	}
+	out, err := a.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName:      aws.String(a.tableName),
+		Key:            key.AttributeMap(),
+		ConsistentRead: aws.Bool(true),
+	})
+	if err != nil {
+		return "", false, err
+	}
+	if len(out.Item) == 0 {
+		return "", false, nil
+	}
+	av, ok := out.Item["replaced_by_pack_id"]
+	if !ok {
+		return "", false, nil
+	}
+	s, ok := av.(*types.AttributeValueMemberS)
+	if !ok || strings.TrimSpace(s.Value) == "" {
+		return "", false, nil
+	}
+	return strings.TrimSpace(s.Value), true, nil
 }
 
 // GetGCEligibility reads the gc_after timestamp stamped on a COMPACTED manifest entry.
@@ -140,4 +196,7 @@ func (a *DDBManifestGCAdapter) DeleteManifest(
 	return nil
 }
 
-var _ ManifestGCStore = (*DDBManifestGCAdapter)(nil)
+var (
+	_ ManifestGCStore    = (*DDBManifestGCAdapter)(nil)
+	_ ReplacementTracker = (*DDBManifestGCAdapter)(nil)
+)
