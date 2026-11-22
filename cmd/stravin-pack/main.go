@@ -37,6 +37,7 @@ const (
 	defaultGCGraceWindow   = 24 * time.Hour
 	defaultLeaseTTL        = 30 * time.Second
 	defaultShutdownTimeout = 5 * time.Second
+	defaultGitExecTimeout  = 10 * time.Minute
 )
 
 type packConfig struct {
@@ -54,6 +55,7 @@ type packConfig struct {
 	RequireCRRReplication bool
 	CRRBreakerThreshold   int
 	CRRBreakerCooldown    time.Duration
+	GitExec               gitexec.Config
 	StaticRepos           []string
 }
 
@@ -89,8 +91,19 @@ func loadConfig() packConfig {
 		RequireCRRReplication: envBool("STRAVIN_PACK_REQUIRE_CRR_REPLICATION", false),
 		CRRBreakerThreshold:   envInt("STRAVIN_PACK_CRR_BREAKER_THRESHOLD", compaction.DefaultCRRBreakerThreshold),
 		CRRBreakerCooldown:    envDuration("STRAVIN_PACK_CRR_BREAKER_COOLDOWN", compaction.DefaultCRRBreakerCooldown),
+		GitExec:               gitexec.LoadConfigFromEnv(defaultGitExecTimeout, nil),
 		StaticRepos:           staticRepos,
 	}
+}
+
+func resolveGitExecConfig(cfg gitexec.Config) gitexec.Config {
+	if cfg.DefaultTimeout <= 0 && cfg.Sandbox == (gitexec.SandboxConfig{}) {
+		cfg.Sandbox = gitexec.DefaultSandboxConfig()
+	}
+	if cfg.DefaultTimeout <= 0 {
+		cfg.DefaultTimeout = defaultGitExecTimeout
+	}
+	return cfg
 }
 
 func envBool(key string, fallback bool) bool {
@@ -252,12 +265,11 @@ func run(ctx context.Context, cfg packConfig) error {
 		return fmt.Errorf("init tier0 strategy: %w", err)
 	}
 
-	gitExec := gitexec.NewSubprocessExecutor(gitexec.Config{
-		DefaultTimeout: 5 * time.Minute,
-	})
+	gitExecCfg := resolveGitExecConfig(cfg.GitExec)
+	gitExec := gitexec.NewSubprocessExecutor(gitExecCfg)
 	tier1, err := compaction.NewTier1Strategy(s3Store, gitExec, compaction.Tier1Config{
 		WorkDir: cfg.WorkDir,
-		Timeout: 5 * time.Minute,
+		Timeout: gitExecCfg.DefaultTimeout,
 		Limits:  pack.DefaultLimits(),
 	})
 	if err != nil {
