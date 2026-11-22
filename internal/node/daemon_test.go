@@ -265,3 +265,15 @@ func TestRunDaemon_FailClosedOnInvalidKMSKeyID(t *testing.T) {
 		t.Fatalf("RunDaemon(whitespace KMSKeyID) err = %v, want crypto.ErrInvalidInput", err)
 	}
 }
+
+func TestLoadDaemonConfigFromEnv_TelemetryShutdownTimeout(t *testing.T) {
+	t.Setenv("STRAVIN_OTEL_SHUTDOWN_TIMEOUT", "")
+	if got := LoadDaemonConfigFromEnv().TelemetryShutdownTimeout; got != 5*time.Second {
+		t.Fatalf("default TelemetryShutdownTimeout = %v, want 5s", got)
+	}
+
+	t.Setenv("STRAVIN_OTEL_SHUTDOWN_TIMEOUT", "11s")
+	if got := LoadDaemonConfigFromEnv().TelemetryShutdownTimeout; got != 11*time.Second {
+		t.Fatalf("override TelemetryShutdownTimeout = %v, want 11s", got)
+	}
+}

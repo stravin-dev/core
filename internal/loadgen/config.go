@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 )
@@ -37,6 +38,12 @@ type Config struct {
 
 // DefaultConfig returns the standard stravin-loadgen defaults.
 func DefaultConfig() Config {
+	flushTimeout := 10 * time.Second
+	if raw := strings.TrimSpace(os.Getenv("STRAVIN_OTEL_SHUTDOWN_TIMEOUT")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			flushTimeout = d
+		}
+	}
 	return Config{
 		Devs:         10,
 		Agents:       20,
@@ -47,7 +54,7 @@ func DefaultConfig() Config {
 		ThinkMin:     50 * time.Millisecond,
 		ThinkMax:     500 * time.Millisecond,
 		OtelEndpoint: "http://127.0.0.1:4317",
-		FlushTimeout: 10 * time.Second,
+		FlushTimeout: flushTimeout,
 		MaxRetries:   3,
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"stravin.dev/core/internal/chaos"
+	"stravin.dev/core/internal/telemetry"
 )
 
 func newCLIToxiproxyServer(t *testing.T) *httptest.Server {
@@ -94,5 +95,40 @@ func TestRun_RejectsFlociInRestartTargets(t *testing.T) {
 	}, &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected error when --restart-targets contains floci, got nil")
+	}
+}
+
+func TestRun_FlushesTelemetryAfterSignalCancelOnFreshContext(t *testing.T) {
+	srv := newCLIToxiproxyServer(t)
+
+	prov, err := telemetry.NewInMemoryProvider("stravin-chaos")
+	if err != nil {
+		t.Fatalf("NewInMemoryProvider: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		cancel()
+	}()
+
+	var stdout, stderr bytes.Buffer
+	err = runWithTelemetry(ctx, []string{
+		"--toxiproxy-url", srv.URL,
+		"--seed", "42",
+		"--interval", "10ms",
+		"--fault-duration", "10ms",
+		"--enable-restarts=false",
+	}, &stdout, &stderr, func(context.Context, telemetry.Config) (*telemetry.Provider, error) {
+		return prov, nil
+	})
+	if err != nil {
+		t.Fatalf("runWithTelemetry failed: %v (stderr=%s)", err, stderr.String())
+	}
+	if !prov.LogExporter.WasShutdown() {
+		t.Fatal("expected OTLP log exporter Shutdown to be called after signal cancel")
+	}
+	if len(prov.LogExporter.Records()) == 0 {
+		t.Fatal("expected at least one OTLP log record flushed on shutdown")
 	}
 }

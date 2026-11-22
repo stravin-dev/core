@@ -45,12 +45,6 @@ func run() error {
 	maxAttempts := envIntOrDefault("STRAVIN_WEBHOOK_MAX_ATTEMPTS", 3)
 	allowPrivateNetworks := allowPrivateNetworksFromEnv()
 
-	logger := telemetry.NewLogger(os.Stdout, slog.LevelInfo)
-	slog.SetDefault(logger)
-	if allowPrivateNetworks {
-		logger.Warn("webhook private network delivery enabled via STRAVIN_WEBHOOK_ALLOW_PRIVATE_NETWORKS; do not enable in production")
-	}
-
 	telProvider, err := telemetry.Init(ctx, telemetry.Config{
 		ServiceName: "stravin-hook",
 		Region:      region,
@@ -61,10 +55,18 @@ func run() error {
 		return fmt.Errorf("init telemetry: %w", err)
 	}
 	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeoutFromEnv())
 		defer cancel()
-		_ = telProvider.Shutdown(shutdownCtx)
+		if shutErr := telProvider.Shutdown(shutdownCtx); shutErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "stravin-hook: telemetry shutdown warning: %v\n", shutErr)
+		}
 	}()
+
+	logger := telProvider.Logger(os.Stdout, slog.LevelInfo)
+	slog.SetDefault(logger)
+	if allowPrivateNetworks {
+		logger.Warn("webhook private network delivery enabled via STRAVIN_WEBHOOK_ALLOW_PRIVATE_NETWORKS; do not enable in production")
+	}
 
 	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {

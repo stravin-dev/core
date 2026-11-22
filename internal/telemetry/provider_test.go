@@ -1,8 +1,12 @@
 package telemetry_test
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -100,4 +104,73 @@ func TestInit_OTLPModeInitializesAndShutsDown(t *testing.T) {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	cancel()
 	_ = prov.Shutdown(cancelCtx)
+}
+
+func TestNewInMemoryProvider_CapturesLogsAndFlushesOnShutdown(t *testing.T) {
+	ctx := context.Background()
+	prov, err := telemetry.NewInMemoryProvider("stravin-edge")
+	if err != nil {
+		t.Fatalf("NewInMemoryProvider: %v", err)
+	}
+
+	var buf bytes.Buffer
+	logger := prov.Logger(&buf, slog.LevelInfo)
+
+	spanCtx, span := prov.Tracer("stravin.edge").Start(ctx, "edge.handle")
+	wantTraceID := span.SpanContext().TraceID()
+	logger.DebugContext(spanCtx, "filtered debug log")
+	logger.InfoContext(spanCtx, "handled request", "repo", "demo")
+	span.End()
+
+	if err := prov.ForceFlush(ctx); err != nil {
+		t.Fatalf("ForceFlush: %v", err)
+	}
+	if !prov.LogExporter.WasFlushed() {
+		t.Error("expected LogExporter.ForceFlush to be called")
+	}
+
+	if err := prov.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if !prov.LogExporter.WasShutdown() {
+		t.Error("expected LogExporter.Shutdown to be called")
+	}
+
+	records := prov.LogExporter.Records()
+	if len(records) != 1 {
+		t.Fatalf("exported OTLP logs = %d, want 1", len(records))
+	}
+	if records[0].TraceID() != wantTraceID {
+		t.Errorf("OTLP log TraceID = %s, want %s", records[0].TraceID(), wantTraceID)
+	}
+	if !strings.Contains(buf.String(), wantTraceID.String()) {
+		t.Errorf("JSON stdout log missing trace_id %s: %s", wantTraceID, buf.String())
+	}
+	if strings.Contains(buf.String(), "filtered debug log") {
+		t.Errorf("expected debug log filtered out, got: %s", buf.String())
+	}
+}
+
+func TestShutdownTimeoutFromEnv(t *testing.T) {
+	tests := []struct {
+		name string
+		val  string
+		want time.Duration
+	}{
+		{name: "unset", val: "", want: telemetry.DefaultShutdownTimeout},
+		{name: "valid duration", val: "12s", want: 12 * time.Second},
+		{name: "trimmed valid duration", val: "  250ms ", want: 250 * time.Millisecond},
+		{name: "invalid string", val: "not-a-duration", want: telemetry.DefaultShutdownTimeout},
+		{name: "zero duration", val: "0s", want: telemetry.DefaultShutdownTimeout},
+		{name: "negative duration", val: "-3s", want: telemetry.DefaultShutdownTimeout},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("STRAVIN_OTEL_SHUTDOWN_TIMEOUT", tc.val)
+			if got := telemetry.ShutdownTimeoutFromEnv(); got != tc.want {
+				t.Errorf("ShutdownTimeoutFromEnv(%q) = %v, want %v", tc.val, got, tc.want)
+			}
+		})
+	}
 }
