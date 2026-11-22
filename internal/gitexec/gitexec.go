@@ -371,7 +371,7 @@ func (e *SubprocessExecutor) run(
 
 	cause := waitErr
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		cause = fmt.Errorf("%w: %v", ctxErr, waitErr)
+		cause = fmt.Errorf("%w: %w", ctxErr, waitErr)
 	}
 
 	return &ExecError{
