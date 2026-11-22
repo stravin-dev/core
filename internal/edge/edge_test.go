@@ -34,6 +34,7 @@ func TestServer_HealthAddrServesHealthzAndNotMetrics(t *testing.T) {
 		SSHAddr:       "127.0.0.1:0",
 		HTTPAddr:      "127.0.0.1:0",
 		HealthAddr:    healthAddr,
+		DrainDelay:    200 * time.Millisecond,
 		HostKey:       hostKey,
 		Authenticator: env.handler.auth,
 		Limiter:       env.handler.limiter,
@@ -72,6 +73,17 @@ func TestServer_HealthAddrServesHealthzAndNotMetrics(t *testing.T) {
 		t.Fatalf("GET /healthz status = %d, want 200", healthResp.StatusCode)
 	}
 
+	for _, path := range []string{"/livez", "/readyz", "/startupz", "/readyz?verbose=1"} {
+		resp, reqErr := client.Get("http://" + healthAddr + path)
+		if reqErr != nil {
+			t.Fatalf("GET %s failed: %v", path, reqErr)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200", path, resp.StatusCode)
+		}
+	}
+
 	metricsResp, err := client.Get("http://" + healthAddr + "/metrics")
 	if err != nil {
 		t.Fatalf("GET /metrics failed: %v", err)
@@ -82,6 +94,23 @@ func TestServer_HealthAddrServesHealthzAndNotMetrics(t *testing.T) {
 	}
 
 	cancel()
+	var saw503 bool
+	drainDeadline := time.Now().Add(150 * time.Millisecond)
+	for time.Now().Before(drainDeadline) {
+		resp, reqErr := client.Get("http://" + healthAddr + "/readyz")
+		if reqErr == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusServiceUnavailable {
+				saw503 = true
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !saw503 {
+		t.Fatal("expected /readyz on edge HealthAddr to return 503 during drain")
+	}
+
 	select {
 	case runErr := <-runErrCh:
 		if runErr != nil && !strings.Contains(runErr.Error(), "closed") {

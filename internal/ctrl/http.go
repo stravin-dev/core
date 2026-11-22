@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"stravin.dev/core/internal/health"
 	"stravin.dev/core/internal/lease"
 	"stravin.dev/core/internal/storage/ddb"
 	"stravin.dev/core/internal/tenant"
@@ -27,10 +28,11 @@ type HandlerConfig struct {
 	Scrubber    *Scrubber
 	Recovery    *RecoveryReconciler
 	AdminToken  string
+	Probes      *health.Registry
 }
 
 // Handler serves stravin-ctrl's localhost/internal HTTP control and admin endpoints:
-//   - GET  /healthz
+//   - GET  /livez, /readyz, /startupz, /healthz
 //   - GET  /v1/lease
 //   - GET  /v1/lease/status
 //   - POST /v1/lease/fence
@@ -43,6 +45,7 @@ type Handler struct {
 	scrubber    *Scrubber
 	recovery    *RecoveryReconciler
 	adminToken  string
+	probes      *health.Registry
 	mux         *http.ServeMux
 }
 
@@ -59,15 +62,23 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 		svc = defaultServiceName
 	}
 
+	probes := cfg.Probes
+	if probes == nil {
+		probes = health.New(svc)
+		probes.MarkStarted()
+		probes.MarkReady()
+	}
+
 	h := &Handler{
 		serviceName: svc,
 		leases:      cfg.Leases,
 		scrubber:    cfg.Scrubber,
 		recovery:    cfg.Recovery,
 		adminToken:  strings.TrimSpace(cfg.AdminToken),
+		probes:      probes,
 		mux:         http.NewServeMux(),
 	}
-	h.mux.HandleFunc("/healthz", h.handleHealthz)
+	h.probes.Register(h.mux)
 	h.mux.HandleFunc("/v1/lease", h.requireAdminAuth(h.handleLeaseStatus))
 	h.mux.HandleFunc("/v1/lease/status", h.requireAdminAuth(h.handleLeaseStatus))
 	h.mux.HandleFunc("/v1/lease/fence", h.requireAdminAuth(h.handleLeaseFence))
@@ -102,17 +113,6 @@ func (h *Handler) isAuthorized(authHeader string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(token), []byte(h.adminToken)) == 1
-}
-
-func (h *Handler) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status":  "ok",
-		"service": h.serviceName,
-	})
 }
 
 func (h *Handler) handleLeaseStatus(w http.ResponseWriter, r *http.Request) {

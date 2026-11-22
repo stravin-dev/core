@@ -2,7 +2,6 @@ package node
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,6 +22,7 @@ import (
 	"stravin.dev/core/internal/cache"
 	"stravin.dev/core/internal/crypto"
 	"stravin.dev/core/internal/gitexec"
+	"stravin.dev/core/internal/health"
 	"stravin.dev/core/internal/hooks/wasm"
 	"stravin.dev/core/internal/lease"
 	"stravin.dev/core/internal/rpc"
@@ -55,7 +55,9 @@ type DaemonConfig struct {
 	AWSEndpointURL           string
 	LeaseRefreshInterval     time.Duration
 	ShutdownTimeout          time.Duration
+	DrainDelay               time.Duration
 	TelemetryShutdownTimeout time.Duration
+	Probes                   *health.Registry
 	GRPCTransport            rpc.TransportConfig
 	GitExec                  gitexec.Config
 	WriteHandler             WriteHandler
@@ -274,21 +276,21 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 	grpcSrv := grpc.NewServer(grpcOpts...)
 	rpc.RegisterGitWireServer(grpcSrv, nodeSrv)
 
+	probes := cfg.Probes
+	if probes == nil {
+		probes = health.New("stravin-node", health.WithMetadata("region", string(cfg.Region)))
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"status":  "ok",
-			"service": "stravin-node",
-			"region":  string(cfg.Region),
-		})
-	})
+	probes.Register(mux)
 	mux.Handle("/metrics", metrics)
 	healthSrv := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+
+	probes.MarkStarted()
+	probes.MarkReady()
 
 	logger.Info("stravin-node listening",
 		"grpc_addr", grpcLn.Addr().String(),
@@ -318,12 +320,17 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 
 	select {
 	case err := <-errCh:
+		probes.SetDraining()
 		grpcSrv.GracefulStop()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
 		_ = healthSrv.Shutdown(shutdownCtx)
 		return err
 	case <-ctx.Done():
+		probes.SetDraining()
+		if cfg.DrainDelay > 0 {
+			time.Sleep(cfg.DrainDelay)
+		}
 		stopped := make(chan struct{})
 		go func() {
 			grpcSrv.GracefulStop()

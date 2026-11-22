@@ -18,4 +18,6 @@ RUN apk add --no-cache ca-certificates \
 
 COPY --from=builder /out/stravin-chaos /usr/local/bin/stravin-chaos
 USER stravin
+# CLI chaos nemesis runner; no HTTP health listener.
+HEALTHCHECK NONE
 ENTRYPOINT ["/usr/local/bin/stravin-chaos"]

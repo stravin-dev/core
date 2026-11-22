@@ -70,7 +70,7 @@ services:
       AWS_SECRET_ACCESS_KEY: "test"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
       interval: 2s
       timeout: 2s
       retries: 15
@@ -105,7 +105,7 @@ services:
       AWS_SECRET_ACCESS_KEY: "test"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/healthz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/readyz"]
       interval: 2s
       timeout: 2s
       retries: 15
@@ -141,7 +141,7 @@ services:
       AWS_SECRET_ACCESS_KEY: "test"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8082/healthz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8082/readyz"]
       interval: 2s
       timeout: 2s
       retries: 15
@@ -175,7 +175,7 @@ services:
       AWS_SECRET_ACCESS_KEY: "test"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8083/healthz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8083/readyz"]
       interval: 2s
       timeout: 2s
       retries: 15
@@ -207,7 +207,7 @@ services:
       AWS_SECRET_ACCESS_KEY: "test"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8084/healthz"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8084/readyz"]
       interval: 2s
       timeout: 2s
       retries: 15

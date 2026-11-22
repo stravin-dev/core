@@ -21,6 +21,7 @@ import (
 	"stravin.dev/core/internal/crypto"
 	"stravin.dev/core/internal/ctrl"
 	"stravin.dev/core/internal/daemon"
+	"stravin.dev/core/internal/health"
 	"stravin.dev/core/internal/lease"
 	"stravin.dev/core/internal/storage/ddb"
 	"stravin.dev/core/internal/storage/s3"
@@ -323,12 +324,14 @@ func run(ctx context.Context, cfg ctrlConfig) error {
 		return fmt.Errorf("init recovery reconciler: %w", err)
 	}
 
+	probes := health.New(serviceName)
 	handler, err := ctrl.NewHandler(ctrl.HandlerConfig{
 		ServiceName: serviceName,
 		Leases:      leaseMgr,
 		Scrubber:    scrubber,
 		Recovery:    reconciler,
 		AdminToken:  cfg.AdminToken,
+		Probes:      probes,
 	})
 	if err != nil {
 		return fmt.Errorf("init http handler: %w", err)
@@ -347,6 +350,16 @@ func run(ctx context.Context, cfg ctrlConfig) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	httpErrCh := make(chan error, 1)
+	go func() {
+		slog.Info("stravin-ctrl listening", "service", serviceName, "addr", ln.Addr().String(), "region", cfg.Region)
+		if serveErr := srv.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			httpErrCh <- serveErr
+			return
+		}
+		httpErrCh <- nil
+	}()
+
 	if cfg.RecoveryOnBoot && len(cfg.RecoveryRepos) > 0 {
 		if _, renewErr := leaseMgr.RenewOnce(runCtx); renewErr != nil {
 			slog.Warn("ctrl: initial lease renew before recovery boot failed", "region", cfg.Region, "error", renewErr)
@@ -360,21 +373,16 @@ func run(ctx context.Context, cfg ctrlConfig) error {
 		leaseDone <- leaseMgr.Run(runCtx)
 	}()
 
-	httpErrCh := make(chan error, 1)
-	go func() {
-		slog.Info("stravin-ctrl listening", "service", serviceName, "addr", ln.Addr().String(), "region", cfg.Region)
-		if serveErr := srv.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-			httpErrCh <- serveErr
-			return
-		}
-		httpErrCh <- nil
-	}()
+	probes.MarkStarted()
+	probes.MarkReady()
 
 	var serveErr error
 	select {
 	case serveErr = <-httpErrCh:
+		probes.SetDraining()
 		cancel()
 	case <-ctx.Done():
+		probes.SetDraining()
 		cancel()
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
 		defer shutCancel()
