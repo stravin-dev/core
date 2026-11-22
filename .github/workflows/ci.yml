@@ -8,37 +8,149 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  test-and-build:
-    name: Test, Vet, Lint, and Build
+  pre-commit:
+    name: Pre-commit & Lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Read tool versions from .tool-versions
+        id: tools
+        run: |
+          echo "go=$(awk '$1 == "golang" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "golangci_lint=$(awk '$1 == "golangci-lint" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "pre_commit=$(awk '$1 == "pre-commit" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ steps.tools.outputs.go }}
           cache: true
 
-      - name: Check formatting
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache golangci-lint binary and cache
+        id: golangci-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/bin/golangci-lint
+            ~/.cache/golangci-lint
+          key: golangci-lint-${{ runner.os }}-${{ steps.tools.outputs.golangci_lint }}-${{ hashFiles('.golangci.yml', 'go.sum') }}
+          restore-keys: |
+            golangci-lint-${{ runner.os }}-${{ steps.tools.outputs.golangci_lint }}-
+
+      - name: Install golangci-lint
         run: |
-          unformatted="$(gofmt -l .)"
-          if [ -n "$unformatted" ]; then
-            echo "Unformatted Go files:"
-            echo "$unformatted"
-            exit 1
+          mkdir -p "$HOME/bin"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          if [ ! -x "$HOME/bin/golangci-lint" ]; then
+            curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+              | sh -s -- -b "$HOME/bin" "v${{ steps.tools.outputs.golangci_lint }}"
           fi
+          "$HOME/bin/golangci-lint" --version
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ steps.tools.outputs.pre_commit }}-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Install pre-commit
+        run: |
+          python -m pip install --disable-pip-version-check "pre-commit==${{ steps.tools.outputs.pre_commit }}"
+          pre-commit --version
+
+      - name: Run pre-commit on all files
+        run: pre-commit run --all-files --show-diff-on-failure
+
+  unit-tests:
+    name: Unit Tests & Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read Go version from .tool-versions
+        id: tools
+        run: echo "go=$(awk '$1 == "golang" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.tools.outputs.go }}
+          cache: true
 
       - name: Vet
         run: go vet ./...
 
-      - name: Test with race detector
-        run: go test -race -v ./...
+      - name: Unit tests with race detector and coverage
+        run: go test -race -cover ./...
 
-      - name: Build all daemons
+      - name: Build all 5 daemons
         run: |
+          mkdir -p bin
           for d in edge node pack ctrl hook; do
             CGO_ENABLED=0 go build -o "bin/stravin-$d" "./cmd/stravin-$d"
           done
+
+  integration-tests:
+    name: Integration Tests (Docker Compose + Floci)
+    runs-on: ubuntu-latest
+    env:
+      AWS_ENDPOINT_URL: http://localhost:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read Go version from .tool-versions
+        id: tools
+        run: echo "go=$(awk '$1 == "golang" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.tools.outputs.go }}
+          cache: true
+
+      - name: Start Floci and run bootstrap
+        run: |
+          docker compose up -d floci floci-init
+          init_id="$(docker compose ps -a -q floci-init)"
+          if [ -z "${init_id}" ]; then
+            echo "floci-init container not found" >&2
+            exit 1
+          fi
+          exit_code="$(timeout 120 docker wait "${init_id}")"
+          if [ "${exit_code}" != "0" ]; then
+            echo "floci-init failed with exit code ${exit_code}" >&2
+            docker compose logs floci-init
+            exit 1
+          fi
+
+      - name: Run Floci wire parity smoke test
+        run: ./scripts/floci-parity-test.sh
+
+      - name: Run Go integration tests
+        run: go test -race -v -tags=integration ./...
+
+      - name: Dump Floci logs on failure
+        if: failure()
+        run: docker compose logs floci floci-init
+
+      - name: Tear down Docker Compose stack
+        if: always()
+        run: docker compose down -v --remove-orphans

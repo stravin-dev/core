@@ -176,7 +176,7 @@ func TestNewULIDLexicographicOrder(t *testing.T) {
 	if len(u1) != 26 || len(u2) != 26 {
 		t.Fatalf("unexpected ULID lengths: %d, %d", len(u1), len(u2))
 	}
-	if !(u1 < u2) {
+	if u1 >= u2 {
 		t.Fatalf("expected %q < %q", u1, u2)
 	}
 }

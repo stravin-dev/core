@@ -249,7 +249,7 @@ func (c *KMSEnvelopeCipher) Decrypt(ctx context.Context, tenantID tenant.TenantI
 	aad := buildAAD(header, tenantID)
 	plaintext, err := aead.Open(nil, nonce, body, aad)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrDecryptionFailed, err)
+		return nil, fmt.Errorf("%w: %w", ErrDecryptionFailed, err)
 	}
 	return plaintext, nil
 }
@@ -323,7 +323,7 @@ func (c *KMSEnvelopeCipher) getOrDecryptDEK(ctx context.Context, tenantID tenant
 		EncryptionContext: map[string]string{tenantContextKey: string(tenantID)},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: kms Decrypt: %v", ErrDecryptionFailed, err)
+		return nil, fmt.Errorf("%w: kms Decrypt: %w", ErrDecryptionFailed, err)
 	}
 	if len(out.Plaintext) != aes256KeyBytes {
 		return nil, fmt.Errorf("%w: unexpected decrypted DEK length %d", ErrDecryptionFailed, len(out.Plaintext))

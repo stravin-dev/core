@@ -12,7 +12,7 @@ import (
 // encodePackEntryHeader encodes a Git packfile v2 variable-length entry header.
 func encodePackEntryHeader(typ ObjectType, size int64) []byte {
 	var out []byte
-	b := byte((uint8(typ)&0x07)<<4) | byte(size&0x0f)
+	b := ((uint8(typ) & 0x07) << 4) | byte(size&0x0f)
 	size >>= 4
 	for size > 0 {
 		out = append(out, b|0x80)
