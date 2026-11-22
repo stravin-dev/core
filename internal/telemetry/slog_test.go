@@ -90,3 +90,23 @@ func TestTraceHandler_PreservesDecoratorThroughWithAttrsAndWithGroup(t *testing.
 		t.Errorf("expected trace_id %q in JSON log, got: %s", wantTraceID, buf.String())
 	}
 }
+
+func TestFanoutHandler_DispatchesToAllEnabledHandlers(t *testing.T) {
+	var bufA, bufB bytes.Buffer
+	hA := telemetry.NewTraceHandler(slog.NewJSONHandler(&bufA, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	hB := telemetry.NewTraceHandler(slog.NewJSONHandler(&bufB, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	logger := slog.New(telemetry.NewFanoutHandler(hA, hB)).With("service", "stravin-edge").WithGroup("req")
+	logger.Info("info-only", "id", 1)
+	logger.Warn("warn-both", "id", 2)
+
+	if !bytes.Contains(bufA.Bytes(), []byte("info-only")) || !bytes.Contains(bufA.Bytes(), []byte("warn-both")) {
+		t.Errorf("bufA missing expected records: %s", bufA.String())
+	}
+	if bytes.Contains(bufB.Bytes(), []byte("info-only")) {
+		t.Errorf("bufB should not contain info-level record: %s", bufB.String())
+	}
+	if !bytes.Contains(bufB.Bytes(), []byte("warn-both")) {
+		t.Errorf("bufB missing warn-level record: %s", bufB.String())
+	}
+}

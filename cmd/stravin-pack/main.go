@@ -225,12 +225,15 @@ func run(ctx context.Context, cfg packConfig) error {
 		return fmt.Errorf("init telemetry: %w", err)
 	}
 	defer func() {
-		shutCtx, cancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
+		shutCtx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeoutFromEnv())
 		defer cancel()
 		if shutErr := telProvider.Shutdown(shutCtx); shutErr != nil {
-			slog.Warn("telemetry shutdown error", "service", serviceName, "error", shutErr)
+			_, _ = fmt.Fprintf(os.Stderr, "%s: telemetry shutdown warning: %v\n", serviceName, shutErr)
 		}
 	}()
+
+	logger := telProvider.Logger(os.Stdout, slog.LevelInfo)
+	slog.SetDefault(logger)
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
 	if err != nil {

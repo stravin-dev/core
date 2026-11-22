@@ -43,22 +43,23 @@ const (
 
 // DaemonConfig configures the full stravin-node process.
 type DaemonConfig struct {
-	Region               lease.Region
-	GRPCAddr             string
-	HealthAddr           string
-	CacheDir             string
-	CacheMaxBytes        int64
-	S3Bucket             string
-	S3ForcePathStyle     bool
-	KMSKeyID             string
-	DDBTable             string
-	AWSEndpointURL       string
-	LeaseRefreshInterval time.Duration
-	ShutdownTimeout      time.Duration
-	GRPCTransport        rpc.TransportConfig
-	GitExec              gitexec.Config
-	WriteHandler         WriteHandler
-	OnReady              func(grpcAddr, healthAddr string)
+	Region                   lease.Region
+	GRPCAddr                 string
+	HealthAddr               string
+	CacheDir                 string
+	CacheMaxBytes            int64
+	S3Bucket                 string
+	S3ForcePathStyle         bool
+	KMSKeyID                 string
+	DDBTable                 string
+	AWSEndpointURL           string
+	LeaseRefreshInterval     time.Duration
+	ShutdownTimeout          time.Duration
+	TelemetryShutdownTimeout time.Duration
+	GRPCTransport            rpc.TransportConfig
+	GitExec                  gitexec.Config
+	WriteHandler             WriteHandler
+	OnReady                  func(grpcAddr, healthAddr string)
 }
 
 // LoadDaemonConfigFromEnv reads stravin-node configuration from environment variables.
@@ -81,20 +82,21 @@ func LoadDaemonConfigFromEnv() DaemonConfig {
 	}
 
 	return DaemonConfig{
-		Region:               lease.Region(region),
-		GRPCAddr:             envOrDefault("STRAVIN_GRPC_ADDR", defaultGRPCAddr),
-		HealthAddr:           envOrDefault("STRAVIN_HEALTH_ADDR", defaultHealthAddr),
-		CacheDir:             envOrDefault("STRAVIN_CACHE_DIR", defaultCacheDir),
-		CacheMaxBytes:        maxBytes,
-		S3Bucket:             bucket,
-		S3ForcePathStyle:     s3.ForcePathStyleFromEnv(),
-		KMSKeyID:             s3.KMSKeyIDFromEnv(),
-		DDBTable:             envOrDefault("STRAVIN_DDB_TABLE", defaultDDBTable),
-		AWSEndpointURL:       strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL")),
-		LeaseRefreshInterval: refreshInterval,
-		ShutdownTimeout:      defaultDaemonShutdownWindow,
-		GRPCTransport:        rpc.LoadTransportConfigFromEnv(),
-		GitExec:              gitexec.LoadConfigFromEnv(defaultGitExecTimeout, nil),
+		Region:                   lease.Region(region),
+		GRPCAddr:                 envOrDefault("STRAVIN_GRPC_ADDR", defaultGRPCAddr),
+		HealthAddr:               envOrDefault("STRAVIN_HEALTH_ADDR", defaultHealthAddr),
+		CacheDir:                 envOrDefault("STRAVIN_CACHE_DIR", defaultCacheDir),
+		CacheMaxBytes:            maxBytes,
+		S3Bucket:                 bucket,
+		S3ForcePathStyle:         s3.ForcePathStyleFromEnv(),
+		KMSKeyID:                 s3.KMSKeyIDFromEnv(),
+		DDBTable:                 envOrDefault("STRAVIN_DDB_TABLE", defaultDDBTable),
+		AWSEndpointURL:           strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL")),
+		LeaseRefreshInterval:     refreshInterval,
+		ShutdownTimeout:          defaultDaemonShutdownWindow,
+		TelemetryShutdownTimeout: telemetry.ShutdownTimeoutFromEnv(),
+		GRPCTransport:            rpc.LoadTransportConfigFromEnv(),
+		GitExec:                  gitexec.LoadConfigFromEnv(defaultGitExecTimeout, nil),
 	}
 }
 
@@ -135,9 +137,6 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 		return fmt.Errorf("node: grpc transport config: %w", err)
 	}
 
-	logger := telemetry.NewLogger(os.Stdout, slog.LevelInfo)
-	slog.SetDefault(logger)
-
 	tp, err := telemetry.Init(ctx, telemetry.Config{
 		ServiceName: "stravin-node",
 		Region:      string(cfg.Region),
@@ -148,10 +147,19 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 		return fmt.Errorf("node: init telemetry: %w", err)
 	}
 	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+		telTimeout := cfg.TelemetryShutdownTimeout
+		if telTimeout <= 0 {
+			telTimeout = telemetry.ShutdownTimeoutFromEnv()
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), telTimeout)
 		defer cancel()
-		_ = tp.Shutdown(shutdownCtx)
+		if shutErr := tp.Shutdown(shutdownCtx); shutErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "stravin-node: telemetry shutdown warning: %v\n", shutErr)
+		}
 	}()
+
+	logger := tp.Logger(os.Stdout, slog.LevelInfo)
+	slog.SetDefault(logger)
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(string(cfg.Region)))
 	if err != nil {

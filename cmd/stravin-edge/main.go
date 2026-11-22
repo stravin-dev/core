@@ -40,9 +40,6 @@ func run() error {
 	healthAddr := os.Getenv("STRAVIN_HEALTH_ADDR")
 	peers := edge.ParsePeers(os.Getenv("STRAVIN_NODE_PEERS"))
 
-	logger := telemetry.NewLogger(os.Stdout, slog.LevelInfo)
-	slog.SetDefault(logger)
-
 	telProvider, err := telemetry.Init(ctx, telemetry.Config{
 		ServiceName: "stravin-edge",
 		Region:      region,
@@ -53,10 +50,15 @@ func run() error {
 		return fmt.Errorf("init telemetry: %w", err)
 	}
 	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeoutFromEnv())
 		defer cancel()
-		_ = telProvider.Shutdown(shutdownCtx)
+		if shutErr := telProvider.Shutdown(shutdownCtx); shutErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "stravin-edge: telemetry shutdown warning: %v\n", shutErr)
+		}
 	}()
+
+	logger := telProvider.Logger(os.Stdout, slog.LevelInfo)
+	slog.SetDefault(logger)
 
 	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {

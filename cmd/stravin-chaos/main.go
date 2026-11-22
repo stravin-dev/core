@@ -16,8 +16,6 @@ import (
 	"stravin.dev/core/internal/telemetry"
 )
 
-const telemetryShutdownTimeout = 5 * time.Second
-
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	err := run(ctx, os.Args[1:], os.Stdout, os.Stderr)
@@ -29,6 +27,15 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	return runWithTelemetry(ctx, args, stdout, stderr, telemetry.Init)
+}
+
+func runWithTelemetry(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+	initTelemetry func(context.Context, telemetry.Config) (*telemetry.Provider, error),
+) error {
 	fs := flag.NewFlagSet("stravin-chaos", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -58,9 +65,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	logger := telemetry.NewLogger(stdout, slog.LevelInfo)
-
-	provider, err := telemetry.Init(ctx, telemetry.Config{
+	provider, err := initTelemetry(ctx, telemetry.Config{
 		ServiceName: "stravin-chaos",
 		Environment: "local-chaos",
 		Endpoint:    otelEndpoint,
@@ -72,12 +77,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("init telemetry: %w", err)
 	}
 	defer func() {
-		flushCtx, cancel := context.WithTimeout(context.Background(), telemetryShutdownTimeout)
+		flushCtx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeoutFromEnv())
 		defer cancel()
 		if shutdownErr := provider.Shutdown(flushCtx); shutdownErr != nil {
-			logger.WarnContext(flushCtx, "telemetry shutdown failed", slog.String("error", shutdownErr.Error()))
+			_, _ = fmt.Fprintf(stderr, "stravin-chaos: telemetry shutdown warning: %v\n", shutdownErr)
 		}
 	}()
+
+	logger := provider.Logger(stdout, slog.LevelInfo)
+	slog.SetDefault(logger)
 
 	targets := parseCSV(restartTargets)
 	proxyClient := chaos.NewToxiproxyClient(toxiproxyURL, nil)

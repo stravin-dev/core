@@ -47,7 +47,8 @@ type Telemetry struct {
 	fsckFailures     metric.Int64Counter
 	activeThreads    metric.Int64UpDownCounter
 
-	shutdownFns []func(context.Context) error
+	forceFlushFns []func(context.Context) error
+	shutdownFns   []func(context.Context) error
 }
 
 // InMemoryExporters exposes deterministic test exporters for traces, metrics, and logs.
@@ -185,6 +186,10 @@ func NewTelemetry(ctx context.Context, endpoint string, logWriter io.Writer) (*T
 	)
 
 	return buildTelemetry(tp, mp, lp, logWriter, []func(context.Context) error{
+		tp.ForceFlush,
+		mp.ForceFlush,
+		lp.ForceFlush,
+	}, []func(context.Context) error{
 		tp.Shutdown,
 		mp.Shutdown,
 		lp.Shutdown,
@@ -217,6 +222,10 @@ func NewInMemoryTelemetry(logWriter io.Writer) (*Telemetry, *InMemoryExporters, 
 	)
 
 	tel, err := buildTelemetry(tp, mp, lp, logWriter, []func(context.Context) error{
+		tp.ForceFlush,
+		mp.ForceFlush,
+		lp.ForceFlush,
+	}, []func(context.Context) error{
 		tp.Shutdown,
 		mp.Shutdown,
 		lp.Shutdown,
@@ -238,6 +247,7 @@ func newNoopTelemetry(logWriter io.Writer) (*Telemetry, error) {
 		nil,
 		logWriter,
 		nil,
+		nil,
 	)
 }
 
@@ -246,6 +256,7 @@ func buildTelemetry(
 	mp metric.MeterProvider,
 	lp *sdklog.LoggerProvider,
 	logWriter io.Writer,
+	forceFlushFns []func(context.Context) error,
 	shutdownFns []func(context.Context) error,
 ) (*Telemetry, error) {
 	meter := mp.Meter(loadgenServiceName)
@@ -315,6 +326,7 @@ func buildTelemetry(
 		unexpectedErrors: unexpectedErrors,
 		fsckFailures:     fsckFailures,
 		activeThreads:    activeThreads,
+		forceFlushFns:    forceFlushFns,
 		shutdownFns:      shutdownFns,
 	}, nil
 }
@@ -366,14 +378,40 @@ func (t *Telemetry) AddActiveThreads(ctx context.Context, persona Persona, delta
 	))
 }
 
-// Shutdown flushes and shuts down TracerProvider, MeterProvider, and LoggerProvider.
-func (t *Telemetry) Shutdown(ctx context.Context) error {
-	var errs []error
-	for _, fn := range t.shutdownFns {
-		if err := fn(ctx); err != nil {
-			errs = append(errs, err)
-		}
+// ForceFlush flushes buffered traces, metrics, and logs concurrently within ctx.
+func (t *Telemetry) ForceFlush(ctx context.Context) error {
+	if t == nil {
+		return nil
 	}
+	return runParallelTelemetry(ctx, t.forceFlushFns)
+}
+
+// Shutdown flushes and shuts down TracerProvider, MeterProvider, and LoggerProvider
+// concurrently within ctx so one slow exporter cannot starve the others.
+func (t *Telemetry) Shutdown(ctx context.Context) error {
+	if t == nil {
+		return nil
+	}
+	return runParallelTelemetry(ctx, t.shutdownFns)
+}
+
+func runParallelTelemetry(ctx context.Context, fns []func(context.Context) error) error {
+	if len(fns) == 0 {
+		return nil
+	}
+	errs := make([]error, len(fns))
+	var wg sync.WaitGroup
+	for i, fn := range fns {
+		if fn == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(idx int, call func(context.Context) error) {
+			defer wg.Done()
+			errs[idx] = call(ctx)
+		}(i, fn)
+	}
+	wg.Wait()
 	return errors.Join(errs...)
 }
 

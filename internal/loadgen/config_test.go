@@ -165,3 +165,23 @@ func TestConfigRepoURLs(t *testing.T) {
 		t.Errorf("RepoSSHURL = %q, want ssh://git@127.0.0.1:2222/loadgen/repo-1.git", got)
 	}
 }
+
+func TestParseFlagsRespectsEnvShutdownTimeout(t *testing.T) {
+	t.Setenv("STRAVIN_OTEL_SHUTDOWN_TIMEOUT", "7s")
+	var stderr bytes.Buffer
+	cfg, err := ParseFlags(nil, &stderr)
+	if err != nil {
+		t.Fatalf("ParseFlags: %v", err)
+	}
+	if cfg.FlushTimeout != 7*time.Second {
+		t.Fatalf("FlushTimeout = %v, want 7s", cfg.FlushTimeout)
+	}
+
+	cfgOverride, err := ParseFlags([]string{"--flush-timeout=3s"}, &stderr)
+	if err != nil {
+		t.Fatalf("ParseFlags override: %v", err)
+	}
+	if cfgOverride.FlushTimeout != 3*time.Second {
+		t.Fatalf("FlushTimeout override = %v, want 3s", cfgOverride.FlushTimeout)
+	}
+}

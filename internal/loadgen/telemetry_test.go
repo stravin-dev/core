@@ -3,7 +3,9 @@ package loadgen
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -99,5 +101,37 @@ func TestNewTelemetryEmptyEndpointNoop(t *testing.T) {
 	span.End()
 	if err := tel.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown error: %v", err)
+	}
+}
+
+func TestTelemetryParallelShutdownDoesNotStarveFastExporters(t *testing.T) {
+	var fastDone atomic.Bool
+	errSlow := errors.New("slow exporter blocked")
+	errFast := errors.New("fast exporter error")
+
+	tel := &Telemetry{
+		shutdownFns: []func(context.Context) error{
+			func(ctx context.Context) error {
+				<-ctx.Done()
+				return errSlow
+			},
+			func(ctx context.Context) error {
+				if ctx.Err() == nil {
+					fastDone.Store(true)
+				}
+				return errFast
+			},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+
+	err := tel.Shutdown(ctx)
+	if !fastDone.Load() {
+		t.Fatal("expected fast exporter to finish in parallel despite slow exporter")
+	}
+	if !errors.Is(err, errSlow) || !errors.Is(err, errFast) {
+		t.Fatalf("Shutdown error = %v, want both %v and %v", err, errSlow, errFast)
 	}
 }
