@@ -6,7 +6,6 @@ package edge
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,6 +15,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"stravin.dev/core/internal/health"
 	"stravin.dev/core/internal/telemetry"
 )
 
@@ -25,8 +25,10 @@ const defaultShutdownTimeout = 10 * time.Second
 type ServerConfig struct {
 	SSHAddr         string
 	HTTPAddr        string
-	HealthAddr      string // Optional dedicated /healthz listener (e.g. ":8081").
+	HealthAddr      string // Optional dedicated health probe listener (e.g. ":8081").
 	ShutdownTimeout time.Duration
+	DrainDelay      time.Duration
+	Probes          *health.Registry
 	HostKey         ssh.Signer
 	Authenticator   Authenticator
 	Limiter         Limiter
@@ -43,6 +45,7 @@ type Server struct {
 	metrics     *Metrics
 	httpHandler *HTTPHandler
 	sshServer   *SSHServer
+	probes      *health.Registry
 }
 
 // NewServer builds a Server facade from cfg.
@@ -73,11 +76,18 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, err
 	}
 
+	probes := cfg.Probes
+	if probes == nil {
+		probes = health.New("stravin-edge")
+	}
+	httpHandler.SetProbes(probes)
+
 	return &Server{
 		cfg:         cfg,
 		metrics:     metrics,
 		httpHandler: httpHandler,
 		sshServer:   sshServer,
+		probes:      probes,
 	}, nil
 }
 
@@ -103,19 +113,15 @@ func (s *Server) Run(ctx context.Context) error {
 			return fmt.Errorf("edge: listen health %s: %w", s.cfg.HealthAddr, err)
 		}
 		mux := http.NewServeMux()
-		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"status":  "ok",
-				"service": "stravin-edge",
-			})
-		})
+		s.probes.Register(mux)
 		healthSrv = NewHTTPServer(s.cfg.HealthAddr, mux)
 	}
 
 	httpSrv := NewHTTPServer(s.cfg.HTTPAddr, s.httpHandler)
 	errCh := make(chan error, 3)
+
+	s.probes.MarkStarted()
+	s.probes.MarkReady()
 
 	s.cfg.Logger.Info("stravin-edge listening",
 		"http_addr", httpLn.Addr().String(),
@@ -153,14 +159,19 @@ func (s *Server) Run(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 
+	s.probes.SetDraining()
+	if s.cfg.DrainDelay > 0 {
+		time.Sleep(s.cfg.DrainDelay)
+	}
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
 	defer cancel()
 
 	var shutdownErrs []error
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+	if err := s.sshServer.Shutdown(shutdownCtx); err != nil {
 		shutdownErrs = append(shutdownErrs, err)
 	}
-	if err := s.sshServer.Shutdown(shutdownCtx); err != nil {
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		shutdownErrs = append(shutdownErrs, err)
 	}
 	if healthSrv != nil {

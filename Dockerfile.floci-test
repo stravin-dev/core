@@ -20,9 +20,15 @@ RUN apk add --no-cache ca-certificates \
 FROM runtime-base AS floci-test-s3-sync
 COPY --from=builder /out/floci-test-s3-sync /usr/local/bin/floci-test-s3-sync
 USER stravin
+# Long-running test sync daemon without an HTTP listener; verify process is alive.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD pidof floci-test-s3-sync >/dev/null || exit 1
 ENTRYPOINT ["/usr/local/bin/floci-test-s3-sync"]
 
 FROM runtime-base AS floci-test-ddb-sync
 COPY --from=builder /out/floci-test-ddb-sync /usr/local/bin/floci-test-ddb-sync
 USER stravin
+# Long-running test sync daemon without an HTTP listener; verify process is alive.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD pidof floci-test-ddb-sync >/dev/null || exit 1
 ENTRYPOINT ["/usr/local/bin/floci-test-ddb-sync"]

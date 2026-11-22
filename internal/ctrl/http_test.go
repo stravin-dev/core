@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"stravin.dev/core/internal/health"
 	"stravin.dev/core/internal/lease"
 	"stravin.dev/core/internal/storage/ddb"
 	"stravin.dev/core/internal/tenant"
@@ -255,4 +256,48 @@ func TestHandler_AdminAuth(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestHandler_KubernetesProbesLifecycle(t *testing.T) {
+	probes := health.New("stravin-ctrl")
+	base := newTestAdminHandler(t, testAdminToken)
+	handler, err := NewHandler(HandlerConfig{
+		ServiceName: "stravin-ctrl",
+		Leases:      base.leases,
+		Scrubber:    base.scrubber,
+		Recovery:    base.recovery,
+		AdminToken:  testAdminToken,
+		Probes:      probes,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	check := func(path string, want int) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != want {
+			t.Fatalf("GET %s = %d, want %d", path, rec.Code, want)
+		}
+	}
+
+	// Unauthenticated before startup: /livez 200, /startupz & /readyz 503.
+	check("/livez", http.StatusOK)
+	check("/startupz", http.StatusServiceUnavailable)
+	check("/readyz", http.StatusServiceUnavailable)
+
+	// Started and ready: all 200.
+	probes.MarkStarted()
+	probes.MarkReady()
+	check("/livez", http.StatusOK)
+	check("/startupz", http.StatusOK)
+	check("/readyz", http.StatusOK)
+	check("/healthz", http.StatusOK)
+
+	// Draining: /readyz & /healthz 503, /livez 200.
+	probes.SetDraining()
+	check("/livez", http.StatusOK)
+	check("/readyz", http.StatusServiceUnavailable)
+	check("/healthz", http.StatusServiceUnavailable)
 }

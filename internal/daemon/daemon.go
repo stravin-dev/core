@@ -1,10 +1,10 @@
-// Package daemon provides a minimal shared HTTP /healthz server and graceful
-// SIGINT/SIGTERM lifecycle runner for Stravin Core daemons.
+// Package daemon provides a minimal shared HTTP probe server (/livez, /readyz,
+// /startupz, /healthz) and graceful SIGINT/SIGTERM lifecycle runner for Stravin
+// Core daemons.
 package daemon
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,6 +14,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"stravin.dev/core/internal/health"
 )
 
 const defaultShutdownTimeout = 5 * time.Second
@@ -23,6 +25,8 @@ type Config struct {
 	ServiceName     string
 	ListenAddr      string
 	ShutdownTimeout time.Duration
+	DrainDelay      time.Duration
+	Probes          *health.Registry
 	OnReady         func(addr string)
 }
 
@@ -44,7 +48,7 @@ func RunWithSignals(serviceName, defaultAddr string) error {
 	})
 }
 
-// Run starts the daemon's /healthz HTTP listener and blocks until ctx is cancelled.
+// Run starts the daemon's HTTP probe listener and blocks until ctx is cancelled.
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.ServiceName == "" {
 		return errors.New("daemon: empty service name")
@@ -56,15 +60,13 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.ShutdownTimeout = defaultShutdownTimeout
 	}
 
+	probes := cfg.Probes
+	if probes == nil {
+		probes = health.New(cfg.ServiceName)
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"status":  "ok",
-			"service": cfg.ServiceName,
-		})
-	})
+	probes.Register(mux)
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
@@ -75,6 +77,9 @@ func Run(ctx context.Context, cfg Config) error {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+
+	probes.MarkStarted()
+	probes.MarkReady()
 
 	slog.Info("daemon listening", "service", cfg.ServiceName, "addr", ln.Addr().String())
 	if cfg.OnReady != nil {
@@ -92,8 +97,13 @@ func Run(ctx context.Context, cfg Config) error {
 
 	select {
 	case err := <-errCh:
+		probes.SetDraining()
 		return err
 	case <-ctx.Done():
+		probes.SetDraining()
+		if cfg.DrainDelay > 0 {
+			time.Sleep(cfg.DrainDelay)
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {

@@ -3,7 +3,6 @@ package edge
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,6 +13,7 @@ import (
 
 	"google.golang.org/grpc/metadata"
 
+	"stravin.dev/core/internal/health"
 	"stravin.dev/core/internal/rpc"
 	"stravin.dev/core/internal/telemetry"
 	"stravin.dev/core/internal/tenant"
@@ -27,7 +27,7 @@ const (
 	headerStatelessRPC  = "x-stravin-stateless-rpc"
 )
 
-// HTTPHandler serves Git Smart HTTP endpoints alongside /healthz.
+// HTTPHandler serves Git Smart HTTP endpoints alongside Kubernetes health probes.
 type HTTPHandler struct {
 	auth     Authenticator
 	limiter  Limiter
@@ -36,6 +36,7 @@ type HTTPHandler struct {
 	proxy    *WireProxy
 	metrics  *Metrics
 	logger   *slog.Logger
+	probes   *health.Registry
 }
 
 // NewHTTPHandler constructs a Smart HTTP handler with all required collaborators.
@@ -70,6 +71,9 @@ func NewHTTPHandler(
 	if logger == nil {
 		logger = slog.Default()
 	}
+	probes := health.New("stravin-edge")
+	probes.MarkStarted()
+	probes.MarkReady()
 	return &HTTPHandler{
 		auth:     auth,
 		limiter:  limiter,
@@ -78,13 +82,20 @@ func NewHTTPHandler(
 		proxy:    proxy,
 		metrics:  metrics,
 		logger:   logger,
+		probes:   probes,
 	}, nil
 }
 
-// ServeHTTP dispatches /healthz and Smart HTTP Git endpoints.
+// SetProbes attaches a lifecycle-managed health probe registry to the handler.
+func (h *HTTPHandler) SetProbes(probes *health.Registry) {
+	if probes != nil {
+		h.probes = probes
+	}
+}
+
+// ServeHTTP dispatches health probes and Smart HTTP Git endpoints.
 func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/healthz" {
-		h.serveHealthz(w, r)
+	if h.probes.ServeProbe(w, r) {
 		return
 	}
 
@@ -208,15 +219,6 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.metrics.RecordRequest(ctx, "http", route.metricOp, strconv.Itoa(http.StatusOK), "", time.Since(start))
-}
-
-func (h *HTTPHandler) serveHealthz(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"status":  "ok",
-		"service": "stravin-edge",
-	})
 }
 
 func (h *HTTPHandler) writeUnauthorized(w http.ResponseWriter, ctx context.Context, metricOp string, start time.Time) {
