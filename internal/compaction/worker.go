@@ -116,15 +116,28 @@ func (w *Worker) Run(ctx context.Context) error {
 // discovery when empty) and executes it via Engine.CompactShard.
 func (w *Worker) StepCompaction(ctx context.Context) (JobResult, bool, error) {
 	if w.queue.Len() == 0 && w.discoverer != nil {
-		shards, _, err := w.discoverer.DiscoverTargets(ctx)
-		if err != nil {
+		if err := w.discoverIntoQueue(ctx); err != nil {
 			return JobResult{}, false, err
 		}
-		for _, s := range shards {
-			w.queue.Enqueue(s)
-		}
 	}
+	return w.stepQueued(ctx)
+}
 
+func (w *Worker) discoverIntoQueue(ctx context.Context) error {
+	if w.discoverer == nil {
+		return nil
+	}
+	shards, _, err := w.discoverer.DiscoverTargets(ctx)
+	if err != nil {
+		return err
+	}
+	for _, s := range shards {
+		w.queue.Enqueue(s)
+	}
+	return nil
+}
+
+func (w *Worker) stepQueued(ctx context.Context) (JobResult, bool, error) {
 	target, ok := w.queue.Dequeue()
 	if !ok {
 		return JobResult{}, false, nil
@@ -138,11 +151,22 @@ func (w *Worker) compactionLoop(ctx context.Context) {
 	defer ticker.Stop()
 
 	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if w.queue.Len() == 0 {
+			if err := w.discoverIntoQueue(ctx); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return
+				}
+				w.logger.Error("compaction target discovery failed", "error", err)
+			}
+		}
 		for {
 			if ctx.Err() != nil {
 				return
 			}
-			res, ran, err := w.StepCompaction(ctx)
+			res, ran, err := w.stepQueued(ctx)
 			if err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return

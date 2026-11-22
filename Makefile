@@ -1,12 +1,16 @@
 GO := ./scripts/go.sh
 DAEMONS := edge node pack ctrl hook
+BINARIES := $(DAEMONS) admin
 BIN_DIR := bin
 PRE_COMMIT ?= $(shell if command -v pre-commit >/dev/null 2>&1; then echo pre-commit; elif command -v asdf >/dev/null 2>&1; then echo "asdf exec pre-commit"; else echo pre-commit; fi)
 
-.PHONY: test vet lint build docker-build clean pre-commit install-hooks
+.PHONY: test e2e vet lint build docker-build clean pre-commit install-hooks
 
 test:
 	$(GO) test -race -v ./...
+
+e2e:
+	./scripts/e2e.sh
 
 vet:
 	$(GO) vet ./...
@@ -25,7 +29,7 @@ lint: vet
 
 build:
 	@mkdir -p $(BIN_DIR)
-	@for d in $(DAEMONS); do \
+	@for d in $(BINARIES); do \
 		echo "Building stravin-$$d..."; \
 		$(GO) build -o $(BIN_DIR)/stravin-$$d ./cmd/stravin-$$d; \
 	done
