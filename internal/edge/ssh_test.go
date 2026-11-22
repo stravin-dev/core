@@ -2,6 +2,7 @@ package edge
 
 import (
 	"bytes"
+	"context"
 	"net"
 	"strings"
 	"testing"
@@ -163,5 +164,80 @@ func TestSSHServer_EndToEndAuthStreamingIsolationAndLease(t *testing.T) {
 	_ = sessPush.Close()
 	if !strings.Contains(pushStderr.String(), "temporarily unavailable") {
 		t.Fatalf("expected unavailable message on stderr, got %q", pushStderr.String())
+	}
+}
+
+func TestSSHServer_PreAuthStallDoesNotHangShutdown(t *testing.T) {
+	env := newTestEdgeEnv(t, LimiterConfig{})
+	defer env.close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen ssh: %v", err)
+	}
+	go func() { _ = env.sshServer.Serve(ln) }()
+
+	// Open raw TCP connection and stall without sending an SSH banner.
+	rawConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial raw tcp: %v", err)
+	}
+	defer func() { _ = rawConn.Close() }()
+
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		done <- env.sshServer.Shutdown(ctx)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil && err != context.DeadlineExceeded {
+			t.Fatalf("unexpected Shutdown error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("SSHServer.Shutdown hung on stalled unauthenticated TCP connection")
+	}
+}
+
+func TestSSHServer_SessionChannelCap(t *testing.T) {
+	env := newTestEdgeEnv(t, LimiterConfig{})
+	defer env.close()
+	env.sshServer.maxSessionsPerConn = 2
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen ssh: %v", err)
+	}
+	go func() { _ = env.sshServer.Serve(ln) }()
+	defer func() { _ = env.sshServer.Close() }()
+
+	client, err := ssh.Dial("tcp", ln.Addr().String(), &ssh.ClientConfig{
+		User:            "git",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(env.clientKey.(ssh.Signer))},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("ssh.Dial: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	s1, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession 1: %v", err)
+	}
+	defer func() { _ = s1.Close() }()
+
+	s2, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession 2: %v", err)
+	}
+	defer func() { _ = s2.Close() }()
+
+	if s3, err := client.NewSession(); err == nil {
+		_ = s3.Close()
+		t.Fatal("expected 3rd concurrent SSH session channel to be rejected")
 	}
 }

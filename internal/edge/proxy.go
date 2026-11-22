@@ -127,7 +127,11 @@ func (p *WireProxy) ProxyStream(
 
 	sendErrCh := make(chan error, 1)
 	go func() {
-		sendErrCh <- pumpStdin(streamCtx, stdin, stream)
+		err := pumpStdin(streamCtx, stdin, stream)
+		sendErrCh <- err
+		if err != nil {
+			cancel()
+		}
 	}()
 
 	var exitCode int32

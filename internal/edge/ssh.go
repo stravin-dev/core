@@ -23,8 +23,12 @@ import (
 )
 
 const (
-	sshExtTenantID = "tenant_id"
-	sshExtActorID  = "actor_id"
+	sshExtTenantID               = "tenant_id"
+	sshExtActorID                = "actor_id"
+	defaultSSHHandshakeTimeout   = 10 * time.Second
+	defaultSSHExecIdleTimeout    = 15 * time.Second
+	defaultSSHMaxConns           = 1024
+	defaultSSHMaxSessionsPerConn = 8
 )
 
 // LoadOrGenerateHostKey loads a PEM-encoded SSH host private key from path, or
@@ -112,8 +116,17 @@ type SSHServer struct {
 	metrics  *Metrics
 	logger   *slog.Logger
 
+	handshakeTimeout   time.Duration
+	execIdleTimeout    time.Duration
+	maxSessionsPerConn int
+	connSem            chan struct{}
+
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
+
 	mu       sync.Mutex
 	listener net.Listener
+	conns    map[net.Conn]struct{}
 	closed   bool
 	wg       sync.WaitGroup
 }
@@ -155,19 +168,27 @@ func NewSSHServer(
 		logger = slog.Default()
 	}
 
+	baseCtx, baseCancel := context.WithCancel(context.Background())
 	s := &SSHServer{
-		auth:     auth,
-		limiter:  limiter,
-		resolver: resolver,
-		router:   router,
-		proxy:    proxy,
-		metrics:  metrics,
-		logger:   logger,
+		auth:               auth,
+		limiter:            limiter,
+		resolver:           resolver,
+		router:             router,
+		proxy:              proxy,
+		metrics:            metrics,
+		logger:             logger,
+		handshakeTimeout:   defaultSSHHandshakeTimeout,
+		execIdleTimeout:    defaultSSHExecIdleTimeout,
+		maxSessionsPerConn: defaultSSHMaxSessionsPerConn,
+		connSem:            make(chan struct{}, defaultSSHMaxConns),
+		baseCtx:            baseCtx,
+		baseCancel:         baseCancel,
+		conns:              make(map[net.Conn]struct{}),
 	}
 
 	cfg := &ssh.ServerConfig{
 		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			principal, err := s.auth.AuthenticateSSHKey(context.Background(), key)
+			principal, err := s.auth.AuthenticateSSHKey(s.baseCtx, key)
 			if err != nil {
 				return nil, ErrUnauthorized
 			}
@@ -184,7 +205,7 @@ func NewSSHServer(
 	return s, nil
 }
 
-// Serve accepts incoming SSH connections on ln until Close is called or ln fails.
+// Serve accepts incoming SSH connections on ln until Shutdown or Close is called or ln fails.
 func (s *SSHServer) Serve(ln net.Listener) error {
 	s.mu.Lock()
 	if s.closed {
@@ -205,84 +226,201 @@ func (s *SSHServer) Serve(ln net.Listener) error {
 			}
 			return err
 		}
+
+		select {
+		case s.connSem <- struct{}{}:
+		default:
+			_ = conn.Close()
+			continue
+		}
+
+		if !s.trackConn(conn) {
+			<-s.connSem
+			_ = conn.Close()
+			return nil
+		}
+
 		s.wg.Add(1)
 		go func(c net.Conn) {
 			defer s.wg.Done()
+			defer func() {
+				s.untrackConn(c)
+				<-s.connSem
+			}()
 			s.handleConn(c)
 		}(conn)
 	}
 }
 
-// Close stops accepting new SSH connections and waits for active handlers to drain.
-func (s *SSHServer) Close() error {
+// Shutdown stops accepting new SSH connections, cancels server-scoped contexts, and
+// waits for active handlers to drain until ctx expires, forcefully closing remaining
+// connections on timeout so shutdown never hangs.
+func (s *SSHServer) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	s.closed = true
 	ln := s.listener
 	s.mu.Unlock()
 
-	var err error
+	s.baseCancel()
+
+	var lnErr error
 	if ln != nil {
-		err = ln.Close()
+		if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			lnErr = err
+		}
 	}
-	s.wg.Wait()
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return lnErr
+	case <-ctx.Done():
+		s.closeActiveConns()
+		<-done
+		if lnErr != nil {
+			return lnErr
+		}
+		return ctx.Err()
+	}
+}
+
+// Close immediately stops accepting connections, closes active connections, and waits for handlers.
+func (s *SSHServer) Close() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := s.Shutdown(ctx)
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
 	return err
 }
 
+func (s *SSHServer) trackConn(c net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.conns[c] = struct{}{}
+	return true
+}
+
+func (s *SSHServer) untrackConn(c net.Conn) {
+	s.mu.Lock()
+	delete(s.conns, c)
+	s.mu.Unlock()
+}
+
+func (s *SSHServer) closeActiveConns() {
+	s.mu.Lock()
+	conns := make([]net.Conn, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
+
 func (s *SSHServer) handleConn(rawConn net.Conn) {
+	_ = rawConn.SetDeadline(time.Now().Add(s.handshakeTimeout))
 	serverConn, chans, reqs, err := ssh.NewServerConn(rawConn, s.sshCfg)
 	if err != nil {
 		_ = rawConn.Close()
 		return
 	}
-	defer func() { _ = serverConn.Close() }()
+	_ = rawConn.SetDeadline(time.Time{})
 
+	connCtx, connCancel := context.WithCancel(s.baseCtx)
+	defer func() {
+		connCancel()
+		_ = serverConn.Close()
+	}()
+
+	go func() {
+		_ = serverConn.Wait()
+		connCancel()
+	}()
 	go ssh.DiscardRequests(reqs)
 
 	principal := principalFromSSHPerms(serverConn.Permissions)
+	sessSem := make(chan struct{}, s.maxSessionsPerConn)
+
 	for newChan := range chans {
 		if newChan.ChannelType() != "session" {
 			_ = newChan.Reject(ssh.UnknownChannelType, "only session channels are supported")
 			continue
 		}
+		select {
+		case sessSem <- struct{}{}:
+		default:
+			_ = newChan.Reject(ssh.ResourceShortage, "too many open sessions")
+			continue
+		}
+
 		ch, requests, err := newChan.Accept()
 		if err != nil {
+			<-sessSem
 			return
 		}
 		s.wg.Add(1)
 		go func(channel ssh.Channel, in <-chan *ssh.Request) {
 			defer s.wg.Done()
-			defer func() { _ = channel.Close() }()
-			s.handleSession(principal, channel, in)
+			defer func() {
+				_ = channel.Close()
+				<-sessSem
+			}()
+			s.handleSession(connCtx, principal, channel, in)
 		}(ch, requests)
 	}
 }
 
-func (s *SSHServer) handleSession(principal Principal, ch ssh.Channel, requests <-chan *ssh.Request) {
-	for req := range requests {
-		switch req.Type {
-		case "exec":
-			cmd, err := decodeSSHExecPayload(req.Payload)
-			if err != nil {
-				_ = req.Reply(false, nil)
+func (s *SSHServer) handleSession(connCtx context.Context, principal Principal, ch ssh.Channel, requests <-chan *ssh.Request) {
+	timer := time.NewTimer(s.execIdleTimeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-connCtx.Done():
+			return
+		case <-timer.C:
+			return
+		case req, ok := <-requests:
+			if !ok {
 				return
 			}
-			_ = req.Reply(true, nil)
-			code := s.executeGitCommand(principal, cmd, ch)
-			sendSSHExitStatus(ch, code)
-			return
-		default:
-			if req.WantReply {
-				_ = req.Reply(false, nil)
+			switch req.Type {
+			case "exec":
+				cmd, err := decodeSSHExecPayload(req.Payload)
+				if err != nil {
+					_ = req.Reply(false, nil)
+					return
+				}
+				_ = req.Reply(true, nil)
+				code := s.executeGitCommand(connCtx, principal, cmd, ch)
+				sendSSHExitStatus(ch, code)
+				return
+			default:
+				if req.WantReply {
+					_ = req.Reply(false, nil)
+				}
 			}
 		}
 	}
 }
 
-func (s *SSHServer) executeGitCommand(principal Principal, cmd string, ch ssh.Channel) uint32 {
+func (s *SSHServer) executeGitCommand(connCtx context.Context, principal Principal, cmd string, ch ssh.Channel) uint32 {
 	start := time.Now()
 	op, repoKey, err := ParseSSHExecCommand(cmd)
 	if err != nil {
-		s.metrics.RecordRequest(context.Background(), "ssh", "unknown", "error", "invalid_request", time.Since(start))
+		s.metrics.RecordRequest(connCtx, "ssh", "unknown", "error", "invalid_request", time.Since(start))
 		_, _ = io.WriteString(ch.Stderr(), "fatal: invalid git command or repository path\n")
 		return 1
 	}
@@ -292,7 +430,7 @@ func (s *SSHServer) executeGitCommand(principal Principal, cmd string, ch ssh.Ch
 		metricOp = "push"
 	}
 
-	ctx, span := s.metrics.StartIngressSpan(context.Background(), "ssh", metricOp, string(repoKey.TenantID), string(repoKey.RepoID), "")
+	ctx, span := s.metrics.StartIngressSpan(connCtx, "ssh", metricOp, string(repoKey.TenantID), string(repoKey.RepoID), "")
 	defer span.End()
 
 	if err := AuthorizeTenant(principal, repoKey.TenantID); err != nil {

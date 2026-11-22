@@ -161,7 +161,7 @@ func (s *Server) Run(ctx context.Context) error {
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		shutdownErrs = append(shutdownErrs, err)
 	}
-	if err := s.sshServer.Close(); err != nil {
+	if err := s.sshServer.Shutdown(shutdownCtx); err != nil {
 		shutdownErrs = append(shutdownErrs, err)
 	}
 	if healthSrv != nil {

@@ -390,3 +390,28 @@ func TestHTTPHandler_AuthCrossTenantTraversalRateLimitAndLease(t *testing.T) {
 		t.Fatalf("expected 503 for expired write lease, got %d", recExpired.Code)
 	}
 }
+
+func TestHTTPHandler_BandwidthLimitReturns429WithoutDeadlock(t *testing.T) {
+	env := newTestEdgeEnv(t, LimiterConfig{
+		PackBytesPerMin: 16,
+	})
+	defer env.close()
+
+	done := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/acme/core.git/git-receive-pack", strings.NewReader(strings.Repeat("P", 64)))
+		req.Header.Set("Authorization", "Bearer tok-acme")
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+		done <- rec.Code
+	}()
+
+	select {
+	case code := <-done:
+		if code != http.StatusTooManyRequests {
+			t.Fatalf("expected 429 on pack bandwidth limit exceeded, got %d", code)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ProxyStream deadlocked when ByteLimitingReader returned ErrBandwidthLimited")
+	}
+}
