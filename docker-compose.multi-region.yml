@@ -1,0 +1,382 @@
+services:
+  floci-region-a:
+    image: floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
+    ports:
+      - "4566:4566"
+    environment:
+      FLOCI_SERVICES: "s3,sqs,dynamodb,dynamodbstreams,kms"
+      FLOCI_DEFAULT_REGION: "us-east-1"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - stravin-multi-region-net
+
+  floci-region-b:
+    image: floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
+    ports:
+      - "4567:4566"
+    environment:
+      FLOCI_SERVICES: "s3,sqs,dynamodb,dynamodbstreams,kms"
+      FLOCI_DEFAULT_REGION: "us-west-2"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - stravin-multi-region-net
+
+  floci-init-a:
+    image: amazon/aws-cli:latest@sha256:b0102d2269f87d8531d931c1a59e248101ace586886e6c077058d94c1c37b846
+    depends_on:
+      floci-region-a:
+        condition: service_healthy
+    environment:
+      AWS_ENDPOINT_URL: "http://floci-region-a:4566"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      AWS_DEFAULT_REGION: "us-east-1"
+      AWS_PAGER: ""
+      STRAVIN_S3_BUCKET: "git-objects-us-east-1"
+      STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_KMS_ALIAS: "alias/stravin-local-dev"
+      FLOCI_SYNC_QUEUE_NAME: "floci-test-s3-sync-queue"
+      STRAVIN_SEED_DEFAULT_REPO: "1"
+    entrypoint: ["/bin/sh", "/scripts/bootstrap-floci-multi-region.sh"]
+    volumes:
+      - ./scripts/bootstrap-floci-multi-region.sh:/scripts/bootstrap-floci-multi-region.sh:ro
+    restart: "no"
+    networks:
+      - stravin-multi-region-net
+
+  floci-init-b:
+    image: amazon/aws-cli:latest@sha256:b0102d2269f87d8531d931c1a59e248101ace586886e6c077058d94c1c37b846
+    depends_on:
+      floci-region-b:
+        condition: service_healthy
+    environment:
+      AWS_ENDPOINT_URL: "http://floci-region-b:4566"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      AWS_DEFAULT_REGION: "us-west-2"
+      AWS_PAGER: ""
+      STRAVIN_S3_BUCKET: "git-objects-us-west-2"
+      STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_KMS_ALIAS: "alias/stravin-local-dev"
+      FLOCI_SYNC_QUEUE_NAME: "floci-test-s3-sync-queue"
+      STRAVIN_SEED_DEFAULT_REPO: "0"
+    entrypoint: ["/bin/sh", "/scripts/bootstrap-floci-multi-region.sh"]
+    volumes:
+      - ./scripts/bootstrap-floci-multi-region.sh:/scripts/bootstrap-floci-multi-region.sh:ro
+    restart: "no"
+    networks:
+      - stravin-multi-region-net
+
+  floci-test-s3-sync-a-to-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.floci-test
+      target: floci-test-s3-sync
+    depends_on:
+      floci-init-a:
+        condition: service_completed_successfully
+      floci-init-b:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      FLOCI_SYNC_SOURCE_ENDPOINT: "http://floci-region-a:4566"
+      FLOCI_SYNC_SOURCE_REGION: "us-east-1"
+      FLOCI_SYNC_SOURCE_BUCKET: "git-objects-us-east-1"
+      FLOCI_SYNC_SOURCE_QUEUE_URL: "http://floci-region-a:4566/000000000000/floci-test-s3-sync-queue"
+      FLOCI_SYNC_TARGET_ENDPOINT: "http://floci-region-b:4566"
+      FLOCI_SYNC_TARGET_REGION: "us-west-2"
+      FLOCI_SYNC_TARGET_BUCKET: "git-objects-us-west-2"
+      FLOCI_SYNC_LAG_DELAY: "${FLOCI_S3_SYNC_LAG_DELAY:-100ms}"
+      FLOCI_SYNC_REPLICATE_DELETES: "${FLOCI_S3_SYNC_REPLICATE_DELETES:-true}"
+    networks:
+      - stravin-multi-region-net
+
+  floci-test-s3-sync-b-to-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.floci-test
+      target: floci-test-s3-sync
+    depends_on:
+      floci-init-a:
+        condition: service_completed_successfully
+      floci-init-b:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      FLOCI_SYNC_SOURCE_ENDPOINT: "http://floci-region-b:4566"
+      FLOCI_SYNC_SOURCE_REGION: "us-west-2"
+      FLOCI_SYNC_SOURCE_BUCKET: "git-objects-us-west-2"
+      FLOCI_SYNC_SOURCE_QUEUE_URL: "http://floci-region-b:4566/000000000000/floci-test-s3-sync-queue"
+      FLOCI_SYNC_TARGET_ENDPOINT: "http://floci-region-a:4566"
+      FLOCI_SYNC_TARGET_REGION: "us-east-1"
+      FLOCI_SYNC_TARGET_BUCKET: "git-objects-us-east-1"
+      FLOCI_SYNC_LAG_DELAY: "${FLOCI_S3_SYNC_LAG_DELAY:-100ms}"
+      FLOCI_SYNC_REPLICATE_DELETES: "${FLOCI_S3_SYNC_REPLICATE_DELETES:-true}"
+    networks:
+      - stravin-multi-region-net
+
+  floci-test-ddb-sync-a-to-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.floci-test
+      target: floci-test-ddb-sync
+    depends_on:
+      floci-init-a:
+        condition: service_completed_successfully
+      floci-init-b:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      FLOCI_SYNC_SOURCE_ENDPOINT: "http://floci-region-a:4566"
+      FLOCI_SYNC_SOURCE_REGION: "us-east-1"
+      FLOCI_SYNC_SOURCE_TABLE: "stravin-core"
+      FLOCI_SYNC_TARGET_ENDPOINT: "http://floci-region-b:4566"
+      FLOCI_SYNC_TARGET_REGION: "us-west-2"
+      FLOCI_SYNC_TARGET_TABLE: "stravin-core"
+      FLOCI_SYNC_LAG_DELAY: "${FLOCI_DDB_SYNC_LAG_DELAY:-50ms}"
+      FLOCI_SYNC_POLL_INTERVAL: "${FLOCI_DDB_SYNC_POLL_INTERVAL:-100ms}"
+    networks:
+      - stravin-multi-region-net
+
+  floci-test-ddb-sync-b-to-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.floci-test
+      target: floci-test-ddb-sync
+    depends_on:
+      floci-init-a:
+        condition: service_completed_successfully
+      floci-init-b:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      FLOCI_SYNC_SOURCE_ENDPOINT: "http://floci-region-b:4566"
+      FLOCI_SYNC_SOURCE_REGION: "us-west-2"
+      FLOCI_SYNC_SOURCE_TABLE: "stravin-core"
+      FLOCI_SYNC_TARGET_ENDPOINT: "http://floci-region-a:4566"
+      FLOCI_SYNC_TARGET_REGION: "us-east-1"
+      FLOCI_SYNC_TARGET_TABLE: "stravin-core"
+      FLOCI_SYNC_LAG_DELAY: "${FLOCI_DDB_SYNC_LAG_DELAY:-50ms}"
+      FLOCI_SYNC_POLL_INTERVAL: "${FLOCI_DDB_SYNC_POLL_INTERVAL:-100ms}"
+    networks:
+      - stravin-multi-region-net
+
+  stravin-ctrl-a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ctrl
+    depends_on:
+      floci-init-a:
+        condition: service_completed_successfully
+    ports:
+      - "8083:8083"
+    environment:
+      STRAVIN_REGION: "us-east-1"
+      STRAVIN_S3_BUCKET: "git-objects-us-east-1"
+      STRAVIN_S3_FORCE_PATH_STYLE: "true"
+      STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_CTRL_LEASE_TTL: "${STRAVIN_CTRL_LEASE_TTL:-15s}"
+      STRAVIN_CTRL_HEARTBEAT_INTERVAL: "${STRAVIN_CTRL_HEARTBEAT_INTERVAL:-2s}"
+      AWS_ENDPOINT_URL: "http://floci-region-a:4566"
+      AWS_REGION: "us-east-1"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8083/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - stravin-multi-region-net
+
+  stravin-node-a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: node
+    depends_on:
+      floci-init-a:
+        condition: service_completed_successfully
+      stravin-ctrl-a:
+        condition: service_healthy
+    ports:
+      - "8091:8081"
+    environment:
+      STRAVIN_REGION: "us-east-1"
+      STRAVIN_S3_BUCKET: "git-objects-us-east-1"
+      STRAVIN_S3_FORCE_PATH_STYLE: "true"
+      STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_KMS_KEY_ID: "alias/stravin-local-dev"
+      STRAVIN_LEASE_REFRESH_INTERVAL: "${STRAVIN_LEASE_REFRESH_INTERVAL:-1s}"
+      AWS_ENDPOINT_URL: "http://floci-region-a:4566"
+      AWS_REGION: "us-east-1"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    volumes:
+      - node-a-nvme-cache:/var/lib/stravin/cache
+    networks:
+      - stravin-multi-region-net
+
+  stravin-edge-a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: edge
+    depends_on:
+      floci-init-a:
+        condition: service_completed_successfully
+      stravin-node-a:
+        condition: service_healthy
+      stravin-ctrl-a:
+        condition: service_healthy
+    ports:
+      - "2222:2222" # Git SSH (Region A)
+      - "8080:8080" # Git Smart HTTP (Region A)
+    environment:
+      STRAVIN_REGION: "us-east-1"
+      STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_NODE_PEERS: "stravin-node-a:9090"
+      STRAVIN_AUTH_TOKENS: "${STRAVIN_AUTH_TOKENS:-local:dev:stravin-local-dev-token}"
+      STRAVIN_SSH_AUTHORIZED_KEYS: "${STRAVIN_SSH_AUTHORIZED_KEYS:-}"
+      STRAVIN_META_CACHE_TTL: "${STRAVIN_META_CACHE_TTL:-1s}"
+      AWS_ENDPOINT_URL: "http://floci-region-a:4566"
+      AWS_REGION: "us-east-1"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - stravin-multi-region-net
+
+  stravin-ctrl-b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ctrl
+    depends_on:
+      floci-init-b:
+        condition: service_completed_successfully
+    ports:
+      - "8085:8083"
+    environment:
+      STRAVIN_REGION: "us-west-2"
+      STRAVIN_S3_BUCKET: "git-objects-us-west-2"
+      STRAVIN_S3_FORCE_PATH_STYLE: "true"
+      STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_CTRL_LEASE_TTL: "${STRAVIN_CTRL_LEASE_TTL:-15s}"
+      STRAVIN_CTRL_HEARTBEAT_INTERVAL: "${STRAVIN_CTRL_HEARTBEAT_INTERVAL:-2s}"
+      AWS_ENDPOINT_URL: "http://floci-region-b:4566"
+      AWS_REGION: "us-west-2"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8083/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - stravin-multi-region-net
+
+  stravin-node-b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: node
+    depends_on:
+      floci-init-b:
+        condition: service_completed_successfully
+      stravin-ctrl-b:
+        condition: service_healthy
+    ports:
+      - "8092:8081"
+    environment:
+      STRAVIN_REGION: "us-west-2"
+      STRAVIN_S3_BUCKET: "git-objects-us-west-2"
+      STRAVIN_S3_FORCE_PATH_STYLE: "true"
+      STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_KMS_KEY_ID: "alias/stravin-local-dev"
+      STRAVIN_LEASE_REFRESH_INTERVAL: "${STRAVIN_LEASE_REFRESH_INTERVAL:-1s}"
+      AWS_ENDPOINT_URL: "http://floci-region-b:4566"
+      AWS_REGION: "us-west-2"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    volumes:
+      - node-b-nvme-cache:/var/lib/stravin/cache
+    networks:
+      - stravin-multi-region-net
+
+  stravin-edge-b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: edge
+    depends_on:
+      floci-init-b:
+        condition: service_completed_successfully
+      stravin-node-b:
+        condition: service_healthy
+      stravin-ctrl-b:
+        condition: service_healthy
+    ports:
+      - "2223:2222" # Git SSH (Region B)
+      - "8081:8080" # Git Smart HTTP (Region B)
+    environment:
+      STRAVIN_REGION: "us-west-2"
+      STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_NODE_PEERS: "stravin-node-b:9090"
+      STRAVIN_AUTH_TOKENS: "${STRAVIN_AUTH_TOKENS:-local:dev:stravin-local-dev-token}"
+      STRAVIN_SSH_AUTHORIZED_KEYS: "${STRAVIN_SSH_AUTHORIZED_KEYS:-}"
+      STRAVIN_META_CACHE_TTL: "${STRAVIN_META_CACHE_TTL:-1s}"
+      AWS_ENDPOINT_URL: "http://floci-region-b:4566"
+      AWS_REGION: "us-west-2"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - stravin-multi-region-net
+
+volumes:
+  node-a-nvme-cache:
+  node-b-nvme-cache:
+
+networks:
+  stravin-multi-region-net:
+    driver: bridge
