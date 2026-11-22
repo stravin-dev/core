@@ -39,6 +39,38 @@ func TestLoadConfig_DefaultsAndOverrides(t *testing.T) {
 	if cfg.ListenAddr != "127.0.0.1:9083" {
 		t.Fatalf("STRAVIN_CTRL_ADDR ListenAddr = %q, want %q", cfg.ListenAddr, "127.0.0.1:9083")
 	}
+	if cfg.RequirePromotionGuard {
+		t.Fatalf("default RequirePromotionGuard = true, want false")
+	}
+}
+
+func TestBuildPromotionGuard(t *testing.T) {
+	t.Run("disabled returns nil guard", func(t *testing.T) {
+		g, err := buildPromotionGuard(ctrlConfig{RequirePromotionGuard: false})
+		if err != nil || g != nil {
+			t.Fatalf("got (%v, %v), want (nil, nil)", g, err)
+		}
+	})
+
+	t.Run("enabled without operator token or witness endpoints fails closed", func(t *testing.T) {
+		_, err := buildPromotionGuard(ctrlConfig{RequirePromotionGuard: true})
+		if err == nil {
+			t.Fatal("expected error when RequirePromotionGuard=true with no guards configured")
+		}
+	})
+
+	t.Run("enabled with operator token and witness endpoints builds composite guard", func(t *testing.T) {
+		g, err := buildPromotionGuard(ctrlConfig{
+			RequirePromotionGuard:  true,
+			PromotionGuardPolicy:   "require_all",
+			PromotionApprovalToken: "op-token",
+			WitnessEndpoints:       []string{"http://w1.internal/witness", "http://w2.internal/witness"},
+			WitnessQuorum:          2,
+		})
+		if err != nil || g == nil {
+			t.Fatalf("got (%v, %v), want non-nil guard and nil error", g, err)
+		}
+	})
 }
 
 func TestRun_RequiresAdminToken(t *testing.T) {
