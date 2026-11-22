@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"stravin.dev/core/internal/lease"
 )
 
 func TestLoadConfig_DefaultsAndOverrides(t *testing.T) {
@@ -83,5 +85,22 @@ func TestRun_RequiresAdminToken(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "STRAVIN_CTRL_ADMIN_TOKEN") {
 		t.Fatalf("unexpected error = %q, want mention of STRAVIN_CTRL_ADMIN_TOKEN", err.Error())
+	}
+}
+
+func TestRecoveryBootHelpers(t *testing.T) {
+	if !shouldRunRecoveryBoot(lease.ModeDraining) || !shouldRunRecoveryBoot(lease.ModeReadOnly) {
+		t.Fatal("expected recovery boot enabled for DRAINING and READ_ONLY modes")
+	}
+	if shouldRunRecoveryBoot(lease.ModeActive) {
+		t.Fatal("expected recovery boot disabled for ACTIVE mode")
+	}
+
+	rk, err := parseRecoveryRepoKey("acme/core")
+	if err != nil || rk.TenantID != "acme" || rk.RepoID != "core" {
+		t.Fatalf("parseRecoveryRepoKey(acme/core) = (%+v, %v)", rk, err)
+	}
+	if _, err := parseRecoveryRepoKey("missing-slash"); err == nil {
+		t.Fatal("expected error for malformed recovery repo key")
 	}
 }

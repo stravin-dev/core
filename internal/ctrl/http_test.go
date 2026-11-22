@@ -57,9 +57,17 @@ func newTestAdminHandler(t *testing.T, adminToken string) *Handler {
 		t.Fatalf("NewScrubber: %v", err)
 	}
 
+	reconciler, err := NewRecoveryReconciler(RecoveryConfig{
+		DDB: ddbStore, S3: s3Store, Region: "us-east-1", Clock: clk,
+	})
+	if err != nil {
+		t.Fatalf("NewRecoveryReconciler: %v", err)
+	}
+
 	handler, err := NewHandler(HandlerConfig{
 		Leases:     mgr,
 		Scrubber:   scrubber,
+		Recovery:   reconciler,
 		AdminToken: adminToken,
 	})
 	if err != nil {
@@ -150,6 +158,21 @@ func TestHandler_AdminEndpoints(t *testing.T) {
 		t.Fatalf("unexpected scrubRep: %+v", scrubRep)
 	}
 
+	// 5b. POST /v1/recovery/reconcile
+	rec = httptest.NewRecorder()
+	body = bytes.NewBufferString(`{"tenant_id":"acme","repo_id":"api-repo"}`)
+	handler.ServeHTTP(rec, newAuthedRequest(http.MethodPost, "/v1/recovery/reconcile", body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /v1/recovery/reconcile = %d (%s), want 200", rec.Code, rec.Body.String())
+	}
+	var recRep RecoveryReport
+	if err := json.Unmarshal(rec.Body.Bytes(), &recRep); err != nil {
+		t.Fatalf("unmarshal recRep: %v", err)
+	}
+	if recRep.Status != "clean" || recRep.ScannedRefs != 1 {
+		t.Fatalf("unexpected recRep: %+v", recRep)
+	}
+
 	// 6. Error mapping checks (405, 400, 404).
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, newAuthedRequest(http.MethodGet, "/v1/scrub", nil))
@@ -175,6 +198,7 @@ func TestHandler_AdminAuth(t *testing.T) {
 		{http.MethodPost, "/v1/lease/fence", `{"mode":"DRAINING"}`},
 		{http.MethodPost, "/v1/epoch/advance", `{"tenant_id":"acme","repo_id":"api-repo"}`},
 		{http.MethodPost, "/v1/scrub", `{"tenant_id":"acme","repo_id":"api-repo"}`},
+		{http.MethodPost, "/v1/recovery/reconcile", `{"tenant_id":"acme","repo_id":"api-repo"}`},
 	}
 
 	t.Run("rejects missing, wrong scheme, and wrong token", func(t *testing.T) {

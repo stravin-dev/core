@@ -22,13 +22,15 @@ const instrumentationScope = "stravin.dev/core/internal/ctrl"
 type Metrics struct {
 	tracer trace.Tracer
 
-	leaseRenewals    metric.Int64Counter
-	epochTransitions metric.Int64Counter
-	promotionGuard   metric.Int64Counter
-	scrubRuns        metric.Int64Counter
-	scrubHeadChecks  metric.Int64Counter
-	scrubRewoundRefs metric.Int64Counter
-	scrubDuration    metric.Float64Histogram
+	leaseRenewals         metric.Int64Counter
+	epochTransitions      metric.Int64Counter
+	promotionGuard        metric.Int64Counter
+	scrubRuns             metric.Int64Counter
+	scrubHeadChecks       metric.Int64Counter
+	scrubRewoundRefs      metric.Int64Counter
+	scrubDuration         metric.Float64Histogram
+	recoveryRuns          metric.Int64Counter
+	recoveryRefsPublished metric.Int64Counter
 }
 
 // NewMetrics constructs stravin-ctrl telemetry instruments backed by provider.
@@ -96,15 +98,33 @@ func NewMetrics(provider *telemetry.Provider) (*Metrics, error) {
 		return nil, err
 	}
 
+	recoveryRuns, err := meter.Int64Counter(
+		"stravin_ctrl_recovery_runs_total",
+		metric.WithDescription("Total orphaned-pack recovery reconciliation runs by region and result"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	recoveryRefsPublished, err := meter.Int64Counter(
+		"stravin_ctrl_recovery_refs_published_total",
+		metric.WithDescription("Total non-destructive recovery refs published by stravin-ctrl"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Metrics{
-		tracer:           provider.Tracer(instrumentationScope),
-		leaseRenewals:    leaseRenewals,
-		epochTransitions: epochTransitions,
-		promotionGuard:   promotionGuard,
-		scrubRuns:        scrubRuns,
-		scrubHeadChecks:  scrubHeadChecks,
-		scrubRewoundRefs: scrubRewoundRefs,
-		scrubDuration:    scrubDuration,
+		tracer:                provider.Tracer(instrumentationScope),
+		leaseRenewals:         leaseRenewals,
+		epochTransitions:      epochTransitions,
+		promotionGuard:        promotionGuard,
+		scrubRuns:             scrubRuns,
+		scrubHeadChecks:       scrubHeadChecks,
+		scrubRewoundRefs:      scrubRewoundRefs,
+		scrubDuration:         scrubDuration,
+		recoveryRuns:          recoveryRuns,
+		recoveryRefsPublished: recoveryRefsPublished,
 	}, nil
 }
 
@@ -176,5 +196,24 @@ func (m *Metrics) recordRewoundRef(ctx context.Context, region lease.Region, act
 	m.scrubRewoundRefs.Add(ctx, 1, metric.WithAttributes(
 		telemetry.AttrRegion.String(string(region)),
 		attribute.String("action", action),
+	))
+}
+
+func (m *Metrics) recordRecoveryRun(ctx context.Context, region lease.Region, result string) {
+	if m == nil {
+		return
+	}
+	m.recoveryRuns.Add(ctx, 1, metric.WithAttributes(
+		telemetry.AttrRegion.String(string(region)),
+		attribute.String("result", result),
+	))
+}
+
+func (m *Metrics) recordRecoveryRefPublished(ctx context.Context, region lease.Region) {
+	if m == nil {
+		return
+	}
+	m.recoveryRefsPublished.Add(ctx, 1, metric.WithAttributes(
+		telemetry.AttrRegion.String(string(region)),
 	))
 }

@@ -529,3 +529,93 @@ func TestGCSweeper_NeverDeletesPackReferencedByActiveManifest(t *testing.T) {
 		t.Fatalf("NewGCSweeper empty config = %v, want ErrInvalidConfig", err)
 	}
 }
+
+type fakeRecoveryRefLister struct {
+	refs []ddb.RefState
+	err  error
+}
+
+func (f *fakeRecoveryRefLister) ListRefs(_ context.Context, _ tenant.RepoKey, _ int) ([]ddb.RefState, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.refs, nil
+}
+
+func TestGCSweeper_PreservesPacksReferencedByRecoveryRefs(t *testing.T) {
+	clk := newStaticClock(time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC))
+	rk := mustTestRepoKey(t, "tenant-rec", "repo-rec")
+	manifests := newFakeManifestStore(1)
+	objects := newFakePackObjectStore(clk)
+
+	compactedRecSHA := strings.Repeat("e", 64)
+	orphanRecSHA := strings.Repeat("f", 64)
+	reapableOrphanSHA := strings.Repeat("1", 64)
+
+	ctx := context.Background()
+	for _, sha := range []string{compactedRecSHA, orphanRecSHA, reapableOrphanSHA} {
+		if err := objects.PutPack(ctx, rk, sha, []byte("PACK-"+sha[:4]), []byte("IDX-"+sha[:4])); err != nil {
+			t.Fatalf("PutPack(%s): %v", sha, err)
+		}
+	}
+
+	manifests.put(ddb.PackManifest{
+		Repo:         rk,
+		ULID:         "01J00000000000000000000010",
+		PackID:       compactedRecSHA,
+		SizeBytes:    64,
+		OriginRegion: "us-east-1",
+		Status:       ddb.PackStatusCompacted,
+		CreatedAt:    clk.Now().Add(-48 * time.Hour),
+	})
+
+	// Advance past orphan grace window so both orphanRecSHA and reapableOrphanSHA are eligible.
+	clk.Advance(48 * time.Hour)
+
+	refLister := &fakeRecoveryRefLister{
+		refs: []ddb.RefState{
+			{Repo: rk, RefName: "refs/stravin-recovery/heads-main-aaaaaaaaaaaa", OID: strings.Repeat("a", 40), PackID: compactedRecSHA},
+			{Repo: rk, RefName: "refs/stravin-recovery/heads-feat-bbbbbbbbbbbb", OID: strings.Repeat("b", 40), PackID: orphanRecSHA},
+		},
+	}
+
+	sweeper, err := NewGCSweeper(GCSweeperConfig{
+		Manifests:         manifests,
+		ManifestGC:        manifests,
+		Objects:           objects,
+		Refs:              refLister,
+		RefShards:         1,
+		GraceWindow:       1 * time.Hour,
+		OrphanGraceWindow: 1 * time.Hour,
+		Clock:             clk,
+	})
+	if err != nil {
+		t.Fatalf("NewGCSweeper: %v", err)
+	}
+
+	res, err := sweeper.SweepRepo(ctx, rk, 1)
+	if err != nil {
+		t.Fatalf("SweepRepo: %v", err)
+	}
+
+	if res.CompactedReaped != 0 {
+		t.Fatalf("CompactedReaped = %d, want 0 (protected by recovery ref)", res.CompactedReaped)
+	}
+	if res.OrphanedReaped != 1 {
+		t.Fatalf("OrphanedReaped = %d, want 1 (only unreferenced orphan)", res.OrphanedReaped)
+	}
+	if res.SkippedActive < 2 {
+		t.Fatalf("SkippedActive = %d, want >= 2", res.SkippedActive)
+	}
+
+	for _, protectedSHA := range []string{compactedRecSHA, orphanRecSHA} {
+		pk, _ := s3.PackKey(rk, protectedSHA)
+		if !objects.exists(pk) {
+			t.Fatalf("pack %s referenced by recovery ref was deleted", protectedSHA)
+		}
+	}
+	reapKey, _ := s3.PackKey(rk, reapableOrphanSHA)
+	if objects.exists(reapKey) {
+		t.Fatalf("unreferenced orphan pack %s should have been reaped", reapableOrphanSHA)
+	}
+}

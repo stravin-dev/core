@@ -25,6 +25,7 @@ type HandlerConfig struct {
 	ServiceName string
 	Leases      *LeaseManager
 	Scrubber    *Scrubber
+	Recovery    *RecoveryReconciler
 	AdminToken  string
 }
 
@@ -35,10 +36,12 @@ type HandlerConfig struct {
 //   - POST /v1/lease/fence
 //   - POST /v1/epoch/advance
 //   - POST /v1/scrub
+//   - POST /v1/recovery/reconcile
 type Handler struct {
 	serviceName string
 	leases      *LeaseManager
 	scrubber    *Scrubber
+	recovery    *RecoveryReconciler
 	adminToken  string
 	mux         *http.ServeMux
 }
@@ -60,6 +63,7 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 		serviceName: svc,
 		leases:      cfg.Leases,
 		scrubber:    cfg.Scrubber,
+		recovery:    cfg.Recovery,
 		adminToken:  strings.TrimSpace(cfg.AdminToken),
 		mux:         http.NewServeMux(),
 	}
@@ -69,6 +73,7 @@ func NewHandler(cfg HandlerConfig) (*Handler, error) {
 	h.mux.HandleFunc("/v1/lease/fence", h.requireAdminAuth(h.handleLeaseFence))
 	h.mux.HandleFunc("/v1/epoch/advance", h.requireAdminAuth(h.handleEpochAdvance))
 	h.mux.HandleFunc("/v1/scrub", h.requireAdminAuth(h.handleScrub))
+	h.mux.HandleFunc("/v1/recovery/reconcile", h.requireAdminAuth(h.handleRecoveryReconcile))
 	return h, nil
 }
 
@@ -263,6 +268,54 @@ func (h *Handler) handleScrub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	report, err := h.scrubber.ScrubRepo(r.Context(), req)
+	if err != nil {
+		writeJSONError(w, mapControlError(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+type recoveryReconcileHTTPRequest struct {
+	TenantID        string   `json:"tenant_id"`
+	RepoID          string   `json:"repo_id"`
+	LookbackSeconds int64    `json:"lookback_seconds,omitempty"`
+	Concurrency     int      `json:"concurrency,omitempty"`
+	DryRun          bool     `json:"dry_run,omitempty"`
+	TargetRefs      []string `json:"target_refs,omitempty"`
+}
+
+func (h *Handler) handleRecoveryReconcile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.recovery == nil {
+		writeJSONError(w, http.StatusNotImplemented, "recovery reconciler is not configured")
+		return
+	}
+	var payload recoveryReconcileHTTPRequest
+	if err := decodeJSON(w, r, &payload); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	rk, err := tenant.NewRepoKey(payload.TenantID, payload.RepoID)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	req := RecoveryRequest{
+		Repo:        rk,
+		Concurrency: payload.Concurrency,
+		DryRun:      payload.DryRun,
+		TargetRefs:  payload.TargetRefs,
+	}
+	if payload.LookbackSeconds > 0 {
+		req.LookbackWindow = time.Duration(payload.LookbackSeconds) * time.Second
+	}
+
+	report, err := h.recovery.ReconcileRepo(r.Context(), req)
 	if err != nil {
 		writeJSONError(w, mapControlError(err), err.Error())
 		return
