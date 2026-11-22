@@ -224,7 +224,9 @@ services:
       STRAVIN_S3_BUCKET: "git-objects-us-east-1"
       STRAVIN_S3_FORCE_PATH_STYLE: "true"
       STRAVIN_DDB_TABLE: "stravin-core"
-      STRAVIN_KMS_KEY_ID: "alias/stravin-local-dev"
+      # Omit STRAVIN_KMS_KEY_ID in dual-Floci compose: floci-region-a and
+      # floci-region-b hold independent local KMS key material (unlike AWS
+      # KMS multi-region mrk-* keys), so Region B cannot decrypt Region A DEKs.
       STRAVIN_INTERNAL_GRPC_TOKEN: "${STRAVIN_INTERNAL_GRPC_TOKEN:-stravin-local-internal-grpc-token}"
       STRAVIN_GRPC_ALLOW_INSECURE: "${STRAVIN_GRPC_ALLOW_INSECURE:-true}"
       STRAVIN_LEASE_REFRESH_INTERVAL: "${STRAVIN_LEASE_REFRESH_INTERVAL:-1s}"
@@ -329,7 +331,9 @@ services:
       STRAVIN_S3_BUCKET: "git-objects-us-west-2"
       STRAVIN_S3_FORCE_PATH_STYLE: "true"
       STRAVIN_DDB_TABLE: "stravin-core"
-      STRAVIN_KMS_KEY_ID: "alias/stravin-local-dev"
+      # Omit STRAVIN_KMS_KEY_ID in dual-Floci compose: floci-region-a and
+      # floci-region-b hold independent local KMS key material (unlike AWS
+      # KMS multi-region mrk-* keys), so Region B cannot decrypt Region A DEKs.
       STRAVIN_INTERNAL_GRPC_TOKEN: "${STRAVIN_INTERNAL_GRPC_TOKEN:-stravin-local-internal-grpc-token}"
       STRAVIN_GRPC_ALLOW_INSECURE: "${STRAVIN_GRPC_ALLOW_INSECURE:-true}"
       STRAVIN_LEASE_REFRESH_INTERVAL: "${STRAVIN_LEASE_REFRESH_INTERVAL:-1s}"

@@ -54,6 +54,15 @@ type KMSAPI interface {
 
 var _ KMSAPI = (*kms.Client)(nil)
 
+// NewKMSClient builds an AWS SDK v2 KMS client with an optional endpoint override.
+func NewKMSClient(cfg aws.Config, endpoint string) *kms.Client {
+	return kms.NewFromConfig(cfg, func(o *kms.Options) {
+		if trimmed := strings.TrimSpace(endpoint); trimmed != "" {
+			o.BaseEndpoint = aws.String(trimmed)
+		}
+	})
+}
+
 // EnvelopeCipher defines the GoF Strategy interface for tenant-scoped envelope encryption.
 type EnvelopeCipher interface {
 	Encrypt(ctx context.Context, tenantID tenant.TenantID, plaintext []byte) ([]byte, error)

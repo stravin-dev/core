@@ -14,11 +14,13 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/service/kms"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
+	"stravin.dev/core/internal/crypto"
 	"stravin.dev/core/internal/tenant"
 )
 
@@ -475,4 +477,94 @@ func TestStoreHeadObjectReplicationStatus(t *testing.T) {
 			}
 		})
 	}
+}
+
+type fakeKMSAPI struct {
+	dek []byte
+}
+
+func (f *fakeKMSAPI) GenerateDataKey(_ context.Context, _ *kms.GenerateDataKeyInput, _ ...func(*kms.Options)) (*kms.GenerateDataKeyOutput, error) {
+	return &kms.GenerateDataKeyOutput{
+		Plaintext:      append([]byte(nil), f.dek...),
+		CiphertextBlob: []byte("wrapped-dek-blob"),
+	}, nil
+}
+
+func (f *fakeKMSAPI) Decrypt(_ context.Context, _ *kms.DecryptInput, _ ...func(*kms.Options)) (*kms.DecryptOutput, error) {
+	return &kms.DecryptOutput{
+		Plaintext: append([]byte(nil), f.dek...),
+	}, nil
+}
+
+func TestKMSKeyIDFromEnv(t *testing.T) {
+	t.Setenv(EnvKMSKeyID, "")
+	if got := KMSKeyIDFromEnv(); got != "" {
+		t.Fatalf("KMSKeyIDFromEnv() = %q, want empty", got)
+	}
+
+	t.Setenv(EnvKMSKeyID, "  alias/stravin-local-dev  ")
+	if got := KMSKeyIDFromEnv(); got != "alias/stravin-local-dev" {
+		t.Fatalf("KMSKeyIDFromEnv() = %q, want %q", got, "alias/stravin-local-dev")
+	}
+
+	t.Setenv(EnvKMSKeyID, "   ")
+	if got := KMSKeyIDFromEnv(); got != "   " {
+		t.Fatalf("KMSKeyIDFromEnv() = %q, want whitespace preserved for fail-closed validation", got)
+	}
+}
+
+func TestWithKMSEnvelopeCipher(t *testing.T) {
+	t.Run("disabled_when_key_empty", func(t *testing.T) {
+		opt, err := WithKMSEnvelopeCipher(nil, "")
+		if err != nil || opt != nil {
+			t.Fatalf("WithKMSEnvelopeCipher(nil, empty) = (%v, %v), want (nil, nil)", opt, err)
+		}
+	})
+
+	t.Run("fail_closed_on_nil_client", func(t *testing.T) {
+		_, err := WithKMSEnvelopeCipher(nil, "alias/stravin-local-dev")
+		if !errors.Is(err, crypto.ErrInvalidInput) {
+			t.Fatalf("err = %v, want crypto.ErrInvalidInput", err)
+		}
+	})
+
+	t.Run("fail_closed_on_whitespace_key", func(t *testing.T) {
+		kmsClient := &fakeKMSAPI{dek: bytes.Repeat([]byte{0x42}, 32)}
+		_, err := WithKMSEnvelopeCipher(kmsClient, "   ")
+		if !errors.Is(err, crypto.ErrInvalidInput) {
+			t.Fatalf("err = %v, want crypto.ErrInvalidInput", err)
+		}
+	})
+
+	t.Run("encrypts_and_decrypts_pack_round_trip", func(t *testing.T) {
+		fakeS3 := newFakeS3API()
+		kmsClient := &fakeKMSAPI{dek: bytes.Repeat([]byte{0x42}, 32)}
+		opt, err := WithKMSEnvelopeCipher(kmsClient, "alias/stravin-local-dev")
+		if err != nil {
+			t.Fatalf("WithKMSEnvelopeCipher: %v", err)
+		}
+		store, err := NewStore(fakeS3, "git-objects-us-east-1", opt)
+		if err != nil {
+			t.Fatalf("NewStore: %v", err)
+		}
+
+		ctx := context.Background()
+		rk := mustRepoKey(t, "acme", "core")
+		packPlain := []byte("PACK\x00\x00\x00\x02kms-pack-payload")
+		idxPlain := []byte("\xfftOc\x00\x00\x00\x02kms-idx-payload")
+		if err := store.PutPack(ctx, rk, testPackSHA, packPlain, idxPlain); err != nil {
+			t.Fatalf("PutPack: %v", err)
+		}
+
+		packKey, _ := PackKey(rk, testPackSHA)
+		raw := fakeS3.objects[packKey].data
+		if bytes.HasPrefix(raw, []byte("PACK")) || bytes.Contains(raw, packPlain) {
+			t.Fatal("expected envelope-encrypted bytes in S3, got plaintext")
+		}
+
+		gotPack, err := store.GetPack(ctx, rk, testPackSHA)
+		if err != nil || !bytes.Equal(gotPack, packPlain) {
+			t.Fatalf("GetPack = %q, err=%v", gotPack, err)
+		}
+	})
 }

@@ -24,6 +24,9 @@ const (
 	// EnvForcePathStyle enables S3 path-style addressing when set to a truthy boolean.
 	EnvForcePathStyle = "STRAVIN_S3_FORCE_PATH_STYLE"
 
+	// EnvKMSKeyID configures optional per-tenant KMS envelope encryption for S3 objects.
+	EnvKMSKeyID = "STRAVIN_KMS_KEY_ID"
+
 	// ReplicationStatus constants mirror AWS S3 HeadObject x-amz-replication-status values.
 	ReplicationStatusCompleted = "COMPLETED"
 	ReplicationStatusComplete  = "COMPLETE"
@@ -93,10 +96,35 @@ func WithEnvelopeCipher(c crypto.EnvelopeCipher) Option {
 	}
 }
 
+// WithKMSEnvelopeCipher constructs a KMS envelope cipher when kmsKeyID is
+// non-empty and returns a Store Option wiring it into NewStore. It returns
+// (nil, nil) when kmsKeyID is empty, and returns an error when kmsKeyID is
+// non-empty and cipher initialization fails so callers fail closed.
+func WithKMSEnvelopeCipher(kmsClient crypto.KMSAPI, kmsKeyID string, opts ...crypto.Option) (Option, error) {
+	if kmsKeyID == "" {
+		return nil, nil
+	}
+	cipher, err := crypto.NewKMSEnvelopeCipher(kmsClient, kmsKeyID, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return WithEnvelopeCipher(cipher), nil
+}
+
 // ForcePathStyleFromEnv parses STRAVIN_S3_FORCE_PATH_STYLE.
 func ForcePathStyleFromEnv() bool {
 	v, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(EnvForcePathStyle)))
 	return err == nil && v
+}
+
+// KMSKeyIDFromEnv reads STRAVIN_KMS_KEY_ID. Non-empty whitespace-only values
+// are preserved so startup fails closed instead of silently disabling KMS.
+func KMSKeyIDFromEnv() string {
+	raw := os.Getenv(EnvKMSKeyID)
+	if trimmed := strings.TrimSpace(raw); trimmed != "" {
+		return trimmed
+	}
+	return raw
 }
 
 // NewAWSClient builds a standard AWS SDK v2 S3 client configured with optional

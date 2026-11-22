@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc"
 
 	"stravin.dev/core/internal/cache"
+	"stravin.dev/core/internal/crypto"
 	"stravin.dev/core/internal/gitexec"
 	"stravin.dev/core/internal/hooks/wasm"
 	"stravin.dev/core/internal/lease"
@@ -49,6 +50,7 @@ type DaemonConfig struct {
 	CacheMaxBytes        int64
 	S3Bucket             string
 	S3ForcePathStyle     bool
+	KMSKeyID             string
 	DDBTable             string
 	AWSEndpointURL       string
 	LeaseRefreshInterval time.Duration
@@ -86,6 +88,7 @@ func LoadDaemonConfigFromEnv() DaemonConfig {
 		CacheMaxBytes:        maxBytes,
 		S3Bucket:             bucket,
 		S3ForcePathStyle:     s3.ForcePathStyleFromEnv(),
+		KMSKeyID:             s3.KMSKeyIDFromEnv(),
 		DDBTable:             envOrDefault("STRAVIN_DDB_TABLE", defaultDDBTable),
 		AWSEndpointURL:       strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL")),
 		LeaseRefreshInterval: refreshInterval,
@@ -165,8 +168,12 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 		return fmt.Errorf("node: init ddb repository: %w", err)
 	}
 
+	var kmsClient crypto.KMSAPI
+	if cfg.KMSKeyID != "" {
+		kmsClient = crypto.NewKMSClient(awsCfg, cfg.AWSEndpointURL)
+	}
 	s3Client := s3.NewAWSClient(awsCfg, cfg.AWSEndpointURL, cfg.S3ForcePathStyle)
-	s3Store, err := s3.NewStore(s3Client, cfg.S3Bucket)
+	s3Store, err := buildS3Store(s3Client, cfg.S3Bucket, kmsClient, cfg.KMSKeyID)
 	if err != nil {
 		return fmt.Errorf("node: init s3 store: %w", err)
 	}
@@ -328,6 +335,14 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 		logger.Info("stravin-node stopped")
 		return nil
 	}
+}
+
+func buildS3Store(s3Client s3.API, bucket string, kmsClient crypto.KMSAPI, kmsKeyID string) (*s3.Store, error) {
+	kmsOpt, err := s3.WithKMSEnvelopeCipher(kmsClient, kmsKeyID)
+	if err != nil {
+		return nil, fmt.Errorf("init kms envelope cipher: %w", err)
+	}
+	return s3.NewStore(s3Client, bucket, kmsOpt)
 }
 
 func resolveGitExecConfig(cfg gitexec.Config, logger *slog.Logger) gitexec.Config {

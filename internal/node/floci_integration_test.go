@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/metadata"
 
 	"stravin.dev/core/internal/cache"
+	"stravin.dev/core/internal/crypto"
 	"stravin.dev/core/internal/gitexec"
 	"stravin.dev/core/internal/hooks/wasm"
 	"stravin.dev/core/internal/lease"
@@ -453,5 +454,186 @@ func TestFlociIntegration_NodeReceivePackPushAndFetchRoundTrip(t *testing.T) {
 	refsAfter, err := ddbRepo.ListRefs(ctx, rk, 2)
 	if err != nil || len(refsAfter) != 0 {
 		t.Fatalf("expected 0 refs after deletion, got refs=%+v err=%v", refsAfter, err)
+	}
+}
+
+func TestFlociIntegration_NodeReceivePackKMSEnvelopeEncryption(t *testing.T) {
+	endpoint := os.Getenv("AWS_ENDPOINT_URL")
+	if endpoint == "" {
+		t.Skip("skipping Floci integration test: AWS_ENDPOINT_URL not set")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not installed")
+	}
+
+	region := envOrDefault("AWS_REGION", "us-east-1")
+	table := envOrDefault("STRAVIN_DDB_TABLE", "stravin-core")
+	bucket := envOrDefault("STRAVIN_S3_BUCKET", "git-objects-us-east-1")
+	kmsKeyID := envOrDefault("STRAVIN_KMS_KEY_ID", "alias/stravin-local-dev")
+	if os.Getenv("AWS_ACCESS_KEY_ID") == "" {
+		t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	}
+	if os.Getenv("AWS_SECRET_ACCESS_KEY") == "" {
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	}
+	if os.Getenv(s3.EnvForcePathStyle) == "" {
+		t.Setenv(s3.EnvForcePathStyle, "true")
+	}
+
+	ctx := context.Background()
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+	if err != nil {
+		t.Fatalf("LoadDefaultConfig: %v", err)
+	}
+
+	ddbClient := dynamodb.NewFromConfig(awsCfg, func(o *dynamodb.Options) {
+		o.BaseEndpoint = aws.String(endpoint)
+	})
+	ddbRepo, err := ddb.NewRepository(ddbClient, table)
+	if err != nil {
+		t.Fatalf("ddb.NewRepository: %v", err)
+	}
+
+	s3Client := s3.NewAWSClient(awsCfg, endpoint, s3.ForcePathStyleFromEnv())
+	kmsClient := crypto.NewKMSClient(awsCfg, endpoint)
+	encStore, err := buildS3Store(s3Client, bucket, kmsClient, kmsKeyID)
+	if err != nil {
+		t.Fatalf("buildS3Store: %v", err)
+	}
+	rawStore, err := s3.NewStore(s3Client, bucket)
+	if err != nil {
+		t.Fatalf("s3.NewStore(raw): %v", err)
+	}
+
+	nonce := fmt.Sprintf("node-kms-it-%d", time.Now().UnixNano())
+	rk, err := tenant.NewRepoKey("local", nonce)
+	if err != nil {
+		t.Fatalf("NewRepoKey: %v", err)
+	}
+	leaseRegion := lease.Region(fmt.Sprintf("%s-kms-%d", region, time.Now().UnixNano()))
+
+	if err := ddbRepo.PutRegionalWriteLease(ctx, ddb.RegionalWriteLease{
+		Region:    leaseRegion,
+		Epoch:     1,
+		Mode:      lease.ModeActive,
+		HolderID:  "floci-kms-it-ctrl",
+		ExpiresAt: time.Now().UTC().Add(5 * time.Minute),
+	}); err != nil {
+		t.Fatalf("PutRegionalWriteLease: %v", err)
+	}
+	if err := ddbRepo.CreateMeta(ctx, ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     leaseRegion,
+		FailoverEpoch:  1,
+		RefShards:      2,
+		ManifestShards: 2,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	}); err != nil {
+		t.Fatalf("CreateMeta: %v", err)
+	}
+
+	refresher, err := NewLeaseRefresher(LeaseRefresherConfig{
+		Store:  ddbRepo,
+		Region: leaseRegion,
+	})
+	if err != nil {
+		t.Fatalf("NewLeaseRefresher: %v", err)
+	}
+	if err := refresher.RefreshOnce(ctx); err != nil {
+		t.Fatalf("RefreshOnce: %v", err)
+	}
+
+	nvmeCache, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:  ddbRepo,
+		Packs: encStore,
+		Cache: nvmeCache,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	hookEngine := wasm.NewEngine(
+		NewS3WasmLoader(encStore),
+		NewDDBHookConfigStore(ddbRepo),
+		wasm.EngineConfig{},
+	)
+	t.Cleanup(func() { _ = hookEngine.Close(context.Background()) })
+
+	wh, err := NewReceivePackHandler(ReceivePackConfig{
+		Materializer:   mat,
+		Cache:          nvmeCache,
+		Packs:          encStore,
+		Committer:      ddbRepo,
+		LeaseRefresher: refresher,
+		HookEngine:     hookEngine,
+		Region:         leaseRegion,
+	})
+	if err != nil {
+		t.Fatalf("NewReceivePackHandler: %v", err)
+	}
+	srv, err := NewServer(ServerConfig{
+		Materializer:   mat,
+		GitExecutor:    gitexec.NewSubprocessExecutor(gitexec.Config{}),
+		WriteHandler:   wh,
+		LeaseRefresher: refresher,
+		Region:         string(leaseRegion),
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	client := startBufconnNode(t, srv)
+
+	commit1, _, pack1 := buildSyntheticCommitPack(t, "kms-encrypted-blob-content\n", "kms push commit\n", nil)
+	wire1 := buildPushWirePayload(
+		[]ddb.RefUpdate{{RefName: "refs/heads/main", OldOID: ddb.ZeroOID, NewOID: commit1.String()}},
+		"report-status side-band-64k atomic",
+		pack1,
+	)
+	resp, exitCode, err := sendReceivePack(t, ctx, client, rk, "", wire1)
+	if err != nil || exitCode != 0 {
+		t.Fatalf("push failed: err=%v exit=%d", err, exitCode)
+	}
+	b1, _ := splitSideBandResponse(t, resp)
+	if !strings.Contains(string(b1), "ok refs/heads/main\n") {
+		t.Fatalf("push report-status missing ok: %q", string(b1))
+	}
+
+	packs, err := rawStore.ListRepoPacks(ctx, rk)
+	if err != nil || len(packs) != 1 {
+		t.Fatalf("ListRepoPacks = %+v, err=%v (want 1 pack)", packs, err)
+	}
+	packInfo := packs[0]
+	idxKey, err := s3.IndexKey(rk, packInfo.PackSHA256)
+	if err != nil {
+		t.Fatalf("IndexKey: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = rawStore.DeleteObject(context.Background(), packInfo.Key)
+		_ = rawStore.DeleteObject(context.Background(), idxKey)
+	})
+
+	// Raw S3 object must be KMS envelope-encrypted, never plaintext PACK.
+	rawPack, err := rawStore.GetObject(ctx, packInfo.Key)
+	if err != nil {
+		t.Fatalf("raw GetObject(%s): %v", packInfo.Key, err)
+	}
+	if bytes.HasPrefix(rawPack, []byte("PACK")) {
+		t.Fatal("expected KMS envelope-encrypted pack in Floci S3, got plaintext PACK header")
+	}
+	if len(rawPack) < 4 || rawPack[0] != 1 {
+		t.Fatalf("expected envelope version 1 header in Floci S3, got len=%d prefix=%x", len(rawPack), rawPack[:min(len(rawPack), 4)])
+	}
+
+	// Encrypted s3.Store.GetPack must decrypt cleanly back to a valid Git PACK.
+	decPack, err := encStore.GetPack(ctx, rk, packInfo.PackSHA256)
+	if err != nil {
+		t.Fatalf("encStore.GetPack: %v", err)
+	}
+	if !bytes.HasPrefix(decPack, []byte("PACK")) {
+		t.Fatalf("decrypted pack missing PACK header: prefix=%q", decPack[:min(len(decPack), 4)])
 	}
 }
