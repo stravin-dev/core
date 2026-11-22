@@ -1,10 +1,12 @@
 GO := ./scripts/go.sh
 DAEMONS := edge node pack ctrl hook
 BINARIES := $(DAEMONS) admin
+FLOCI_TEST_TOOLS := floci-test-s3-sync floci-test-ddb-sync
 BIN_DIR := bin
 PRE_COMMIT ?= $(shell if command -v pre-commit >/dev/null 2>&1; then echo pre-commit; elif command -v asdf >/dev/null 2>&1; then echo "asdf exec pre-commit"; else echo pre-commit; fi)
+DOCKER_COMPOSE ?= $(shell if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "docker-compose"; fi)
 
-.PHONY: test e2e vet lint build docker-build clean pre-commit install-hooks
+.PHONY: test e2e vet lint build docker-build build-floci-test-tools multi-region-up multi-region-down multi-region-e2e clean pre-commit install-hooks
 
 test:
 	$(GO) test -race -v ./...
@@ -39,6 +41,21 @@ docker-build:
 		echo "Building Docker target $$d..."; \
 		docker build --target $$d -t stravin-$$d:local .; \
 	done
+
+build-floci-test-tools:
+	@for tool in $(FLOCI_TEST_TOOLS); do \
+		echo "Building Floci test tool Docker target $$tool..."; \
+		docker build -f Dockerfile.floci-test --target $$tool -t $$tool:local .; \
+	done
+
+multi-region-up:
+	$(DOCKER_COMPOSE) -f docker-compose.multi-region.yml up -d --build
+
+multi-region-down:
+	$(DOCKER_COMPOSE) -f docker-compose.multi-region.yml down -v --remove-orphans
+
+multi-region-e2e:
+	./scripts/multi-region-e2e.sh
 
 clean:
 	rm -rf $(BIN_DIR)

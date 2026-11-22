@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+
+FROM golang:1.24-alpine AS builder
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY cmd ./cmd
+COPY internal ./internal
+
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/floci-test-s3-sync ./cmd/floci-test-s3-sync \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/floci-test-ddb-sync ./cmd/floci-test-ddb-sync
+
+FROM alpine:3.21 AS runtime-base
+RUN apk add --no-cache ca-certificates \
+ && addgroup -S stravin \
+ && adduser -S -G stravin stravin
+
+FROM runtime-base AS floci-test-s3-sync
+COPY --from=builder /out/floci-test-s3-sync /usr/local/bin/floci-test-s3-sync
+USER stravin
+ENTRYPOINT ["/usr/local/bin/floci-test-s3-sync"]
+
+FROM runtime-base AS floci-test-ddb-sync
+COPY --from=builder /out/floci-test-ddb-sync /usr/local/bin/floci-test-ddb-sync
+USER stravin
+ENTRYPOINT ["/usr/local/bin/floci-test-ddb-sync"]

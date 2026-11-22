@@ -174,3 +174,26 @@ jobs:
 
       - name: Run 6/6 E2E suite against Docker Compose + Floci
         run: make e2e
+
+  multi-region-e2e:
+    name: Multi-Region E2E (Dual Floci + Sync)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read Go version from .tool-versions
+        id: tools
+        run: echo "go=$(awk '$1 == "golang" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.tools.outputs.go }}
+          cache: true
+
+      - name: Build Floci test sync images
+        run: make build-floci-test-tools
+
+      - name: Run multi-region sync E2E suite
+        run: make multi-region-e2e

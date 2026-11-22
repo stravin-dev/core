@@ -76,6 +76,29 @@ docker compose --profile telemetry up -d
 
 Open Grafana at [http://localhost:3000](http://localhost:3000) (anonymous Admin access enabled for local dev) with pre-provisioned Prometheus, Loki, and Tempo datasources.
 
+## Multi-Region Local Testing (Dual Floci)
+
+A standalone multi-region stack (`docker-compose.multi-region.yml`) runs two regional Floci emulators (`us-east-1` on `:4566` and `us-west-2` on `:4567`), two regional Stravin Core daemon sets (`stravin-edge-a/b`, `stravin-node-a/b`, `stravin-ctrl-a/b`), and four containerized directional sync workers built from `Dockerfile.floci-test`:
+
+- `floci-test-s3-sync-a-to-b` / `floci-test-s3-sync-b-to-a`: S3->SQS event-driven cross-region replication with `x-amz-meta-floci-replicated-from` loop guards.
+- `floci-test-ddb-sync-a-to-b` / `floci-test-ddb-sync-b-to-a`: DynamoDB Streams MREC replication with `_floci_rep_origin` / `_floci_rep_ts` LWW and delete bounce suppression.
+
+Production daemon images (`Dockerfile`) remain completely isolated from `cmd/floci-test-*`, `internal/flocitest/*`, and `service/sqs`.
+
+```bash
+# Build the standalone floci-test-s3-sync and floci-test-ddb-sync Docker images
+make build-floci-test-tools
+
+# Boot the dual-Floci multi-region stack (Region A :8080/:2222, Region B :8081/:2223)
+make multi-region-up
+
+# Tear down the multi-region stack and volumes
+make multi-region-down
+
+# Run the automated multi-region sync + push-A/fetch-B E2E suite
+make multi-region-e2e
+```
+
 ## Local Development Setup
 
 Tool versions are pinned in `.tool-versions` for [asdf](https://asdf-vm.com/):
