@@ -52,6 +52,7 @@ type DaemonConfig struct {
 	AWSEndpointURL       string
 	LeaseRefreshInterval time.Duration
 	ShutdownTimeout      time.Duration
+	GRPCTransport        rpc.TransportConfig
 	WriteHandler         WriteHandler
 	OnReady              func(grpcAddr, healthAddr string)
 }
@@ -87,6 +88,7 @@ func LoadDaemonConfigFromEnv() DaemonConfig {
 		AWSEndpointURL:       strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL")),
 		LeaseRefreshInterval: refreshInterval,
 		ShutdownTimeout:      defaultDaemonShutdownWindow,
+		GRPCTransport:        rpc.LoadTransportConfigFromEnv(),
 	}
 }
 
@@ -120,6 +122,11 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 	}
 	if cfg.ShutdownTimeout <= 0 {
 		cfg.ShutdownTimeout = defaultDaemonShutdownWindow
+	}
+
+	grpcOpts, err := rpc.ServerOptions(cfg.GRPCTransport)
+	if err != nil {
+		return fmt.Errorf("node: grpc transport config: %w", err)
 	}
 
 	logger := telemetry.NewLogger(os.Stdout, slog.LevelInfo)
@@ -246,7 +253,7 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 		return fmt.Errorf("node: listen health %s: %w", cfg.HealthAddr, err)
 	}
 
-	grpcSrv := grpc.NewServer()
+	grpcSrv := grpc.NewServer(grpcOpts...)
 	rpc.RegisterGitWireServer(grpcSrv, nodeSrv)
 
 	mux := http.NewServeMux()
