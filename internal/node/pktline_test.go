@@ -293,6 +293,43 @@ func TestParseReceiveCommands_CommandLineLengthCap(t *testing.T) {
 	}
 }
 
+func TestParseReceiveCommands_RejectsInvalidRefNames(t *testing.T) {
+	newOID := strings.Repeat("a", 40)
+	invalidRefs := []string{
+		"refs/",
+		"refs/heads/",
+		"refs/heads//a",
+		"refs/heads/.hidden",
+		"refs/heads/foo.lock",
+		"refs/heads/a..b",
+		"refs/heads/a@{b}",
+		"refs/heads/@",
+		"refs/heads/a.",
+		"refs/heads/a b",
+		"refs/heads/a~1",
+		"refs/heads/a^2",
+		"refs/heads/a:b",
+		"refs/heads/a?b",
+		"refs/heads/a*",
+		"refs/heads/a[0]",
+		`refs/heads/a\b`,
+		"refs/heads/a\x01b",
+		"refs/heads/a\x7fb",
+	}
+
+	for _, ref := range invalidRefs {
+		t.Run(fmt.Sprintf("%q", ref), func(t *testing.T) {
+			var wire bytes.Buffer
+			wire.Write(EncodePktLine([]byte(ddb.ZeroOID + " " + newOID + " " + ref + "\n")))
+			wire.Write(FlushPkt)
+
+			if _, _, err := ParseReceiveCommands(&wire); err == nil {
+				t.Fatalf("ParseReceiveCommands accepted invalid ref %q, want error", ref)
+			}
+		})
+	}
+}
+
 func decodePktLines(t *testing.T, data []byte) []string {
 	t.Helper()
 	var lines []string

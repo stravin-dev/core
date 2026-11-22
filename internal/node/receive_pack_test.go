@@ -1068,4 +1068,207 @@ func TestPackObjectReaderAdapter_CommitsDiffAndBlob(t *testing.T) {
 	if string(chunk) != "hello adapter\n" {
 		t.Fatalf("ReadBlobChunk = %q, want %q", string(chunk), "hello adapter\n")
 	}
+
+	ctxReader, ok := adapter.(wasm.ContextDiffTreeReader)
+	if !ok {
+		t.Fatalf("adapter %T does not implement wasm.ContextDiffTreeReader", adapter)
+	}
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := ctxReader.DiffTreeContext(canceledCtx, [20]byte{}, commits[0].TreeOID, 10); !errors.Is(err, context.Canceled) {
+		t.Fatalf("DiffTreeContext(canceled) err = %v, want context.Canceled", err)
+	}
+}
+
+func TestReceivePack_RefDirectoryCollisions(t *testing.T) {
+	t.Run("PushChildWhenParentExists", func(t *testing.T) {
+		env := newTestReceivePackEnv(t, "collide-child")
+		existingOID := strings.Repeat("a", 40)
+		env.ddbStore.SetRefs(env.rk, []ddb.RefState{
+			{Repo: env.rk, RefName: "refs/heads/a", OID: existingOID},
+		})
+
+		commitOID, _, packBytes := buildSyntheticCommitPack(t, "child\n", "child commit\n", nil)
+		wire := buildPushWirePayload(
+			[]ddb.RefUpdate{{RefName: "refs/heads/a/b", OldOID: ddb.ZeroOID, NewOID: commitOID.String()}},
+			"report-status side-band-64k",
+			packBytes,
+		)
+		resp, exitCode, err := sendReceivePack(t, context.Background(), env.client, env.rk, "", wire)
+		if err != nil {
+			t.Fatalf("sendReceivePack: %v", err)
+		}
+		if exitCode != 0 {
+			t.Fatalf("exitCode = %d, want 0", exitCode)
+		}
+		band1, _ := splitSideBandResponse(t, resp)
+		lines := decodePktLines(t, band1)
+		if len(lines) < 2 || !strings.HasPrefix(lines[1], "ng refs/heads/a/b ") || !strings.Contains(lines[1], "collision") {
+			t.Fatalf("expected ref collision rejection, got %q", lines)
+		}
+		if env.s3Store.PutCount() != 0 || env.ddbStore.CommitCount() != 0 {
+			t.Fatalf("expected zero S3/DDB writes on collision, got s3=%d ddb=%d", env.s3Store.PutCount(), env.ddbStore.CommitCount())
+		}
+	})
+
+	t.Run("PushParentWhenChildExists", func(t *testing.T) {
+		env := newTestReceivePackEnv(t, "collide-parent")
+		existingOID := strings.Repeat("b", 40)
+		env.ddbStore.SetRefs(env.rk, []ddb.RefState{
+			{Repo: env.rk, RefName: "refs/heads/a/b", OID: existingOID},
+		})
+
+		commitOID, _, packBytes := buildSyntheticCommitPack(t, "parent\n", "parent commit\n", nil)
+		wire := buildPushWirePayload(
+			[]ddb.RefUpdate{{RefName: "refs/heads/a", OldOID: ddb.ZeroOID, NewOID: commitOID.String()}},
+			"report-status side-band-64k",
+			packBytes,
+		)
+		resp, exitCode, err := sendReceivePack(t, context.Background(), env.client, env.rk, "", wire)
+		if err != nil {
+			t.Fatalf("sendReceivePack: %v", err)
+		}
+		if exitCode != 0 {
+			t.Fatalf("exitCode = %d, want 0", exitCode)
+		}
+		band1, _ := splitSideBandResponse(t, resp)
+		lines := decodePktLines(t, band1)
+		if len(lines) < 2 || !strings.HasPrefix(lines[1], "ng refs/heads/a ") || !strings.Contains(lines[1], "collision") {
+			t.Fatalf("expected ref collision rejection, got %q", lines)
+		}
+		if env.s3Store.PutCount() != 0 || env.ddbStore.CommitCount() != 0 {
+			t.Fatalf("expected zero S3/DDB writes on collision, got s3=%d ddb=%d", env.s3Store.PutCount(), env.ddbStore.CommitCount())
+		}
+	})
+
+	t.Run("PushParentAndChildInSameBatch", func(t *testing.T) {
+		env := newTestReceivePackEnv(t, "collide-batch")
+		commitOID, _, packBytes := buildSyntheticCommitPack(t, "batch\n", "batch commit\n", nil)
+		wire := buildPushWirePayload(
+			[]ddb.RefUpdate{
+				{RefName: "refs/heads/a", OldOID: ddb.ZeroOID, NewOID: commitOID.String()},
+				{RefName: "refs/heads/a/b", OldOID: ddb.ZeroOID, NewOID: commitOID.String()},
+				{RefName: "refs/heads/ok", OldOID: ddb.ZeroOID, NewOID: commitOID.String()},
+			},
+			"report-status side-band-64k atomic",
+			packBytes,
+		)
+		resp, exitCode, err := sendReceivePack(t, context.Background(), env.client, env.rk, "", wire)
+		if err != nil {
+			t.Fatalf("sendReceivePack: %v", err)
+		}
+		if exitCode != 0 {
+			t.Fatalf("exitCode = %d, want 0", exitCode)
+		}
+		band1, _ := splitSideBandResponse(t, resp)
+		lines := decodePktLines(t, band1)
+		if len(lines) != 4 {
+			t.Fatalf("expected 4 status lines, got %q", lines)
+		}
+		if !strings.HasPrefix(lines[1], "ng refs/heads/a ") || !strings.Contains(lines[1], "collision") {
+			t.Fatalf("expected collision on refs/heads/a, got %q", lines[1])
+		}
+		if !strings.HasPrefix(lines[2], "ng refs/heads/a/b ") || !strings.Contains(lines[2], "collision") {
+			t.Fatalf("expected collision on refs/heads/a/b, got %q", lines[2])
+		}
+		if !strings.HasPrefix(lines[3], "ng refs/heads/ok ") {
+			t.Fatalf("expected atomic rejection on refs/heads/ok, got %q", lines[3])
+		}
+		if env.s3Store.PutCount() != 0 || env.ddbStore.CommitCount() != 0 {
+			t.Fatalf("expected zero S3/DDB writes on collision, got s3=%d ddb=%d", env.s3Store.PutCount(), env.ddbStore.CommitCount())
+		}
+	})
+
+	t.Run("DeleteParentAndCreateChildInSameBatchAllowed", func(t *testing.T) {
+		env := newTestReceivePackEnv(t, "replace-parent-with-child")
+		existingOID := strings.Repeat("c", 40)
+		env.ddbStore.SetRefs(env.rk, []ddb.RefState{
+			{Repo: env.rk, RefName: "refs/heads/a", OID: existingOID},
+		})
+
+		commitOID, _, packBytes := buildSyntheticCommitPack(t, "replace\n", "replace commit\n", nil)
+		wire := buildPushWirePayload(
+			[]ddb.RefUpdate{
+				{RefName: "refs/heads/a", OldOID: existingOID, NewOID: ddb.ZeroOID},
+				{RefName: "refs/heads/a/b", OldOID: ddb.ZeroOID, NewOID: commitOID.String()},
+			},
+			"report-status side-band-64k delete-refs atomic",
+			packBytes,
+		)
+		resp, exitCode, err := sendReceivePack(t, context.Background(), env.client, env.rk, "", wire)
+		if err != nil {
+			t.Fatalf("sendReceivePack: %v", err)
+		}
+		if exitCode != 0 {
+			t.Fatalf("exitCode = %d, want 0", exitCode)
+		}
+		band1, _ := splitSideBandResponse(t, resp)
+		lines := decodePktLines(t, band1)
+		if len(lines) != 3 || lines[1] != "ok refs/heads/a\n" || lines[2] != "ok refs/heads/a/b\n" {
+			t.Fatalf("expected delete+create to succeed, got %q", lines)
+		}
+		if env.ddbStore.CommitCount() != 1 {
+			t.Fatalf("expected 1 DDB commit, got %d", env.ddbStore.CommitCount())
+		}
+	})
+
+	t.Run("DeleteChildAndCreateParentInSameBatchAllowed", func(t *testing.T) {
+		env := newTestReceivePackEnv(t, "replace-child-with-parent")
+		existingOID := strings.Repeat("d", 40)
+		env.ddbStore.SetRefs(env.rk, []ddb.RefState{
+			{Repo: env.rk, RefName: "refs/heads/a/b", OID: existingOID},
+		})
+
+		commitOID, _, packBytes := buildSyntheticCommitPack(t, "replace2\n", "replace2 commit\n", nil)
+		wire := buildPushWirePayload(
+			[]ddb.RefUpdate{
+				{RefName: "refs/heads/a/b", OldOID: existingOID, NewOID: ddb.ZeroOID},
+				{RefName: "refs/heads/a", OldOID: ddb.ZeroOID, NewOID: commitOID.String()},
+			},
+			"report-status side-band-64k delete-refs atomic",
+			packBytes,
+		)
+		resp, exitCode, err := sendReceivePack(t, context.Background(), env.client, env.rk, "", wire)
+		if err != nil {
+			t.Fatalf("sendReceivePack: %v", err)
+		}
+		if exitCode != 0 {
+			t.Fatalf("exitCode = %d, want 0", exitCode)
+		}
+		band1, _ := splitSideBandResponse(t, resp)
+		lines := decodePktLines(t, band1)
+		if len(lines) != 3 || lines[1] != "ok refs/heads/a/b\n" || lines[2] != "ok refs/heads/a\n" {
+			t.Fatalf("expected delete+create to succeed, got %q", lines)
+		}
+		if env.ddbStore.CommitCount() != 1 {
+			t.Fatalf("expected 1 DDB commit, got %d", env.ddbStore.CommitCount())
+		}
+	})
+
+	t.Run("SiblingNamePrefixAllowed", func(t *testing.T) {
+		env := newTestReceivePackEnv(t, "sibling-prefix")
+		existingOID := strings.Repeat("e", 40)
+		env.ddbStore.SetRefs(env.rk, []ddb.RefState{
+			{Repo: env.rk, RefName: "refs/heads/a", OID: existingOID},
+		})
+
+		commitOID, _, packBytes := buildSyntheticCommitPack(t, "sibling\n", "sibling commit\n", nil)
+		wire := buildPushWirePayload(
+			[]ddb.RefUpdate{{RefName: "refs/heads/ab", OldOID: ddb.ZeroOID, NewOID: commitOID.String()}},
+			"report-status side-band-64k",
+			packBytes,
+		)
+		resp, exitCode, err := sendReceivePack(t, context.Background(), env.client, env.rk, "", wire)
+		if err != nil {
+			t.Fatalf("sendReceivePack: %v", err)
+		}
+		if exitCode != 0 {
+			t.Fatalf("exitCode = %d, want 0", exitCode)
+		}
+		band1, _ := splitSideBandResponse(t, resp)
+		lines := decodePktLines(t, band1)
+		if len(lines) != 2 || lines[1] != "ok refs/heads/ab\n" {
+			t.Fatalf("expected sibling ref push to succeed, got %q", lines)
+		}
+	})
 }
