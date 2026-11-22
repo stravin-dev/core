@@ -37,6 +37,7 @@ const (
 	defaultCacheDir             = "/var/lib/stravin/cache"
 	defaultDDBTable             = "stravin-core"
 	defaultDaemonShutdownWindow = 5 * time.Second
+	defaultGitExecTimeout       = 5 * time.Minute
 )
 
 // DaemonConfig configures the full stravin-node process.
@@ -53,6 +54,7 @@ type DaemonConfig struct {
 	LeaseRefreshInterval time.Duration
 	ShutdownTimeout      time.Duration
 	GRPCTransport        rpc.TransportConfig
+	GitExec              gitexec.Config
 	WriteHandler         WriteHandler
 	OnReady              func(grpcAddr, healthAddr string)
 }
@@ -89,6 +91,7 @@ func LoadDaemonConfigFromEnv() DaemonConfig {
 		LeaseRefreshInterval: refreshInterval,
 		ShutdownTimeout:      defaultDaemonShutdownWindow,
 		GRPCTransport:        rpc.LoadTransportConfigFromEnv(),
+		GitExec:              gitexec.LoadConfigFromEnv(defaultGitExecTimeout, nil),
 	}
 }
 
@@ -228,7 +231,7 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 		}
 	}
 
-	gitExec := gitexec.NewSubprocessExecutor(gitexec.Config{Logger: logger})
+	gitExec := gitexec.NewSubprocessExecutor(resolveGitExecConfig(cfg.GitExec, logger))
 	nodeSrv, err := NewServer(ServerConfig{
 		Materializer:   materializer,
 		GitExecutor:    gitExec,
@@ -325,6 +328,19 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 		logger.Info("stravin-node stopped")
 		return nil
 	}
+}
+
+func resolveGitExecConfig(cfg gitexec.Config, logger *slog.Logger) gitexec.Config {
+	if cfg.DefaultTimeout <= 0 && cfg.Sandbox == (gitexec.SandboxConfig{}) {
+		cfg.Sandbox = gitexec.DefaultSandboxConfig()
+	}
+	if cfg.DefaultTimeout <= 0 {
+		cfg.DefaultTimeout = defaultGitExecTimeout
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = logger
+	}
+	return cfg
 }
 
 func envOrDefault(key, fallback string) string {
