@@ -40,8 +40,29 @@ type PromotionAuditStore interface {
 	RecordPromotionAudit(ctx context.Context, record PromotionAuditRecord) error
 }
 
-// DDBAuditStore writes immutable scrub and promotion audit records to the Stravin
-// single-table DynamoDB store.
+// RecoveryAuditRecord captures an immutable audit entry for a published
+// orphaned-pack recovery ref (refs/stravin-recovery/*).
+type RecoveryAuditRecord struct {
+	AuditID       string         `json:"audit_id"`
+	Repo          tenant.RepoKey `json:"repo"`
+	Region        lease.Region   `json:"region"`
+	FailoverEpoch lease.Epoch    `json:"failover_epoch"`
+	SourceRef     string         `json:"source_ref"`
+	RecoveryRef   string         `json:"recovery_ref"`
+	CommitOID     string         `json:"commit_oid"`
+	PackID        string         `json:"pack_id"`
+	PackSizeBytes int64          `json:"pack_size_bytes"`
+	OriginRegion  lease.Region   `json:"origin_region"`
+	PublishedAt   time.Time      `json:"published_at"`
+}
+
+// RecoveryAuditStore persists immutable recovery branch publication audit records.
+type RecoveryAuditStore interface {
+	RecordRecoveryAudit(ctx context.Context, record RecoveryAuditRecord) error
+}
+
+// DDBAuditStore writes immutable scrub, promotion, and recovery audit records to
+// the Stravin single-table DynamoDB store.
 type DDBAuditStore struct {
 	client    ddb.API
 	tableName string
@@ -50,6 +71,7 @@ type DDBAuditStore struct {
 var (
 	_ AuditStore          = (*DDBAuditStore)(nil)
 	_ PromotionAuditStore = (*DDBAuditStore)(nil)
+	_ RecoveryAuditStore  = (*DDBAuditStore)(nil)
 )
 
 // NewDDBAuditStore constructs a DynamoDB-backed immutable AuditStore.
@@ -181,6 +203,56 @@ func (s *DDBAuditStore) RecordPromotionAudit(ctx context.Context, record Promoti
 	})
 	if err != nil {
 		return fmt.Errorf("ctrl: put promotion audit %s: %w", record.AuditID, err)
+	}
+	return nil
+}
+
+// RecoveryAuditKey returns PK=T#{tenant}#REPO#{repo}#AUDIT, SK=RECOVERY#{audit_id}.
+func RecoveryAuditKey(record RecoveryAuditRecord) (ddb.Key, error) {
+	if err := record.Repo.Validate(); err != nil {
+		return ddb.Key{}, err
+	}
+	if strings.TrimSpace(record.AuditID) == "" {
+		return ddb.Key{}, fmt.Errorf("%w: empty audit_id", ddb.ErrInvalidInput)
+	}
+	return ddb.Key{
+		PK: fmt.Sprintf("%s#AUDIT", record.Repo.DynamoPrefix()),
+		SK: fmt.Sprintf("RECOVERY#%s", record.AuditID),
+	}, nil
+}
+
+// RecordRecoveryAudit persists a published recovery ref record as an immutable DynamoDB item.
+func (s *DDBAuditStore) RecordRecoveryAudit(ctx context.Context, record RecoveryAuditRecord) error {
+	key, err := RecoveryAuditKey(record)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("ctrl: marshal recovery audit record: %w", err)
+	}
+
+	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(s.tableName),
+		Item: map[string]types.AttributeValue{
+			ddb.AttrPK:       &types.AttributeValueMemberS{Value: key.PK},
+			ddb.AttrSK:       &types.AttributeValueMemberS{Value: key.SK},
+			"audit_id":       &types.AttributeValueMemberS{Value: record.AuditID},
+			"tenant_id":      &types.AttributeValueMemberS{Value: string(record.Repo.TenantID)},
+			"repo_id":        &types.AttributeValueMemberS{Value: string(record.Repo.RepoID)},
+			"region":         &types.AttributeValueMemberS{Value: string(record.Region)},
+			"failover_epoch": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", record.FailoverEpoch)},
+			"source_ref":     &types.AttributeValueMemberS{Value: record.SourceRef},
+			"recovery_ref":   &types.AttributeValueMemberS{Value: record.RecoveryRef},
+			"commit_oid":     &types.AttributeValueMemberS{Value: record.CommitOID},
+			"pack_id":        &types.AttributeValueMemberS{Value: record.PackID},
+			"published_at":   &types.AttributeValueMemberS{Value: record.PublishedAt.UTC().Format(time.RFC3339Nano)},
+			"record_json":    &types.AttributeValueMemberS{Value: string(payload)},
+		},
+		ConditionExpression: aws.String("attribute_not_exists(PK)"),
+	})
+	if err != nil {
+		return fmt.Errorf("ctrl: put recovery audit %s: %w", record.AuditID, err)
 	}
 	return nil
 }

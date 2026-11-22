@@ -24,6 +24,7 @@ import (
 	"stravin.dev/core/internal/storage/ddb"
 	"stravin.dev/core/internal/storage/s3"
 	"stravin.dev/core/internal/telemetry"
+	"stravin.dev/core/internal/tenant"
 )
 
 const (
@@ -54,6 +55,10 @@ type ctrlConfig struct {
 	WitnessEndpoints       []string
 	WitnessQuorum          int
 	WitnessTimeout         time.Duration
+	RecoveryOnBoot         bool
+	RecoveryRepos          []string
+	RecoveryConcurrency    int
+	RecoveryLookback       time.Duration
 }
 
 func loadConfig() ctrlConfig {
@@ -85,6 +90,10 @@ func loadConfig() ctrlConfig {
 		WitnessEndpoints:       envCSV("STRAVIN_CTRL_WITNESS_ENDPOINTS"),
 		WitnessQuorum:          envIntAllowZero("STRAVIN_CTRL_WITNESS_QUORUM", 0),
 		WitnessTimeout:         envDuration("STRAVIN_CTRL_WITNESS_TIMEOUT", ctrl.DefaultWitnessTimeout),
+		RecoveryOnBoot:         envBool("STRAVIN_CTRL_RECOVERY_ON_BOOT", false),
+		RecoveryRepos:          envCSV("STRAVIN_CTRL_RECOVERY_REPOS"),
+		RecoveryConcurrency:    envInt("STRAVIN_CTRL_RECOVERY_CONCURRENCY", ctrl.DefaultRecoveryConcurrency),
+		RecoveryLookback:       envDurationAllowZero("STRAVIN_CTRL_RECOVERY_LOOKBACK", 0),
 	}
 }
 
@@ -283,10 +292,24 @@ func run(ctx context.Context, cfg ctrlConfig) error {
 		return fmt.Errorf("init scrubber: %w", err)
 	}
 
+	reconciler, err := ctrl.NewRecoveryReconciler(ctrl.RecoveryConfig{
+		DDB:           ddbRepo,
+		S3:            s3Store,
+		Audit:         auditStore,
+		Region:        lease.Region(cfg.Region),
+		DefaultWindow: cfg.RecoveryLookback,
+		Concurrency:   cfg.RecoveryConcurrency,
+		Metrics:       metrics,
+	})
+	if err != nil {
+		return fmt.Errorf("init recovery reconciler: %w", err)
+	}
+
 	handler, err := ctrl.NewHandler(ctrl.HandlerConfig{
 		ServiceName: serviceName,
 		Leases:      leaseMgr,
 		Scrubber:    scrubber,
+		Recovery:    reconciler,
 		AdminToken:  cfg.AdminToken,
 	})
 	if err != nil {
@@ -305,6 +328,14 @@ func run(ctx context.Context, cfg ctrlConfig) error {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	if cfg.RecoveryOnBoot && len(cfg.RecoveryRepos) > 0 {
+		if _, renewErr := leaseMgr.RenewOnce(runCtx); renewErr != nil {
+			slog.Warn("ctrl: initial lease renew before recovery boot failed", "region", cfg.Region, "error", renewErr)
+		} else if shouldRunRecoveryBoot(leaseMgr.Status().Mode) {
+			runRecoveryBoot(runCtx, reconciler, cfg)
+		}
+	}
 
 	leaseDone := make(chan error, 1)
 	go func() {
@@ -341,6 +372,47 @@ func run(ctx context.Context, cfg ctrlConfig) error {
 		return serveErr
 	}
 	return leaseErr
+}
+
+func shouldRunRecoveryBoot(mode lease.Mode) bool {
+	return mode == lease.ModeDraining || mode == lease.ModeReadOnly
+}
+
+func parseRecoveryRepoKey(raw string) (tenant.RepoKey, error) {
+	tenantID, repoID, ok := strings.Cut(strings.TrimSpace(raw), "/")
+	if !ok {
+		return tenant.RepoKey{}, fmt.Errorf("invalid recovery repo %q: want tenant/repo", raw)
+	}
+	return tenant.NewRepoKey(tenantID, repoID)
+}
+
+func runRecoveryBoot(ctx context.Context, reconciler *ctrl.RecoveryReconciler, cfg ctrlConfig) {
+	for _, raw := range cfg.RecoveryRepos {
+		rk, err := parseRecoveryRepoKey(raw)
+		if err != nil {
+			slog.Warn("ctrl: skipping invalid recovery boot repo", "repo", raw, "error", err)
+			continue
+		}
+		report, err := reconciler.ReconcileRepo(ctx, ctrl.RecoveryRequest{
+			Repo:           rk,
+			LookbackWindow: cfg.RecoveryLookback,
+			Concurrency:    cfg.RecoveryConcurrency,
+		})
+		if err != nil {
+			slog.Warn("ctrl: recovery boot reconciliation failed",
+				"tenant_id", string(rk.TenantID),
+				"repo_id", string(rk.RepoID),
+				"error", err,
+			)
+			continue
+		}
+		slog.Info("ctrl: recovery boot reconciliation completed",
+			"tenant_id", string(rk.TenantID),
+			"repo_id", string(rk.RepoID),
+			"status", report.Status,
+			"published", len(report.Published),
+		)
+	}
 }
 
 func main() {

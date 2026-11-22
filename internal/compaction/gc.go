@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -19,12 +20,18 @@ import (
 	"stravin.dev/core/internal/tenant"
 )
 
+// RecoveryRefPrefix identifies non-destructive recovery refs published by
+// stravin-ctrl whose backing packs must never be reaped by delayed GC.
+const RecoveryRefPrefix = "refs/stravin-recovery/"
+
 // GCSweeperConfig configures delayed garbage collection for COMPACTED and
 // orphaned S3 packfiles.
 type GCSweeperConfig struct {
 	Manifests         ManifestStore
 	ManifestGC        ManifestGCStore
 	Objects           PackObjectStore
+	Refs              RefLister
+	RefShards         int
 	ReplicationGate   ReplicationGate
 	GraceWindow       time.Duration
 	OrphanGraceWindow time.Duration
@@ -40,6 +47,8 @@ type GCSweeper struct {
 	manifests         ManifestStore
 	manifestGC        ManifestGCStore
 	objects           PackObjectStore
+	refs              RefLister
+	refShards         int
 	replicationGate   ReplicationGate
 	graceWindow       time.Duration
 	orphanGraceWindow time.Duration
@@ -76,6 +85,8 @@ func NewGCSweeper(cfg GCSweeperConfig) (*GCSweeper, error) {
 		manifests:         cfg.Manifests,
 		manifestGC:        cfg.ManifestGC,
 		objects:           cfg.Objects,
+		refs:              cfg.Refs,
+		refShards:         cfg.RefShards,
 		replicationGate:   cfg.ReplicationGate,
 		graceWindow:       grace,
 		orphanGraceWindow: orphanGrace,
@@ -125,6 +136,22 @@ func (g *GCSweeper) SweepRepo(ctx context.Context, repo tenant.RepoKey, manifest
 			activePackIDs[m.PackID] = struct{}{}
 		case ddb.PackStatusCompacted:
 			compacted = append(compacted, m)
+		}
+	}
+
+	// Protect any pack referenced by an active recovery ref (refs/stravin-recovery/*)
+	// from both COMPACTED and orphaned-pack deletion.
+	if g.refs != nil && g.refShards > 0 {
+		refs, err := g.refs.ListRefs(spanCtx, repo, g.refShards)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return GCResult{}, fmt.Errorf("compaction gc: list recovery refs: %w", err)
+		}
+		for _, ref := range refs {
+			if strings.HasPrefix(ref.RefName, RecoveryRefPrefix) && ref.PackID != "" {
+				activePackIDs[ref.PackID] = struct{}{}
+			}
 		}
 	}
 
