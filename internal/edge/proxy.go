@@ -40,6 +40,17 @@ func NewGRPCNodeDialer(opts ...grpc.DialOption) *GRPCNodeDialer {
 	}
 }
 
+// NewGRPCNodeDialerWithConfig creates a GRPCNodeDialer configured with internal gRPC
+// authentication and TLS/mTLS options from cfg. It fails closed when cfg is incomplete.
+func NewGRPCNodeDialerWithConfig(cfg rpc.TransportConfig, extraOpts ...grpc.DialOption) (*GRPCNodeDialer, error) {
+	opts, err := rpc.ClientDialOptions(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("edge: grpc client transport config: %w", err)
+	}
+	opts = append(opts, extraOpts...)
+	return NewGRPCNodeDialer(opts...), nil
+}
+
 // Client returns a cached rpc.GitWireClient for peer, dialing lazily if needed.
 func (d *GRPCNodeDialer) Client(peer string) (rpc.GitWireClient, error) {
 	if peer == "" {

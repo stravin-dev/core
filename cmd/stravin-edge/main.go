@@ -17,6 +17,7 @@ import (
 
 	"stravin.dev/core/internal/edge"
 	"stravin.dev/core/internal/lease"
+	"stravin.dev/core/internal/rpc"
 	"stravin.dev/core/internal/storage/ddb"
 	"stravin.dev/core/internal/telemetry"
 )
@@ -97,7 +98,10 @@ func run() error {
 	})
 
 	router := edge.NewRendezvousRouter(peers)
-	dialer := edge.NewGRPCNodeDialer()
+	dialer, err := edge.NewGRPCNodeDialerWithConfig(rpc.LoadTransportConfigFromEnv())
+	if err != nil {
+		return fmt.Errorf("init grpc node dialer: %w", err)
+	}
 	defer func() { _ = dialer.Close() }()
 
 	proxy, err := edge.NewWireProxy(dialer)
