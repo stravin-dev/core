@@ -22,6 +22,7 @@ import (
 
 	"stravin.dev/core/internal/cache"
 	"stravin.dev/core/internal/gitexec"
+	"stravin.dev/core/internal/hooks/wasm"
 	"stravin.dev/core/internal/lease"
 	"stravin.dev/core/internal/rpc"
 	"stravin.dev/core/internal/storage/ddb"
@@ -192,11 +193,39 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 		return fmt.Errorf("node: init materializer: %w", err)
 	}
 
+	writeHandler := cfg.WriteHandler
+	if writeHandler == nil {
+		hookEngine := wasm.NewEngine(
+			NewS3WasmLoader(s3Store),
+			NewDDBHookConfigStore(ddbRepo),
+			wasm.EngineConfig{Logger: logger},
+		)
+		defer func() {
+			_ = hookEngine.Close(context.Background())
+		}()
+
+		writeHandler, err = NewReceivePackHandler(ReceivePackConfig{
+			Materializer:   materializer,
+			Cache:          nvmeCache,
+			Packs:          s3Store,
+			Committer:      ddbRepo,
+			LeaseRefresher: refresher,
+			HookEngine:     hookEngine,
+			Region:         cfg.Region,
+			Telemetry:      tp,
+			Metrics:        metrics,
+			Logger:         logger,
+		})
+		if err != nil {
+			return fmt.Errorf("node: init receive-pack handler: %w", err)
+		}
+	}
+
 	gitExec := gitexec.NewSubprocessExecutor(gitexec.Config{Logger: logger})
 	nodeSrv, err := NewServer(ServerConfig{
 		Materializer:   materializer,
 		GitExecutor:    gitExec,
-		WriteHandler:   cfg.WriteHandler,
+		WriteHandler:   writeHandler,
 		LeaseRefresher: refresher,
 		Telemetry:      tp,
 		Metrics:        metrics,
