@@ -1,15 +1,268 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+
+	"stravin.dev/core/internal/ctrl"
 	"stravin.dev/core/internal/daemon"
+	"stravin.dev/core/internal/lease"
+	"stravin.dev/core/internal/storage/ddb"
+	"stravin.dev/core/internal/storage/s3"
+	"stravin.dev/core/internal/telemetry"
 )
 
+const (
+	serviceName            = "stravin-ctrl"
+	defaultListenAddr      = ":8083"
+	defaultRegion          = "us-east-1"
+	defaultDDBTable        = "stravin-core"
+	defaultS3BucketPrefix  = "git-objects-"
+	defaultShutdownTimeout = 5 * time.Second
+)
+
+type ctrlConfig struct {
+	ListenAddr        string
+	Region            string
+	AWSEndpoint       string
+	DDBTable          string
+	S3Bucket          string
+	HolderID          string
+	LeaseTTL          time.Duration
+	HeartbeatInterval time.Duration
+	FenceWait         time.Duration
+	ScrubLookback     time.Duration
+	ScrubConcurrency  int
+}
+
+func loadConfig() ctrlConfig {
+	region := envOrDefault("STRAVIN_REGION", envOrDefault("AWS_REGION", defaultRegion))
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		hostname = "ctrl"
+	}
+	defaultHolderID := fmt.Sprintf("%s-%s-%d", serviceName, hostname, os.Getpid())
+
+	listenAddr := envOrDefault("STRAVIN_CTRL_ADDR", daemon.ListenAddrFromEnv(defaultListenAddr))
+
+	return ctrlConfig{
+		ListenAddr:        listenAddr,
+		Region:            region,
+		AWSEndpoint:       strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL")),
+		DDBTable:          envOrDefault("STRAVIN_DDB_TABLE", defaultDDBTable),
+		S3Bucket:          envOrDefault("STRAVIN_S3_BUCKET", defaultS3BucketPrefix+region),
+		HolderID:          envOrDefault("STRAVIN_CTRL_HOLDER_ID", defaultHolderID),
+		LeaseTTL:          envDuration("STRAVIN_CTRL_LEASE_TTL", ctrl.DefaultLeaseTTL),
+		HeartbeatInterval: envDuration("STRAVIN_CTRL_HEARTBEAT_INTERVAL", ctrl.DefaultHeartbeatInterval),
+		FenceWait:         envDurationAllowZero("STRAVIN_CTRL_FENCE_WAIT", 0),
+		ScrubLookback:     envDuration("STRAVIN_CTRL_SCRUB_LOOKBACK", ctrl.DefaultScrubLookback),
+		ScrubConcurrency:  envInt("STRAVIN_CTRL_SCRUB_CONCURRENCY", ctrl.DefaultScrubConcurrency),
+	}
+}
+
+func envOrDefault(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return d
+	}
+	if secs, err := strconv.Atoi(raw); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return fallback
+}
+
+func envDurationAllowZero(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d >= 0 {
+		return d
+	}
+	if secs, err := strconv.Atoi(raw); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return fallback
+}
+
+func envInt(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+		return v
+	}
+	return fallback
+}
+
+func run(ctx context.Context, cfg ctrlConfig) error {
+	telProvider, err := telemetry.Init(ctx, telemetry.Config{
+		ServiceName: serviceName,
+		Region:      cfg.Region,
+		Mode:        telemetry.ModeOTLP,
+		SetGlobal:   true,
+	})
+	if err != nil {
+		return fmt.Errorf("init telemetry: %w", err)
+	}
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
+		defer cancel()
+		if shutErr := telProvider.Shutdown(shutCtx); shutErr != nil {
+			slog.Warn("telemetry shutdown error", "service", serviceName, "error", shutErr)
+		}
+	}()
+
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.Region))
+	if err != nil {
+		return fmt.Errorf("load aws config: %w", err)
+	}
+
+	ddbClient := dynamodb.NewFromConfig(awsCfg, func(o *dynamodb.Options) {
+		if cfg.AWSEndpoint != "" {
+			o.BaseEndpoint = aws.String(cfg.AWSEndpoint)
+		}
+	})
+	ddbRepo, err := ddb.NewRepository(ddbClient, cfg.DDBTable)
+	if err != nil {
+		return fmt.Errorf("init ddb repository: %w", err)
+	}
+	auditStore, err := ctrl.NewDDBAuditStore(ddbClient, cfg.DDBTable)
+	if err != nil {
+		return fmt.Errorf("init ddb audit store: %w", err)
+	}
+
+	s3Client := s3.NewAWSClient(awsCfg, cfg.AWSEndpoint, s3.ForcePathStyleFromEnv() || cfg.AWSEndpoint != "")
+	s3Store, err := s3.NewStore(s3Client, cfg.S3Bucket)
+	if err != nil {
+		return fmt.Errorf("init s3 store: %w", err)
+	}
+
+	metrics, err := ctrl.NewMetrics(telProvider)
+	if err != nil {
+		return fmt.Errorf("init ctrl metrics: %w", err)
+	}
+
+	leaseMgr, err := ctrl.NewLeaseManager(ctrl.LeaseManagerConfig{
+		Leases:            ddbRepo,
+		Meta:              ddbRepo,
+		Region:            lease.Region(cfg.Region),
+		HolderID:          cfg.HolderID,
+		LeaseTTL:          cfg.LeaseTTL,
+		HeartbeatInterval: cfg.HeartbeatInterval,
+		FenceWait:         cfg.FenceWait,
+		Metrics:           metrics,
+	})
+	if err != nil {
+		return fmt.Errorf("init lease manager: %w", err)
+	}
+
+	scrubber, err := ctrl.NewScrubber(ctrl.ScrubConfig{
+		DDB:           ddbRepo,
+		S3:            s3Store,
+		Audit:         auditStore,
+		Region:        lease.Region(cfg.Region),
+		DefaultWindow: cfg.ScrubLookback,
+		Concurrency:   cfg.ScrubConcurrency,
+		Metrics:       metrics,
+	})
+	if err != nil {
+		return fmt.Errorf("init scrubber: %w", err)
+	}
+
+	handler, err := ctrl.NewHandler(ctrl.HandlerConfig{
+		ServiceName: serviceName,
+		Leases:      leaseMgr,
+		Scrubber:    scrubber,
+	})
+	if err != nil {
+		return fmt.Errorf("init http handler: %w", err)
+	}
+
+	ln, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", cfg.ListenAddr, err)
+	}
+
+	srv := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	leaseDone := make(chan error, 1)
+	go func() {
+		leaseDone <- leaseMgr.Run(runCtx)
+	}()
+
+	httpErrCh := make(chan error, 1)
+	go func() {
+		slog.Info("stravin-ctrl listening", "service", serviceName, "addr", ln.Addr().String(), "region", cfg.Region)
+		if serveErr := srv.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			httpErrCh <- serveErr
+			return
+		}
+		httpErrCh <- nil
+	}()
+
+	var serveErr error
+	select {
+	case serveErr = <-httpErrCh:
+		cancel()
+	case <-ctx.Done():
+		cancel()
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
+		defer shutCancel()
+		if shutErr := srv.Shutdown(shutCtx); shutErr != nil {
+			serveErr = fmt.Errorf("http shutdown: %w", shutErr)
+		} else {
+			serveErr = <-httpErrCh
+		}
+	}
+
+	leaseErr := <-leaseDone
+	if serveErr != nil {
+		return serveErr
+	}
+	return leaseErr
+}
+
 func main() {
-	if err := daemon.RunWithSignals("stravin-ctrl", ":8083"); err != nil {
+	if err := runWithSignals(); err != nil {
 		slog.Error("stravin-ctrl exited with error", "error", err)
 		os.Exit(1)
 	}
+}
+
+func runWithSignals() error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return run(ctx, loadConfig())
 }
