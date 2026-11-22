@@ -119,3 +119,23 @@ func TestMainReturnsNonZeroOnUnexpectedError(t *testing.T) {
 		t.Fatalf("expected non-zero exit code on unexpected error, got 0; stdout=%s", stdout.String())
 	}
 }
+
+func TestDefaultRegistryHas22ScenariosAndCLIFiltering(t *testing.T) {
+	deps := defaultDeps(&bytes.Buffer{})
+	reg := deps.newRegistry()
+
+	devs := reg.Scenarios(loadgen.PersonaDev)
+	agents := reg.Scenarios(loadgen.PersonaAgent)
+	if len(devs) != 11 || len(agents) != 11 {
+		t.Fatalf("default registry counts: dev=%d agent=%d, want 11 and 11", len(devs), len(agents))
+	}
+
+	filtered, err := reg.Filter([]string{"dev_clone_and_read", "agent_corrupt_ref_negative_test"})
+	if err != nil {
+		t.Fatalf("Filter: %v", err)
+	}
+	if len(filtered.Scenarios(loadgen.PersonaDev)) != 1 || len(filtered.Scenarios(loadgen.PersonaAgent)) != 1 {
+		t.Fatalf("filtered counts: dev=%d agent=%d, want 1 and 1",
+			len(filtered.Scenarios(loadgen.PersonaDev)), len(filtered.Scenarios(loadgen.PersonaAgent)))
+	}
+}

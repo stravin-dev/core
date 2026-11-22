@@ -111,7 +111,7 @@ func isCorruptionMessage(msg string) bool {
 }
 
 func isCleanReject(httpStatus int, msg string) bool {
-	if httpStatus == 403 || httpStatus == 422 {
+	if httpStatus == 400 || httpStatus == 403 || httpStatus == 422 {
 		return true
 	}
 	markers := []string{
@@ -120,6 +120,12 @@ func isCleanReject(httpStatus int, msg string) bool {
 		"hook declined",
 		"wasm",
 		"rejected by policy",
+		"invalid refspec",
+		"invalid ref",
+		"funny refname",
+		"not a valid ref",
+		"bad ref",
+		"refusing to",
 	}
 	for _, m := range markers {
 		if strings.Contains(msg, m) {
