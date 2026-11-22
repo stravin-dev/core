@@ -856,6 +856,36 @@ func TestReceivePack_TooManyRefsRejected(t *testing.T) {
 	}
 }
 
+func TestReceivePack_TooManyRefsWithoutFlushRejected(t *testing.T) {
+	env := newTestReceivePackEnv(t, "too-many-refs-no-flush")
+	newOID := strings.Repeat("f", 40)
+	var wire bytes.Buffer
+	for i := 0; i < ddb.MaxAtomicPushRefs+5; i++ {
+		line := fmt.Sprintf("%s %s refs/heads/b-%02d", ddb.ZeroOID, newOID, i)
+		if i == 0 {
+			line += "\x00report-status side-band-64k"
+		}
+		wire.Write(EncodePktLine([]byte(line + "\n")))
+	}
+	// Intentionally omit FlushPkt ("0000") to simulate an unterminated command flood.
+
+	resp, _, err := sendReceivePack(t, context.Background(), env.client, env.rk, "", wire.Bytes())
+	if err != nil {
+		t.Fatalf("unterminated too-many-refs push: %v", err)
+	}
+	band1, band2 := splitSideBandResponse(t, resp)
+	lines := decodePktLines(t, band1)
+	if len(lines) < 2 || !strings.Contains(lines[1], "ng refs/heads/b-00") {
+		t.Fatalf("expected >45 ref rejection, got %q", lines)
+	}
+	if !strings.Contains(string(band2), "push exceeds max atomic ref limit") {
+		t.Fatalf("expected side-band stderr limit message, got %q", string(band2))
+	}
+	if env.s3Store.PutCount() != 0 || env.ddbStore.CommitCount() != 0 {
+		t.Fatalf("expected zero S3/DDB calls, got s3=%d ddb=%d", env.s3Store.PutCount(), env.ddbStore.CommitCount())
+	}
+}
+
 func TestReceivePack_LeaseExpiredFailsClosed(t *testing.T) {
 	env := newTestReceivePackEnv(t, "lease-expired")
 	env.leaseBox.Set(ddb.RegionalWriteLease{

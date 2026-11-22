@@ -2,6 +2,8 @@ package node
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -158,6 +160,136 @@ func TestParseReceiveCommands_AndSideBand(t *testing.T) {
 	sbLines := decodePktLines(t, sb)
 	if len(sbLines) != 1 || sbLines[0] != "\x02hook failed\n" {
 		t.Fatalf("EncodeSideBand = %q, want [\\x02hook failed\\n]", sbLines)
+	}
+}
+
+type infinitePktLineReader struct {
+	linesGenerated int
+	cur            []byte
+}
+
+func (r *infinitePktLineReader) Read(p []byte) (int, error) {
+	if len(r.cur) == 0 {
+		line := fmt.Sprintf("%s %s refs/heads/b-%06d", ddb.ZeroOID, strings.Repeat("a", 40), r.linesGenerated)
+		if r.linesGenerated == 0 {
+			line += "\x00report-status side-band-64k"
+		}
+		line += "\n"
+		r.cur = EncodePktLine([]byte(line))
+		r.linesGenerated++
+	}
+	n := copy(p, r.cur)
+	r.cur = r.cur[n:]
+	return n, nil
+}
+
+func TestParseReceiveCommands_CommandCountCap(t *testing.T) {
+	newOID := strings.Repeat("a", 40)
+
+	t.Run("ExactCapSucceeds", func(t *testing.T) {
+		var wire bytes.Buffer
+		for i := 0; i < ddb.MaxAtomicPushRefs; i++ {
+			line := fmt.Sprintf("%s %s refs/heads/b-%02d", ddb.ZeroOID, newOID, i)
+			if i == 0 {
+				line += "\x00report-status"
+			}
+			wire.Write(EncodePktLine([]byte(line + "\n")))
+		}
+		wire.Write(FlushPkt)
+
+		cmds, caps, err := ParseReceiveCommands(&wire)
+		if err != nil {
+			t.Fatalf("ParseReceiveCommands at exact cap (%d): %v", ddb.MaxAtomicPushRefs, err)
+		}
+		if len(cmds) != ddb.MaxAtomicPushRefs {
+			t.Fatalf("got %d commands, want %d", len(cmds), ddb.MaxAtomicPushRefs)
+		}
+		if !caps["report-status"] {
+			t.Fatalf("expected report-status capability, got %+v", caps)
+		}
+	})
+
+	t.Run("ExceedsCapByOneFails", func(t *testing.T) {
+		var wire bytes.Buffer
+		for i := 0; i <= ddb.MaxAtomicPushRefs; i++ {
+			line := fmt.Sprintf("%s %s refs/heads/b-%02d", ddb.ZeroOID, newOID, i)
+			if i == 0 {
+				line += "\x00report-status side-band-64k"
+			}
+			wire.Write(EncodePktLine([]byte(line + "\n")))
+		}
+		wire.Write(FlushPkt)
+
+		cmds, caps, err := ParseReceiveCommands(&wire)
+		if !errors.Is(err, ErrTooManyReceiveCommands) {
+			t.Fatalf("err = %v, want ErrTooManyReceiveCommands", err)
+		}
+		if len(cmds) != ddb.MaxAtomicPushRefs {
+			t.Fatalf("got %d partial commands, want %d", len(cmds), ddb.MaxAtomicPushRefs)
+		}
+		if !caps["report-status"] || !caps["side-band-64k"] {
+			t.Fatalf("expected parsed capabilities on cap error, got %+v", caps)
+		}
+	})
+
+	t.Run("InfiniteStreamRejectedImmediately", func(t *testing.T) {
+		r := &infinitePktLineReader{}
+		cmds, caps, err := ParseReceiveCommands(r)
+		if !errors.Is(err, ErrTooManyReceiveCommands) {
+			t.Fatalf("err = %v, want ErrTooManyReceiveCommands", err)
+		}
+		if r.linesGenerated != ddb.MaxAtomicPushRefs+1 {
+			t.Fatalf("reader generated %d lines, want immediate stop at %d", r.linesGenerated, ddb.MaxAtomicPushRefs+1)
+		}
+		if len(cmds) != ddb.MaxAtomicPushRefs {
+			t.Fatalf("got %d commands, want %d", len(cmds), ddb.MaxAtomicPushRefs)
+		}
+		if !caps["side-band-64k"] {
+			t.Fatalf("expected capabilities from first line, got %+v", caps)
+		}
+	})
+}
+
+func TestParseReceiveCommands_RefNameLengthCap(t *testing.T) {
+	newOID := strings.Repeat("b", 40)
+	prefix := "refs/heads/"
+
+	t.Run("ExactMaxRefNameLenSucceeds", func(t *testing.T) {
+		refName := prefix + strings.Repeat("a", MaxRefNameLen-len(prefix))
+		var wire bytes.Buffer
+		wire.Write(EncodePktLine([]byte(ddb.ZeroOID + " " + newOID + " " + refName + "\n")))
+		wire.Write(FlushPkt)
+
+		cmds, _, err := ParseReceiveCommands(&wire)
+		if err != nil {
+			t.Fatalf("ParseReceiveCommands with %d-byte ref: %v", len(refName), err)
+		}
+		if len(cmds) != 1 || cmds[0].RefName != refName {
+			t.Fatalf("unexpected cmds: %+v", cmds)
+		}
+	})
+
+	t.Run("ExceedsMaxRefNameLenFails", func(t *testing.T) {
+		refName := prefix + strings.Repeat("a", MaxRefNameLen-len(prefix)+1)
+		var wire bytes.Buffer
+		wire.Write(EncodePktLine([]byte(ddb.ZeroOID + " " + newOID + " " + refName + "\n")))
+		wire.Write(FlushPkt)
+
+		_, _, err := ParseReceiveCommands(&wire)
+		if !errors.Is(err, ErrRefNameTooLong) {
+			t.Fatalf("err = %v, want ErrRefNameTooLong", err)
+		}
+	})
+}
+
+func TestParseReceiveCommands_CommandLineLengthCap(t *testing.T) {
+	// Send only the 4-byte length header exceeding MaxReceiveCommandLineLen
+	// with no payload bytes behind it to verify rejection happens before reading payload.
+	oversizedLen := MaxReceiveCommandLineLen + 1
+	header := fmt.Sprintf("%04x", oversizedLen)
+	_, _, err := ParseReceiveCommands(strings.NewReader(header))
+	if !errors.Is(err, ErrReceiveCommandLineTooLong) {
+		t.Fatalf("err = %v, want ErrReceiveCommandLineTooLong", err)
 	}
 }
 

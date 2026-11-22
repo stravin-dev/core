@@ -30,10 +30,28 @@ const (
 
 	maxSideBandChunk = 65515
 	maxPktLineLen    = 65520
+
+	// MaxReceiveCommands caps the number of ref-update commands accepted while
+	// streaming git-receive-pack pkt-lines, matching DynamoDB's atomic push limit.
+	MaxReceiveCommands = ddb.MaxAtomicPushRefs
+	// MaxRefNameLen caps the maximum length in bytes of a ref name in a receive command.
+	MaxRefNameLen = 1024
+	// MaxReceiveCommandLineLen caps the maximum byte length (including the 4-byte
+	// hex length prefix) of a single git-receive-pack command pkt-line.
+	MaxReceiveCommandLineLen = 4096
 )
 
-// FlushPkt is the standard Git pkt-line flush packet ("0000").
-var FlushPkt = []byte("0000")
+var (
+	// FlushPkt is the standard Git pkt-line flush packet ("0000").
+	FlushPkt = []byte("0000")
+
+	// ErrTooManyReceiveCommands is returned when a receive-pack stream exceeds MaxReceiveCommands.
+	ErrTooManyReceiveCommands = errors.New("node: too many receive-pack commands")
+	// ErrRefNameTooLong is returned when a ref name exceeds MaxRefNameLen bytes.
+	ErrRefNameTooLong = errors.New("node: ref name exceeds max length")
+	// ErrReceiveCommandLineTooLong is returned when a receive command pkt-line exceeds MaxReceiveCommandLineLen bytes.
+	ErrReceiveCommandLineTooLong = errors.New("node: receive-pack command line exceeds max length")
+)
 
 // EncodePktLine encodes payload as a single Git pkt-line with a 4-hex-digit
 // big-endian length prefix including the 4 length bytes.
@@ -215,8 +233,14 @@ func ParseReceiveCommands(r io.Reader) ([]ddb.RefUpdate, map[string]bool, error)
 		if pktLen == 0 {
 			return cmds, caps, nil
 		}
+		if len(cmds) >= MaxReceiveCommands {
+			return cmds, caps, fmt.Errorf("%w: exceeds max %d", ErrTooManyReceiveCommands, MaxReceiveCommands)
+		}
 		if pktLen < 4 || pktLen > maxPktLineLen {
 			return nil, nil, fmt.Errorf("pkt-line length %d out of range", pktLen)
+		}
+		if pktLen > MaxReceiveCommandLineLen {
+			return nil, nil, fmt.Errorf("%w: length %d exceeds max %d", ErrReceiveCommandLineTooLong, pktLen, MaxReceiveCommandLineLen)
 		}
 
 		payload := make([]byte, pktLen-4)
@@ -244,6 +268,9 @@ func ParseReceiveCommands(r io.Reader) ([]ddb.RefUpdate, map[string]bool, error)
 		}
 		if err := ddb.ValidateOID(newOID); err != nil {
 			return nil, nil, fmt.Errorf("invalid new_oid %q: %w", newOID, err)
+		}
+		if len(refName) > MaxRefNameLen {
+			return nil, nil, fmt.Errorf("%w: length %d exceeds max %d", ErrRefNameTooLong, len(refName), MaxRefNameLen)
 		}
 		if !isSafeRefName(refName) {
 			return nil, nil, fmt.Errorf("unsafe ref name %q", refName)

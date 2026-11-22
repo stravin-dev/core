@@ -150,6 +150,12 @@ func (h *ReceivePackHandler) HandleReceivePack(ctx context.Context, meta rpc.Req
 		if errors.Is(err, io.EOF) {
 			return stream.Send(&rpc.Frame{EOF: true, ExitCode: 0})
 		}
+		if errors.Is(err, ErrTooManyReceiveCommands) {
+			useSideBand := caps["side-band-64k"]
+			reportStatus := caps["report-status"] || useSideBand
+			reason := fmt.Sprintf("push exceeds max atomic ref limit (%d)", ddb.MaxAtomicPushRefs)
+			return h.sendAllRejected(stream, reportStatus, useSideBand, "unpack ok", cmds, reason, []string{"remote: " + reason + "\n"})
+		}
 		return status.Errorf(codes.InvalidArgument, "node: parse receive-pack commands: %v", err)
 	}
 	if len(cmds) == 0 {
