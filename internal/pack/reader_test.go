@@ -2,9 +2,11 @@ package pack
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 )
 
 func buildTreePayload(entries []TreeEntry) []byte {
@@ -188,4 +190,255 @@ func TestPackReaderCommitsTreesAndBlobs(t *testing.T) {
 			t.Fatalf("ReadBlobChunk on commit: got %v, want ErrInvalidObjectType", err)
 		}
 	})
+}
+
+func TestPackReaderDiffTreeMaxDepthExceeded(t *testing.T) {
+	objs := make(map[OID]*Object)
+	leafData := []byte("deep-leaf")
+	leafOID := ComputeOID(ObjBlob, leafData)
+	objs[leafOID] = &Object{OID: leafOID, Type: ObjBlob, Data: leafData}
+
+	leafTreeData := buildTreePayload([]TreeEntry{
+		{Mode: 0o100644, Name: "leaf.txt", OID: leafOID},
+	})
+	currOID := ComputeOID(ObjTree, leafTreeData)
+	objs[currOID] = &Object{OID: currOID, Type: ObjTree, Data: leafTreeData}
+
+	var shallowOID OID
+	for i := 1; i <= MaxTreeDepth+2; i++ {
+		data := buildTreePayload([]TreeEntry{
+			{Mode: treeDirMode, Name: fmt.Sprintf("d%d", i), OID: currOID},
+		})
+		oid := ComputeOID(ObjTree, data)
+		objs[oid] = &Object{OID: oid, Type: ObjTree, Data: data}
+		currOID = oid
+		if i == 10 {
+			shallowOID = oid
+		}
+	}
+
+	reader := NewPackReader(&ParsedPack{Objects: objs}, nil)
+
+	t.Run("within max depth succeeds", func(t *testing.T) {
+		changes, err := reader.DiffTree(OID{}, shallowOID, 10)
+		if err != nil {
+			t.Fatalf("DiffTree shallow: %v", err)
+		}
+		if len(changes) != 1 {
+			t.Fatalf("got %d changes, want 1", len(changes))
+		}
+	})
+
+	t.Run("exceeding max depth returns ErrMaxTreeDepthExceeded", func(t *testing.T) {
+		_, err := reader.DiffTree(OID{}, currOID, 100)
+		if !errors.Is(err, ErrMaxTreeDepthExceeded) {
+			t.Fatalf("DiffTree deep: got %v, want ErrMaxTreeDepthExceeded", err)
+		}
+	})
+}
+
+func TestPackReaderDiffTreeSharedSubtreeDAGBlowup(t *testing.T) {
+	buildBinaryDAG := func(leafData []byte) (*PackReader, OID) {
+		objs := make(map[OID]*Object)
+		var baseTreeData []byte
+		if leafData != nil {
+			leafOID := ComputeOID(ObjBlob, leafData)
+			objs[leafOID] = &Object{OID: leafOID, Type: ObjBlob, Data: leafData}
+			baseTreeData = buildTreePayload([]TreeEntry{
+				{Mode: 0o100644, Name: "leaf.txt", OID: leafOID},
+			})
+		}
+		currOID := ComputeOID(ObjTree, baseTreeData)
+		objs[currOID] = &Object{OID: currOID, Type: ObjTree, Data: baseTreeData}
+
+		for range 32 {
+			data := buildTreePayload([]TreeEntry{
+				{Mode: treeDirMode, Name: "a", OID: currOID},
+				{Mode: treeDirMode, Name: "b", OID: currOID},
+			})
+			oid := ComputeOID(ObjTree, data)
+			objs[oid] = &Object{OID: oid, Type: ObjTree, Data: data}
+			currOID = oid
+		}
+		return NewPackReader(&ParsedPack{Objects: objs}, nil), currOID
+	}
+
+	t.Run("depth-32 binary DAG with leaf terminates fast", func(t *testing.T) {
+		reader, rootOID := buildBinaryDAG([]byte("payload"))
+		start := time.Now()
+		changes, err := reader.DiffTree(OID{}, rootOID, MaxDiffTreeLimit)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("DiffTree DAG with leaf: %v", err)
+		}
+		if elapsed > time.Second {
+			t.Fatalf("DiffTree DAG took too long: %v", elapsed)
+		}
+		if len(changes) == 0 {
+			t.Fatal("expected at least one change from non-empty DAG")
+		}
+	})
+
+	t.Run("depth-32 binary DAG with empty leaves terminates fast", func(t *testing.T) {
+		reader, rootOID := buildBinaryDAG(nil)
+		start := time.Now()
+		changes, err := reader.DiffTree(OID{}, rootOID, MaxDiffTreeLimit)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("DiffTree empty DAG: %v", err)
+		}
+		if elapsed > time.Second {
+			t.Fatalf("DiffTree empty DAG took too long: %v", elapsed)
+		}
+		if len(changes) != 0 {
+			t.Fatalf("got %d changes, want 0", len(changes))
+		}
+	})
+}
+
+func TestPackReaderDiffTreeLimitClamping(t *testing.T) {
+	const totalFiles = MaxDiffTreeLimit + 25
+	objs := make(map[OID]*Object, totalFiles+1)
+	blobData := []byte("x")
+	blobOID := ComputeOID(ObjBlob, blobData)
+	objs[blobOID] = &Object{OID: blobOID, Type: ObjBlob, Data: blobData}
+
+	entries := make([]TreeEntry, totalFiles)
+	for i := range totalFiles {
+		entries[i] = TreeEntry{
+			Mode: 0o100644,
+			Name: fmt.Sprintf("f%05d.txt", i),
+			OID:  blobOID,
+		}
+	}
+	treeData := buildTreePayload(entries)
+	treeOID := ComputeOID(ObjTree, treeData)
+	objs[treeOID] = &Object{OID: treeOID, Type: ObjTree, Data: treeData}
+
+	reader := NewPackReader(&ParsedPack{Objects: objs}, nil)
+
+	t.Run("zero limit uses DefaultDiffTreeLimit", func(t *testing.T) {
+		changes, err := reader.DiffTree(OID{}, treeOID, 0)
+		if err != nil {
+			t.Fatalf("DiffTree default limit: %v", err)
+		}
+		if len(changes) != DefaultDiffTreeLimit {
+			t.Fatalf("got %d changes, want %d", len(changes), DefaultDiffTreeLimit)
+		}
+	})
+
+	t.Run("excessive limit is clamped to MaxDiffTreeLimit", func(t *testing.T) {
+		changes, err := reader.DiffTree(OID{}, treeOID, MaxDiffTreeLimit+5000)
+		if err != nil {
+			t.Fatalf("DiffTree max limit: %v", err)
+		}
+		if len(changes) != MaxDiffTreeLimit {
+			t.Fatalf("got %d changes, want %d", len(changes), MaxDiffTreeLimit)
+		}
+	})
+}
+
+func TestPackReaderDiffTreeContextCancellation(t *testing.T) {
+	objs := make(map[OID]*Object)
+	blobData := []byte("hello")
+	blobOID := ComputeOID(ObjBlob, blobData)
+	objs[blobOID] = &Object{OID: blobOID, Type: ObjBlob, Data: blobData}
+
+	subEntries := make([]TreeEntry, 20)
+	for i := range 20 {
+		subData := buildTreePayload([]TreeEntry{{Mode: 0o100644, Name: fmt.Sprintf("b%d.txt", i), OID: blobOID}})
+		subOID := ComputeOID(ObjTree, subData)
+		objs[subOID] = &Object{OID: subOID, Type: ObjTree, Data: subData}
+		subEntries[i] = TreeEntry{Mode: treeDirMode, Name: fmt.Sprintf("d%d", i), OID: subOID}
+	}
+	rootData := buildTreePayload(subEntries)
+	rootOID := ComputeOID(ObjTree, rootData)
+	objs[rootOID] = &Object{OID: rootOID, Type: ObjTree, Data: rootData}
+
+	t.Run("pre-cancelled context aborts immediately", func(t *testing.T) {
+		reads := 0
+		reader := NewPackReader(nil, FuncBaseResolver(func(oid OID) (ObjectType, []byte, error) {
+			reads++
+			obj, ok := objs[oid]
+			if !ok {
+				return 0, nil, ErrObjectNotFound
+			}
+			return obj.Type, obj.Data, nil
+		}))
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := reader.DiffTreeContext(ctx, OID{}, rootOID, 100)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want context.Canceled", err)
+		}
+		if reads != 0 {
+			t.Fatalf("expected 0 reads on pre-cancelled context, got %d", reads)
+		}
+	})
+
+	t.Run("mid-traversal cancellation aborts promptly", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		reads := 0
+		reader := NewPackReader(nil, FuncBaseResolver(func(oid OID) (ObjectType, []byte, error) {
+			reads++
+			if reads == 3 {
+				cancel()
+			}
+			obj, ok := objs[oid]
+			if !ok {
+				return 0, nil, ErrObjectNotFound
+			}
+			return obj.Type, obj.Data, nil
+		}))
+
+		_, err := reader.DiffTreeContext(ctx, OID{}, rootOID, 100)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want context.Canceled", err)
+		}
+		if reads > 5 {
+			t.Fatalf("expected traversal to abort near read 3, got %d reads", reads)
+		}
+	})
+}
+
+func TestPackReaderDiffTreeVisitedNodeBudget(t *testing.T) {
+	const numDirs = MaxTreeNodesVisited + 5
+	objs := make(map[OID]*Object, numDirs+2)
+
+	emptyOID := ComputeOID(ObjTree, nil)
+	objs[emptyOID] = &Object{OID: emptyOID, Type: ObjTree, Data: nil}
+
+	oldEntries := make([]TreeEntry, numDirs)
+	newEntries := make([]TreeEntry, numDirs)
+	for i := range numDirs {
+		// Each oldSub_i has a unique entry name pointing to emptyOID, producing
+		// a distinct OID per subtree while emitting zero file changes.
+		subData := buildTreePayload([]TreeEntry{
+			{Mode: treeDirMode, Name: fmt.Sprintf("e%d", i), OID: emptyOID},
+		})
+		subOID := ComputeOID(ObjTree, subData)
+		objs[subOID] = &Object{OID: subOID, Type: ObjTree, Data: subData}
+
+		name := fmt.Sprintf("d%06d", i)
+		oldEntries[i] = TreeEntry{Mode: treeDirMode, Name: name, OID: subOID}
+		newEntries[i] = TreeEntry{Mode: treeDirMode, Name: name, OID: emptyOID}
+	}
+
+	oldRootData := buildTreePayload(oldEntries)
+	oldRootOID := ComputeOID(ObjTree, oldRootData)
+	objs[oldRootOID] = &Object{OID: oldRootOID, Type: ObjTree, Data: oldRootData}
+
+	newRootData := buildTreePayload(newEntries)
+	newRootOID := ComputeOID(ObjTree, newRootData)
+	objs[newRootOID] = &Object{OID: newRootOID, Type: ObjTree, Data: newRootData}
+
+	reader := NewPackReader(&ParsedPack{Objects: objs}, nil)
+	_, err := reader.DiffTree(oldRootOID, newRootOID, MaxDiffTreeLimit)
+	if !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("DiffTree over visited-node budget: got %v, want ErrLimitExceeded", err)
+	}
 }

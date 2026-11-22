@@ -90,16 +90,17 @@ func ComputeOID(typ ObjectType, data []byte) OID {
 
 // Sentinel errors returned by packfile parsing, thin-pack completion, indexing, and object reads.
 var (
-	ErrInvalidHeader      = errors.New("pack: invalid header")
-	ErrUnsupportedVersion = errors.New("pack: unsupported version")
-	ErrChecksumMismatch   = errors.New("pack: checksum mismatch")
-	ErrCorruptEntry       = errors.New("pack: corrupt entry")
-	ErrDeltaBomb          = errors.New("pack: delta depth or expansion limit exceeded")
-	ErrMissingBase        = errors.New("pack: missing delta base object")
-	ErrObjectNotFound     = errors.New("pack: object not found")
-	ErrInvalidObjectType  = errors.New("pack: invalid object type")
-	ErrLimitExceeded      = errors.New("pack: resource limit exceeded")
-	ErrInvalidIdx         = errors.New("pack: invalid idx file")
+	ErrInvalidHeader        = errors.New("pack: invalid header")
+	ErrUnsupportedVersion   = errors.New("pack: unsupported version")
+	ErrChecksumMismatch     = errors.New("pack: checksum mismatch")
+	ErrCorruptEntry         = errors.New("pack: corrupt entry")
+	ErrDeltaBomb            = errors.New("pack: delta depth or expansion limit exceeded")
+	ErrMissingBase          = errors.New("pack: missing delta base object")
+	ErrObjectNotFound       = errors.New("pack: object not found")
+	ErrInvalidObjectType    = errors.New("pack: invalid object type")
+	ErrLimitExceeded        = errors.New("pack: resource limit exceeded")
+	ErrMaxTreeDepthExceeded = errors.New("pack: maximum tree recursion depth exceeded")
+	ErrInvalidIdx           = errors.New("pack: invalid idx file")
 )
 
 // Limits bounds packfile parsing and delta expansion to resist delta bombs and memory exhaustion.
