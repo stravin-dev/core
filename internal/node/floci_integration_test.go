@@ -256,9 +256,11 @@ func TestFlociIntegration_NodeReceivePackPushAndFetchRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRepoKey: %v", err)
 	}
+	// Use a unique per-test lease region so parallel integration packages never collide on REGION#us-east-1#LEASE.
+	leaseRegion := lease.Region(fmt.Sprintf("%s-node-%d", region, time.Now().UnixNano()))
 
 	if err := ddbRepo.PutRegionalWriteLease(ctx, ddb.RegionalWriteLease{
-		Region:    lease.Region(region),
+		Region:    leaseRegion,
 		Epoch:     1,
 		Mode:      lease.ModeActive,
 		HolderID:  "floci-it-ctrl",
@@ -269,7 +271,7 @@ func TestFlociIntegration_NodeReceivePackPushAndFetchRoundTrip(t *testing.T) {
 
 	if err := ddbRepo.CreateMeta(ctx, ddb.RepoMeta{
 		Repo:           rk,
-		HomeRegion:     lease.Region(region),
+		HomeRegion:     leaseRegion,
 		FailoverEpoch:  1,
 		RefShards:      2,
 		ManifestShards: 2,
@@ -281,7 +283,7 @@ func TestFlociIntegration_NodeReceivePackPushAndFetchRoundTrip(t *testing.T) {
 
 	refresher, err := NewLeaseRefresher(LeaseRefresherConfig{
 		Store:  ddbRepo,
-		Region: lease.Region(region),
+		Region: leaseRegion,
 	})
 	if err != nil {
 		t.Fatalf("NewLeaseRefresher: %v", err)
@@ -317,7 +319,7 @@ func TestFlociIntegration_NodeReceivePackPushAndFetchRoundTrip(t *testing.T) {
 		Committer:      ddbRepo,
 		LeaseRefresher: refresher,
 		HookEngine:     hookEngine,
-		Region:         lease.Region(region),
+		Region:         leaseRegion,
 	})
 	if err != nil {
 		t.Fatalf("NewReceivePackHandler: %v", err)
@@ -328,7 +330,7 @@ func TestFlociIntegration_NodeReceivePackPushAndFetchRoundTrip(t *testing.T) {
 		GitExecutor:    gitexec.NewSubprocessExecutor(gitexec.Config{}),
 		WriteHandler:   wh,
 		LeaseRefresher: refresher,
-		Region:         region,
+		Region:         string(leaseRegion),
 	})
 	if err != nil {
 		t.Fatalf("NewServer write: %v", err)
