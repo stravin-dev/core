@@ -1,0 +1,283 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Client-side load generator and chaos visibility: active threads by persona, ops/sec, p50/p95/p99 latency with Tempo exemplars, expected retries vs unexpected errors, git fsck failures, and correlated Loki logs.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "icon": "external link",
+      "targetBlank": true,
+      "title": "Explore Loadgen Traces (Tempo)",
+      "type": "link",
+      "url": "/explore?left=%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7Bresource.service.name%3D~%5C%22stravin-loadgen%7Cstravin-chaos%5C%22%7D%22%7D%5D%7D"
+    },
+    {
+      "icon": "external link",
+      "targetBlank": true,
+      "title": "Explore Loadgen & Chaos Logs (Loki)",
+      "type": "link",
+      "url": "/explore?left=%7B%22datasource%22%3A%22loki%22%2C%22queries%22%3A%5B%7B%22expr%22%3A%22%7Bservice_name%3D~%5C%22stravin-loadgen%7Cstravin-chaos%5C%22%7D%22%7D%5D%7D"
+    },
+    {
+      "icon": "dashboard",
+      "targetBlank": false,
+      "title": "Stravin Core",
+      "type": "link",
+      "url": "/d/stravin-core"
+    }
+  ],
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Concurrent active developer and AI agent worker threads by persona.",
+      "fieldConfig": {
+        "defaults": {
+          "links": [
+            {
+              "targetBlank": true,
+              "title": "Explore Tempo Traces (stravin-loadgen)",
+              "url": "/explore?left=%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7Bresource.service.name%3D%5C%22stravin-loadgen%5C%22%7D%22%7D%5D%7D"
+            },
+            {
+              "targetBlank": true,
+              "title": "Explore Loki Logs (stravin-loadgen)",
+              "url": "/explore?left=%7B%22datasource%22%3A%22loki%22%2C%22queries%22%3A%5B%7B%22expr%22%3A%22%7Bservice_name%3D%5C%22stravin-loadgen%5C%22%7D%22%7D%5D%7D"
+            }
+          ],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (persona) (stravin_loadgen_active_threads)",
+          "legendFormat": "{{persona}} threads",
+          "refId": "A"
+        }
+      ],
+      "title": "Active Threads by Persona",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Client-observed Git operations per second broken down by persona, scenario, and outcome.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (persona, scenario, outcome) (rate(stravin_loadgen_ops_total[1m]))",
+          "legendFormat": "{{persona}} / {{scenario}} ({{outcome}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Client Ops/sec by Persona, Scenario & Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Client-side Git operation p50/p95/p99 latency with clickable Tempo trace exemplars.",
+      "fieldConfig": {
+        "defaults": {
+          "links": [
+            {
+              "targetBlank": true,
+              "title": "Explore Slow Loadgen Traces in Tempo",
+              "url": "/explore?left=%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7Bresource.service.name%3D%5C%22stravin-loadgen%5C%22%20%26%26%20duration%3E500ms%7D%22%7D%5D%7D"
+            }
+          ],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "id": 3,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "exemplar": true,
+          "expr": "histogram_quantile(0.50, sum by (le, persona, scenario) (rate(stravin_loadgen_op_duration_seconds_bucket[1m])))",
+          "legendFormat": "p50 {{persona}} {{scenario}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, persona, scenario) (rate(stravin_loadgen_op_duration_seconds_bucket[1m])))",
+          "legendFormat": "p95 {{persona}} {{scenario}}",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "exemplar": true,
+          "expr": "histogram_quantile(0.99, sum by (le, persona, scenario) (rate(stravin_loadgen_op_duration_seconds_bucket[1m])))",
+          "legendFormat": "p99 {{persona}} {{scenario}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Client Latency p50 / p95 / p99 (with Tempo Exemplars)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Expected transient retries (e.g., CAS conflicts, chaos restarts) grouped by reason.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "id": 4,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (reason) (rate(stravin_loadgen_retries_total[1m]))",
+          "legendFormat": "retry ({{reason}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Expected Retries by Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Unexpected client failures and git fsck integrity failures (must remain zero).",
+      "fieldConfig": {
+        "defaults": {
+          "links": [
+            {
+              "targetBlank": true,
+              "title": "Explore Error Logs in Loki",
+              "url": "/explore?left=%7B%22datasource%22%3A%22loki%22%2C%22queries%22%3A%5B%7B%22expr%22%3A%22%7Bservice_name%3D~%5C%22stravin-loadgen%7Cstravin-chaos%5C%22%7D%20%7C%3D%20%5C%22error%5C%22%22%7D%5D%7D"
+            }
+          ],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "id": 5,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (persona, scenario) (rate(stravin_loadgen_unexpected_errors_total[1m]))",
+          "legendFormat": "unexpected err {{persona}} {{scenario}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(stravin_loadgen_fsck_failures_total[1m]))",
+          "legendFormat": "git fsck failures/s",
+          "refId": "B"
+        }
+      ],
+      "title": "Unexpected Errors & git fsck Failures",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "description": "Correlated loadgen errors and chaos fault injection logs with clickable Tempo trace links.",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 24 },
+      "id": 6,
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": true,
+        "showCommonLabels": false,
+        "showLabels": true,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "{service_name=~\"stravin-loadgen|stravin-chaos\"}",
+          "refId": "A"
+        }
+      ],
+      "title": "Loadgen & Chaos Logs (Loki -> Tempo Trace Links)",
+      "type": "logs"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["stravin", "loadgen", "chaos", "otel"],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Stravin Load Tester",
+  "uid": "stravin-loadgen",
+  "version": 1
+}
