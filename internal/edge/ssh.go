@@ -240,7 +240,6 @@ func (s *SSHServer) Serve(ln net.Listener) error {
 			return nil
 		}
 
-		s.wg.Add(1)
 		go func(c net.Conn) {
 			defer s.wg.Done()
 			defer func() {
@@ -307,6 +306,7 @@ func (s *SSHServer) trackConn(c net.Conn) bool {
 		return false
 	}
 	s.conns[c] = struct{}{}
+	s.wg.Add(1)
 	return true
 }
 
