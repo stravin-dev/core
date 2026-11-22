@@ -30,20 +30,20 @@ func TestModuleCacheLRUEviction(t *testing.T) {
 	k3, cm3 := compile("m3")
 
 	h1 := cache.Put(ctx, k1, cm1)
-	h1.release(ctx)
+	cache.Release(ctx, h1)
 	h2 := cache.Put(ctx, k2, cm2)
-	h2.release(ctx)
+	cache.Release(ctx, h2)
 
 	// Touch k1 so k2 becomes LRU.
 	if hit, ok := cache.Get(k1); !ok {
 		t.Fatal("expected k1 hit")
 	} else {
-		hit.release(ctx)
+		cache.Release(ctx, hit)
 	}
 
 	// Inserting k3 should evict k2.
 	h3 := cache.Put(ctx, k3, cm3)
-	h3.release(ctx)
+	cache.Release(ctx, h3)
 
 	if cache.Len() != 2 {
 		t.Fatalf("cache.Len() = %d, want 2", cache.Len())
@@ -54,12 +54,12 @@ func TestModuleCacheLRUEviction(t *testing.T) {
 	if hit, ok := cache.Get(k1); !ok {
 		t.Fatal("expected k1 to remain cached")
 	} else {
-		hit.release(ctx)
+		cache.Release(ctx, hit)
 	}
 	if hit, ok := cache.Get(k3); !ok {
 		t.Fatal("expected k3 to remain cached")
 	} else {
-		hit.release(ctx)
+		cache.Release(ctx, hit)
 	}
 }
 

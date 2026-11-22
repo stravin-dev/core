@@ -460,18 +460,22 @@ func TestEngineStructuredPerRefVerdict(t *testing.T) {
 
 func TestEngineBulkheadAndCacheUnderRace(t *testing.T) {
 	loader := newMemWasmLoader()
-	allowSHA := loader.Put(wasmVerdictFixture(0, "ok"))
+	sha1 := loader.Put(wasmVerdictFixture(0, "ok-1"))
+	sha2 := loader.Put(wasmVerdictFixture(0, "ok-2"))
+	sha3 := loader.Put(wasmVerdictFixture(0, "ok-3"))
 
 	store := &staticConfigStore{hooks: []HookConfig{
-		{HookID: "concurrent-hook", WasmSHA256: allowSHA, RefGlob: "*", TimeoutMS: 100, MemoryLimitMB: 16, FailMode: FailModeClosed},
+		{HookID: "concurrent-hook-1", WasmSHA256: sha1, RefGlob: "*", TimeoutMS: 100, MemoryLimitMB: 16, FailMode: FailModeClosed},
+		{HookID: "concurrent-hook-2", WasmSHA256: sha2, RefGlob: "*", TimeoutMS: 100, MemoryLimitMB: 16, FailMode: FailModeClosed},
+		{HookID: "concurrent-hook-3", WasmSHA256: sha3, RefGlob: "*", TimeoutMS: 100, MemoryLimitMB: 16, FailMode: FailModeClosed},
 	}}
 	eng := NewEngine(loader, store, EngineConfig{
-		MaxConcurrency:  2,
+		MaxConcurrency:  4,
 		ModuleCacheSize: 2,
 	})
 	defer func() { _ = eng.Close(context.Background()) }()
 
-	const callers = 12
+	const callers = 24
 	var wg sync.WaitGroup
 	var succeeded atomic.Int32
 

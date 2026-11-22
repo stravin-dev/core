@@ -126,7 +126,7 @@ func (e *Engine) runHook(ctx context.Context, hook HookConfig, pushCtx PushConte
 		out.Duration = time.Since(start)
 		return out
 	}
-	defer cached.release(context.Background())
+	defer e.cache.Release(context.Background(), cached)
 
 	verdict, err := e.executeModule(ctx, rt, cached.compiled, pushCtx, reader, timeout)
 	if err != nil {
@@ -216,27 +216,25 @@ func (e *Engine) getOrCompile(ctx context.Context, rt wazero.Runtime, shaHex str
 		return nil, false, fmt.Errorf("%w: empty wasm_sha256", ErrInvalidConfig)
 	}
 	key := moduleCacheKey{sha256: normSHA, memoryLimitPages: memPages}
-	if mod, ok := e.cache.Get(key); ok {
-		return mod, true, nil
-	}
+	return e.cache.GetOrCompile(ctx, key, func() (wazero.CompiledModule, error) {
+		if e.loader == nil {
+			return nil, ErrMissingArtifact
+		}
+		raw, err := e.loader.LoadWasm(ctx, normSHA)
+		if err != nil {
+			return nil, fmt.Errorf("load wasm %s: %w", normSHA, err)
+		}
+		actual := sha256.Sum256(raw)
+		if hex.EncodeToString(actual[:]) != normSHA {
+			return nil, fmt.Errorf("%w: expected %s", ErrChecksumMismatch, normSHA)
+		}
 
-	if e.loader == nil {
-		return nil, false, ErrMissingArtifact
-	}
-	raw, err := e.loader.LoadWasm(ctx, normSHA)
-	if err != nil {
-		return nil, false, fmt.Errorf("load wasm %s: %w", normSHA, err)
-	}
-	actual := sha256.Sum256(raw)
-	if hex.EncodeToString(actual[:]) != normSHA {
-		return nil, false, fmt.Errorf("%w: expected %s", ErrChecksumMismatch, normSHA)
-	}
-
-	compiled, err := rt.CompileModule(ctx, raw)
-	if err != nil {
-		return nil, false, classifyExecError(ctx, err)
-	}
-	return e.cache.Put(ctx, key, compiled), false, nil
+		compiled, err := rt.CompileModule(ctx, raw)
+		if err != nil {
+			return nil, classifyExecError(ctx, err)
+		}
+		return compiled, nil
+	})
 }
 
 func (e *Engine) effectiveTimeout(timeoutMS int) time.Duration {
