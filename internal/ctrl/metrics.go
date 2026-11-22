@@ -24,6 +24,7 @@ type Metrics struct {
 
 	leaseRenewals    metric.Int64Counter
 	epochTransitions metric.Int64Counter
+	promotionGuard   metric.Int64Counter
 	scrubRuns        metric.Int64Counter
 	scrubHeadChecks  metric.Int64Counter
 	scrubRewoundRefs metric.Int64Counter
@@ -49,6 +50,14 @@ func NewMetrics(provider *telemetry.Provider) (*Metrics, error) {
 	epochTransitions, err := meter.Int64Counter(
 		"stravin_ctrl_epoch_transitions_total",
 		metric.WithDescription("Total monotonic failover_epoch or write_state fencing transitions"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	promotionGuard, err := meter.Int64Counter(
+		"stravin_ctrl_promotion_guard_total",
+		metric.WithDescription("Total failover promotion guard evaluations by outcome"),
 	)
 	if err != nil {
 		return nil, err
@@ -91,6 +100,7 @@ func NewMetrics(provider *telemetry.Provider) (*Metrics, error) {
 		tracer:           provider.Tracer(instrumentationScope),
 		leaseRenewals:    leaseRenewals,
 		epochTransitions: epochTransitions,
+		promotionGuard:   promotionGuard,
 		scrubRuns:        scrubRuns,
 		scrubHeadChecks:  scrubHeadChecks,
 		scrubRewoundRefs: scrubRewoundRefs,
@@ -124,6 +134,16 @@ func (m *Metrics) recordEpochTransition(ctx context.Context, region lease.Region
 		telemetry.AttrRegion.String(string(region)),
 		attribute.String("mode", string(mode)),
 		attribute.String("result", result),
+	))
+}
+
+func (m *Metrics) recordPromotionGuard(ctx context.Context, region lease.Region, outcome string) {
+	if m == nil {
+		return
+	}
+	m.promotionGuard.Add(ctx, 1, metric.WithAttributes(
+		telemetry.AttrRegion.String(string(region)),
+		attribute.String("outcome", outcome),
 	))
 }
 

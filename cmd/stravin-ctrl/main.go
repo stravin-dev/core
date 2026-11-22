@@ -36,18 +36,24 @@ const (
 )
 
 type ctrlConfig struct {
-	ListenAddr        string
-	AdminToken        string
-	Region            string
-	AWSEndpoint       string
-	DDBTable          string
-	S3Bucket          string
-	HolderID          string
-	LeaseTTL          time.Duration
-	HeartbeatInterval time.Duration
-	FenceWait         time.Duration
-	ScrubLookback     time.Duration
-	ScrubConcurrency  int
+	ListenAddr             string
+	AdminToken             string
+	Region                 string
+	AWSEndpoint            string
+	DDBTable               string
+	S3Bucket               string
+	HolderID               string
+	LeaseTTL               time.Duration
+	HeartbeatInterval      time.Duration
+	FenceWait              time.Duration
+	ScrubLookback          time.Duration
+	ScrubConcurrency       int
+	RequirePromotionGuard  bool
+	PromotionGuardPolicy   string
+	PromotionApprovalToken string
+	WitnessEndpoints       []string
+	WitnessQuorum          int
+	WitnessTimeout         time.Duration
 }
 
 func loadConfig() ctrlConfig {
@@ -61,18 +67,24 @@ func loadConfig() ctrlConfig {
 	listenAddr := envOrDefault("STRAVIN_CTRL_ADDR", envOrDefault("STRAVIN_CTRL_LISTEN_ADDR", daemon.ListenAddrFromEnv(defaultListenAddr)))
 
 	return ctrlConfig{
-		ListenAddr:        listenAddr,
-		AdminToken:        strings.TrimSpace(os.Getenv("STRAVIN_CTRL_ADMIN_TOKEN")),
-		Region:            region,
-		AWSEndpoint:       strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL")),
-		DDBTable:          envOrDefault("STRAVIN_DDB_TABLE", defaultDDBTable),
-		S3Bucket:          envOrDefault("STRAVIN_S3_BUCKET", defaultS3BucketPrefix+region),
-		HolderID:          envOrDefault("STRAVIN_CTRL_HOLDER_ID", defaultHolderID),
-		LeaseTTL:          envDuration("STRAVIN_CTRL_LEASE_TTL", ctrl.DefaultLeaseTTL),
-		HeartbeatInterval: envDuration("STRAVIN_CTRL_HEARTBEAT_INTERVAL", ctrl.DefaultHeartbeatInterval),
-		FenceWait:         envDurationAllowZero("STRAVIN_CTRL_FENCE_WAIT", 0),
-		ScrubLookback:     envDuration("STRAVIN_CTRL_SCRUB_LOOKBACK", ctrl.DefaultScrubLookback),
-		ScrubConcurrency:  envInt("STRAVIN_CTRL_SCRUB_CONCURRENCY", ctrl.DefaultScrubConcurrency),
+		ListenAddr:             listenAddr,
+		AdminToken:             strings.TrimSpace(os.Getenv("STRAVIN_CTRL_ADMIN_TOKEN")),
+		Region:                 region,
+		AWSEndpoint:            strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL")),
+		DDBTable:               envOrDefault("STRAVIN_DDB_TABLE", defaultDDBTable),
+		S3Bucket:               envOrDefault("STRAVIN_S3_BUCKET", defaultS3BucketPrefix+region),
+		HolderID:               envOrDefault("STRAVIN_CTRL_HOLDER_ID", defaultHolderID),
+		LeaseTTL:               envDuration("STRAVIN_CTRL_LEASE_TTL", ctrl.DefaultLeaseTTL),
+		HeartbeatInterval:      envDuration("STRAVIN_CTRL_HEARTBEAT_INTERVAL", ctrl.DefaultHeartbeatInterval),
+		FenceWait:              envDurationAllowZero("STRAVIN_CTRL_FENCE_WAIT", 0),
+		ScrubLookback:          envDuration("STRAVIN_CTRL_SCRUB_LOOKBACK", ctrl.DefaultScrubLookback),
+		ScrubConcurrency:       envInt("STRAVIN_CTRL_SCRUB_CONCURRENCY", ctrl.DefaultScrubConcurrency),
+		RequirePromotionGuard:  envBool("STRAVIN_CTRL_REQUIRE_PROMOTION_GUARD", false),
+		PromotionGuardPolicy:   envOrDefault("STRAVIN_CTRL_PROMOTION_GUARD_POLICY", string(ctrl.CompositePolicyRequireAll)),
+		PromotionApprovalToken: strings.TrimSpace(os.Getenv("STRAVIN_CTRL_PROMOTION_APPROVAL_TOKEN")),
+		WitnessEndpoints:       envCSV("STRAVIN_CTRL_WITNESS_ENDPOINTS"),
+		WitnessQuorum:          envIntAllowZero("STRAVIN_CTRL_WITNESS_QUORUM", 0),
+		WitnessTimeout:         envDuration("STRAVIN_CTRL_WITNESS_TIMEOUT", ctrl.DefaultWitnessTimeout),
 	}
 }
 
@@ -120,6 +132,69 @@ func envInt(key string, fallback int) int {
 		return v
 	}
 	return fallback
+}
+
+func envIntAllowZero(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	if v, err := strconv.Atoi(raw); err == nil && v >= 0 {
+		return v
+	}
+	return fallback
+}
+
+func envBool(key string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	if b, err := strconv.ParseBool(raw); err == nil {
+		return b
+	}
+	return fallback
+}
+
+func envCSV(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func buildPromotionGuard(cfg ctrlConfig) (ctrl.PromotionGuard, error) {
+	if !cfg.RequirePromotionGuard {
+		return nil, nil
+	}
+	var guards []ctrl.PromotionGuard
+	if len(cfg.WitnessEndpoints) > 0 {
+		wg, err := ctrl.NewWitnessQuorumGuard(ctrl.WitnessQuorumConfig{
+			Endpoints: cfg.WitnessEndpoints,
+			Quorum:    cfg.WitnessQuorum,
+			Timeout:   cfg.WitnessTimeout,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("init witness quorum guard: %w", err)
+		}
+		guards = append(guards, wg)
+	}
+	if cfg.PromotionApprovalToken != "" {
+		guards = append(guards, ctrl.NewOperatorPromotionGuard(cfg.PromotionApprovalToken))
+	}
+	if len(guards) == 0 {
+		return nil, errors.New("STRAVIN_CTRL_REQUIRE_PROMOTION_GUARD=true requires STRAVIN_CTRL_WITNESS_ENDPOINTS and/or STRAVIN_CTRL_PROMOTION_APPROVAL_TOKEN")
+	}
+	policy := ctrl.CompositePolicy(strings.TrimSpace(cfg.PromotionGuardPolicy))
+	return ctrl.NewCompositePromotionGuard(policy, guards...)
 }
 
 func run(ctx context.Context, cfg ctrlConfig) error {
@@ -174,6 +249,11 @@ func run(ctx context.Context, cfg ctrlConfig) error {
 		return fmt.Errorf("init ctrl metrics: %w", err)
 	}
 
+	promotionGuard, err := buildPromotionGuard(cfg)
+	if err != nil {
+		return fmt.Errorf("init promotion guard: %w", err)
+	}
+
 	leaseMgr, err := ctrl.NewLeaseManager(ctrl.LeaseManagerConfig{
 		Leases:            ddbRepo,
 		Meta:              ddbRepo,
@@ -182,6 +262,8 @@ func run(ctx context.Context, cfg ctrlConfig) error {
 		LeaseTTL:          cfg.LeaseTTL,
 		HeartbeatInterval: cfg.HeartbeatInterval,
 		FenceWait:         cfg.FenceWait,
+		PromotionGuard:    promotionGuard,
+		PromotionAudit:    auditStore,
 		Metrics:           metrics,
 	})
 	if err != nil {

@@ -105,30 +105,38 @@ type LeaseManagerConfig struct {
 	FenceWait         time.Duration
 	InitialMode       lease.Mode
 	Clock             lease.Clock
+	ULIDGen           func(time.Time) (string, error)
+	PromotionGuard    PromotionGuard
+	PromotionAudit    PromotionAuditStore
 	Metrics           *Metrics
 	Logger            *slog.Logger
 }
 
 // FenceRequest describes a regional lease fencing and/or epoch advancement operation.
 type FenceRequest struct {
-	TargetMode   lease.Mode      `json:"mode,omitempty"`
-	AdvanceEpoch bool            `json:"advance_epoch"`
-	MinEpoch     lease.Epoch     `json:"min_epoch,omitempty"`
-	FenceWait    time.Duration   `json:"-"`
-	Repo         *tenant.RepoKey `json:"-"`
+	TargetMode    lease.Mode      `json:"mode,omitempty"`
+	AdvanceEpoch  bool            `json:"advance_epoch"`
+	MinEpoch      lease.Epoch     `json:"min_epoch,omitempty"`
+	FenceWait     time.Duration   `json:"-"`
+	Repo          *tenant.RepoKey `json:"-"`
+	HomeRegion    lease.Region    `json:"home_region,omitempty"`
+	OperatorID    string          `json:"operator_id,omitempty"`
+	ApprovalToken string          `json:"-"`
+	Reason        string          `json:"reason,omitempty"`
 }
 
 // FenceResult reports the outcome of a fencing or epoch advancement transition.
 type FenceResult struct {
-	Region           lease.Region  `json:"region"`
-	PreviousEpoch    lease.Epoch   `json:"previous_epoch"`
-	CurrentEpoch     lease.Epoch   `json:"current_epoch"`
-	PreviousMode     lease.Mode    `json:"previous_mode"`
-	CurrentMode      lease.Mode    `json:"current_mode"`
-	HolderID         string        `json:"holder_id"`
-	ExpiresAt        time.Time     `json:"expires_at"`
-	FenceWaitApplied time.Duration `json:"fence_wait_applied_ns"`
-	RepoMeta         *ddb.RepoMeta `json:"repo_meta,omitempty"`
+	Region            lease.Region       `json:"region"`
+	PreviousEpoch     lease.Epoch        `json:"previous_epoch"`
+	CurrentEpoch      lease.Epoch        `json:"current_epoch"`
+	PreviousMode      lease.Mode         `json:"previous_mode"`
+	CurrentMode       lease.Mode         `json:"current_mode"`
+	HolderID          string             `json:"holder_id"`
+	ExpiresAt         time.Time          `json:"expires_at"`
+	FenceWaitApplied  time.Duration      `json:"fence_wait_applied_ns"`
+	RepoMeta          *ddb.RepoMeta      `json:"repo_meta,omitempty"`
+	PromotionDecision *PromotionDecision `json:"promotion_decision,omitempty"`
 }
 
 // LeaseStatus is a point-in-time snapshot of the regional write lease.
@@ -154,6 +162,9 @@ type LeaseManager struct {
 	heartbeatInterval time.Duration
 	fenceWait         time.Duration
 	clock             lease.Clock
+	ulidGen           func(time.Time) (string, error)
+	promotionGuard    PromotionGuard
+	promotionAudit    PromotionAuditStore
 	metrics           *Metrics
 	logger            *slog.Logger
 
@@ -201,6 +212,10 @@ func NewLeaseManager(cfg LeaseManagerConfig) (*LeaseManager, error) {
 	if clk == nil {
 		clk = lease.RealClock{}
 	}
+	ulidGen := cfg.ULIDGen
+	if ulidGen == nil {
+		ulidGen = ddb.NewULID
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -215,6 +230,9 @@ func NewLeaseManager(cfg LeaseManagerConfig) (*LeaseManager, error) {
 		heartbeatInterval: heartbeat,
 		fenceWait:         fenceWait,
 		clock:             clk,
+		ulidGen:           ulidGen,
+		promotionGuard:    cfg.PromotionGuard,
+		promotionAudit:    cfg.PromotionAudit,
 		metrics:           cfg.Metrics,
 		logger:            logger,
 		state:             st,
@@ -407,6 +425,19 @@ func (m *LeaseManager) FenceRegion(ctx context.Context, req FenceRequest) (Fence
 	ctx, span := m.metrics.Tracer().Start(ctx, "ctrl.failover.transition", trace.WithAttributes(attrs...))
 	defer span.End()
 
+	var promotionDecision *PromotionDecision
+	isPromotion := newEpoch > prevEpoch || (targetMode == lease.ModeActive && prevState.Mode() != lease.ModeActive)
+	if m.promotionGuard != nil && isPromotion {
+		dec, err := m.evaluatePromotionGuard(ctx, req, prevEpoch, newEpoch, targetMode)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			m.metrics.recordEpochTransition(ctx, m.region, targetMode, "denied")
+			return FenceResult{}, err
+		}
+		promotionDecision = &dec
+	}
+
 	waitDur := req.FenceWait
 	if waitDur <= 0 {
 		waitDur = m.fenceWait
@@ -437,14 +468,15 @@ func (m *LeaseManager) FenceRegion(ctx context.Context, req FenceRequest) (Fence
 	m.mu.Unlock()
 
 	res := FenceResult{
-		Region:           m.region,
-		PreviousEpoch:    prevEpoch,
-		CurrentEpoch:     acquired.Epoch,
-		PreviousMode:     prevState.Mode(),
-		CurrentMode:      acquired.Mode,
-		HolderID:         acquired.HolderID,
-		ExpiresAt:        acquired.ExpiresAt,
-		FenceWaitApplied: appliedWait,
+		Region:            m.region,
+		PreviousEpoch:     prevEpoch,
+		CurrentEpoch:      acquired.Epoch,
+		PreviousMode:      prevState.Mode(),
+		CurrentMode:       acquired.Mode,
+		HolderID:          acquired.HolderID,
+		ExpiresAt:         acquired.ExpiresAt,
+		FenceWaitApplied:  appliedWait,
+		PromotionDecision: promotionDecision,
 	}
 
 	if req.Repo != nil {
@@ -517,6 +549,76 @@ func (m *LeaseManager) UpdateRepoEpoch(ctx context.Context, repo tenant.RepoKey,
 
 	m.metrics.recordEpochTransition(ctx, current.HomeRegion, targetMode, "ok")
 	return updated, nil
+}
+
+func (m *LeaseManager) evaluatePromotionGuard(ctx context.Context, req FenceRequest, prevEpoch, targetEpoch lease.Epoch, targetMode lease.Mode) (PromotionDecision, error) {
+	homeRegion := req.HomeRegion
+	if homeRegion == "" && req.Repo != nil && m.meta != nil {
+		if meta, err := m.meta.GetMeta(ctx, *req.Repo); err == nil && meta.HomeRegion != "" {
+			homeRegion = meta.HomeRegion
+		}
+	}
+	if homeRegion == "" {
+		homeRegion = m.region
+	}
+
+	promReq := PromotionRequest{
+		Region:        m.region,
+		HomeRegion:    homeRegion,
+		CurrentEpoch:  prevEpoch,
+		TargetEpoch:   targetEpoch,
+		TargetMode:    targetMode,
+		Repo:          req.Repo,
+		OperatorID:    req.OperatorID,
+		ApprovalToken: req.ApprovalToken,
+		Reason:        req.Reason,
+	}
+
+	dec, guardErr := m.promotionGuard.AuthorizePromotion(ctx, promReq)
+	allowed := guardErr == nil && dec.Allowed
+	outcome := "denied"
+	if allowed {
+		outcome = "allowed"
+	}
+	m.metrics.recordPromotionGuard(ctx, m.region, outcome)
+
+	if m.promotionAudit != nil {
+		now := m.clock.Now().UTC()
+		auditID, idErr := m.ulidGen(now)
+		if idErr != nil {
+			auditID = fmt.Sprintf("prom-%d", now.UnixNano())
+		}
+		record := PromotionAuditRecord{
+			AuditID:      auditID,
+			Region:       m.region,
+			HomeRegion:   homeRegion,
+			Repo:         req.Repo,
+			CurrentEpoch: prevEpoch,
+			TargetEpoch:  targetEpoch,
+			TargetMode:   targetMode,
+			Decision:     dec,
+			Reason:       req.Reason,
+			EvaluatedAt:  now,
+		}
+		if auditErr := m.promotionAudit.RecordPromotionAudit(ctx, record); auditErr != nil {
+			m.logger.Warn("ctrl: failed to persist promotion guard audit record",
+				"region", string(m.region),
+				"outcome", outcome,
+				"error", auditErr,
+			)
+			if allowed {
+				return dec, fmt.Errorf("ctrl: persist promotion audit: %w", auditErr)
+			}
+		}
+	}
+
+	if !allowed {
+		if guardErr == nil {
+			guardErr = fmt.Errorf("%w: %s", ErrPromotionDenied, dec.Reason)
+		}
+		return dec, guardErr
+	}
+	return dec, nil
 }
 
 func waitWithContext(ctx context.Context, d time.Duration) error {

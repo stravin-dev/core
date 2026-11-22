@@ -119,12 +119,16 @@ func (h *Handler) handleLeaseStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 type fenceHTTPRequest struct {
-	Mode         lease.Mode  `json:"mode,omitempty"`
-	AdvanceEpoch *bool       `json:"advance_epoch,omitempty"`
-	MinEpoch     lease.Epoch `json:"min_epoch,omitempty"`
-	FenceWaitMs  int64       `json:"fence_wait_ms,omitempty"`
-	TenantID     string      `json:"tenant_id,omitempty"`
-	RepoID       string      `json:"repo_id,omitempty"`
+	Mode          lease.Mode  `json:"mode,omitempty"`
+	AdvanceEpoch  *bool       `json:"advance_epoch,omitempty"`
+	MinEpoch      lease.Epoch `json:"min_epoch,omitempty"`
+	FenceWaitMs   int64       `json:"fence_wait_ms,omitempty"`
+	TenantID      string      `json:"tenant_id,omitempty"`
+	RepoID        string      `json:"repo_id,omitempty"`
+	HomeRegion    string      `json:"home_region,omitempty"`
+	OperatorID    string      `json:"operator_id,omitempty"`
+	ApprovalToken string      `json:"approval_token,omitempty"`
+	Reason        string      `json:"reason,omitempty"`
 }
 
 func (h *Handler) handleLeaseFence(w http.ResponseWriter, r *http.Request) {
@@ -144,9 +148,13 @@ func (h *Handler) handleLeaseFence(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req := FenceRequest{
-		TargetMode:   payload.Mode,
-		AdvanceEpoch: advance,
-		MinEpoch:     payload.MinEpoch,
+		TargetMode:    payload.Mode,
+		AdvanceEpoch:  advance,
+		MinEpoch:      payload.MinEpoch,
+		HomeRegion:    lease.Region(strings.TrimSpace(payload.HomeRegion)),
+		OperatorID:    firstNonEmpty(payload.OperatorID, r.Header.Get("X-Stravin-Operator-ID")),
+		ApprovalToken: firstNonEmpty(payload.ApprovalToken, r.Header.Get("X-Stravin-Approval-Token")),
+		Reason:        strings.TrimSpace(payload.Reason),
 	}
 	if payload.FenceWaitMs > 0 {
 		req.FenceWait = time.Duration(payload.FenceWaitMs) * time.Millisecond
@@ -169,11 +177,15 @@ func (h *Handler) handleLeaseFence(w http.ResponseWriter, r *http.Request) {
 }
 
 type epochAdvanceHTTPRequest struct {
-	TenantID    string      `json:"tenant_id,omitempty"`
-	RepoID      string      `json:"repo_id,omitempty"`
-	Epoch       lease.Epoch `json:"epoch,omitempty"`
-	Mode        lease.Mode  `json:"mode,omitempty"`
-	FenceWaitMs int64       `json:"fence_wait_ms,omitempty"`
+	TenantID      string      `json:"tenant_id,omitempty"`
+	RepoID        string      `json:"repo_id,omitempty"`
+	Epoch         lease.Epoch `json:"epoch,omitempty"`
+	Mode          lease.Mode  `json:"mode,omitempty"`
+	FenceWaitMs   int64       `json:"fence_wait_ms,omitempty"`
+	HomeRegion    string      `json:"home_region,omitempty"`
+	OperatorID    string      `json:"operator_id,omitempty"`
+	ApprovalToken string      `json:"approval_token,omitempty"`
+	Reason        string      `json:"reason,omitempty"`
 }
 
 func (h *Handler) handleEpochAdvance(w http.ResponseWriter, r *http.Request) {
@@ -188,9 +200,13 @@ func (h *Handler) handleEpochAdvance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req := FenceRequest{
-		TargetMode:   payload.Mode,
-		AdvanceEpoch: true,
-		MinEpoch:     payload.Epoch,
+		TargetMode:    payload.Mode,
+		AdvanceEpoch:  true,
+		MinEpoch:      payload.Epoch,
+		HomeRegion:    lease.Region(strings.TrimSpace(payload.HomeRegion)),
+		OperatorID:    firstNonEmpty(payload.OperatorID, r.Header.Get("X-Stravin-Operator-ID")),
+		ApprovalToken: firstNonEmpty(payload.ApprovalToken, r.Header.Get("X-Stravin-Approval-Token")),
+		Reason:        strings.TrimSpace(payload.Reason),
 	}
 	if payload.FenceWaitMs > 0 {
 		req.FenceWait = time.Duration(payload.FenceWaitMs) * time.Millisecond
@@ -271,8 +287,21 @@ func decodeOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	return decodeJSON(w, r, dst)
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
 func mapControlError(err error) int {
 	switch {
+	case errors.Is(err, ErrPromotionDenied):
+		return http.StatusForbidden
+	case errors.Is(err, ErrPrimaryHealthy):
+		return http.StatusConflict
 	case errors.Is(err, ddb.ErrNotFound), errors.Is(err, lease.ErrLeaseNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, ddb.ErrEpochConflict), errors.Is(err, ddb.ErrLeaseHeld), errors.Is(err, ddb.ErrRefConflict), errors.Is(err, ErrNonMonotonicEpoch):
