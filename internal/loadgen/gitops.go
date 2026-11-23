@@ -84,6 +84,7 @@ func (g *GitClient) Run(ctx context.Context, args ...string) (string, error) {
 
 	fullArgs := g.buildArgs(args)
 	cmd := exec.CommandContext(ctx, "git", fullArgs...) //#nosec G204 -- loadgen invokes local git CLI with controlled arguments
+	configureGitCommand(cmd)
 	if g.workDir != "" {
 		if info, err := os.Stat(g.workDir); err == nil && info.IsDir() {
 			cmd.Dir = g.workDir
@@ -249,7 +250,7 @@ func (g *GitClient) buildArgs(args []string) []string {
 func (g *GitClient) buildEnv() []string {
 	env := append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	if g.opts.SSHKey != "" {
-		sshCmd := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes", g.opts.SSHKey)
+		sshCmd := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5", g.opts.SSHKey)
 		env = append(env, "GIT_SSH_COMMAND="+sshCmd)
 	}
 	if len(g.opts.ExtraEnv) > 0 {
