@@ -147,6 +147,7 @@ func isConflictMessage(msg string) bool {
 		"non-fast-forward",
 		"fetch first",
 		"stale info",
+		"stale old_oid",
 		"cannot lock ref",
 		"reference already exists",
 		"atomic push failed",
