@@ -183,6 +183,17 @@ func (h *ReceivePackHandler) HandleReceivePack(ctx context.Context, meta rpc.Req
 		return status.Errorf(codes.Internal, "node: load refs %s: %v", repo, err)
 	}
 
+	// 2b. Verify all command OIDs match the repository's object format (40-hex sha1 or 64-hex sha256).
+	objFormat := repoMeta.EffectiveObjectFormat()
+	for _, c := range cmds {
+		if err := ddb.ValidateOIDForFormat(c.OldOID, objFormat); err != nil {
+			return status.Errorf(codes.InvalidArgument, "node: invalid old_oid for %s: %v", c.RefName, err)
+		}
+		if err := ddb.ValidateOIDForFormat(c.NewOID, objFormat); err != nil {
+			return status.Errorf(codes.InvalidArgument, "node: invalid new_oid for %s: %v", c.RefName, err)
+		}
+	}
+
 	// 3. Enforce repository write state, home region, and failover_epoch fencing.
 	if repoMeta.WriteState != lease.ModeActive {
 		return status.Errorf(codes.FailedPrecondition, "node: repository %s write state is %s", repo, repoMeta.WriteState)
@@ -325,6 +336,7 @@ func (h *ReceivePackHandler) HandleReceivePack(ctx context.Context, meta rpc.Req
 		Epoch:          currentLease.Epoch,
 		OriginRegion:   originRegion,
 		TraceParent:    traceParent,
+		ObjectFormat:   objFormat,
 		Updates:        cmds,
 		Pack:           packUpload,
 	})
@@ -382,6 +394,7 @@ func (h *ReceivePackHandler) sendAdvertiseRefs(ctx context.Context, repo tenant.
 	payload := AdvertiseRefs(refs, repoMeta.DefaultBranch, AdvertiseOptions{
 		IncludeServiceHeader: boolHeader(ctx, HeaderSmartHTTPServiceHeader),
 		ServiceName:          string(rpc.OpReceivePack),
+		ObjectFormat:         repoMeta.EffectiveObjectFormat(),
 	})
 	if len(payload) > 0 {
 		return stream.Send(&rpc.Frame{Data: payload})
@@ -434,6 +447,12 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 		return ingestedPack{}, err
 	}
 
+	algo, err := pack.HashAlgorithmForFormat(string(repoMeta.EffectiveObjectFormat()))
+	if err != nil {
+		recordSpanError(span, err)
+		return ingestedPack{}, fmt.Errorf("object format: %w", err)
+	}
+
 	syncRes, err := h.materializer.SyncAndPin(packCtx, repo)
 	if err != nil {
 		recordSpanError(span, err)
@@ -441,7 +460,12 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 	}
 	baseResolver := syncRes.Handle.BaseResolver()
 
-	completed, err := h.thinCompleter.Complete(packCtx, rawPack, baseResolver)
+	var completed []byte
+	if algoCompleter, ok := h.thinCompleter.(pack.AlgorithmAwareThinPackCompleter); ok {
+		completed, err = algoCompleter.CompleteWithAlgorithm(packCtx, rawPack, baseResolver, algo)
+	} else {
+		completed, err = h.thinCompleter.Complete(packCtx, rawPack, baseResolver)
+	}
 	if err != nil {
 		syncRes.Handle.Release()
 		recordSpanError(span, err)
@@ -449,7 +473,8 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 	}
 
 	parsed, err := pack.Parse(bytes.NewReader(completed), pack.ParseOptions{
-		Limits: h.packLimits,
+		Limits:        h.packLimits,
+		HashAlgorithm: algo,
 	})
 	if err != nil {
 		syncRes.Handle.Release()
@@ -462,7 +487,7 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 		if c.IsDelete() {
 			continue
 		}
-		oid, err := pack.ParseOID(c.NewOID)
+		oid, err := pack.ParseOIDForAlgorithm(c.NewOID, algo)
 		if err != nil {
 			syncRes.Handle.Release()
 			recordSpanError(span, err)
@@ -569,7 +594,7 @@ func (c *pushOverlapCoordinator) Execute(ctx context.Context, req pushOverlapReq
 			))
 			defer hookSpan.End()
 
-			pushCtx := buildWasmPushContext(req.Repo, req.Updates)
+			pushCtx := buildWasmPushContext(req.Repo, req.Meta.EffectiveObjectFormat(), req.Updates)
 			var reader wasm.ObjectReader
 			if req.PackReader != nil {
 				reader = NewPackObjectReaderAdapter(req.PackReader)
@@ -737,21 +762,26 @@ func pushNeedsPack(cmds []ddb.RefUpdate) bool {
 	return false
 }
 
-func buildWasmPushContext(repo tenant.RepoKey, cmds []ddb.RefUpdate) wasm.PushContext {
+func buildWasmPushContext(repo tenant.RepoKey, objectFormat ddb.ObjectFormat, cmds []ddb.RefUpdate) wasm.PushContext {
 	updates := make([]wasm.RefUpdate, 0, len(cmds))
 	for _, c := range cmds {
 		oldOID, _ := pack.ParseOID(c.OldOID)
 		newOID, _ := pack.ParseOID(c.NewOID)
+		oldRaw, _ := oldOID.SHA1Bytes()
+		newRaw, _ := newOID.SHA1Bytes()
 		updates = append(updates, wasm.RefUpdate{
-			Ref:    c.RefName,
-			OldOID: [20]byte(oldOID),
-			NewOID: [20]byte(newOID),
+			Ref:       c.RefName,
+			OldOID:    oldRaw,
+			NewOID:    newRaw,
+			OldOIDHex: c.OldOID,
+			NewOIDHex: c.NewOID,
 		})
 	}
 	return wasm.PushContext{
-		TenantID: string(repo.TenantID),
-		RepoID:   string(repo.RepoID),
-		Updates:  updates,
+		TenantID:     string(repo.TenantID),
+		RepoID:       string(repo.RepoID),
+		ObjectFormat: string(ddb.NormalizeObjectFormat(objectFormat)),
+		Updates:      updates,
 	}
 }
 

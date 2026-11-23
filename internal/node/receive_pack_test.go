@@ -501,7 +501,7 @@ func buildSyntheticCommitPack(t *testing.T, blobContent, commitMsg string, paren
 
 	var treeBuf bytes.Buffer
 	treeBuf.WriteString("100644 file.txt\x00")
-	treeBuf.Write(blobOID[:])
+	treeBuf.Write(blobOID.Bytes())
 	treeData := treeBuf.Bytes()
 	treeOID := pack.ComputeOID(pack.ObjTree, treeData)
 
@@ -544,7 +544,7 @@ func buildSyntheticThinPack(t *testing.T, baseBlobData []byte, baseBlobOID, pare
 
 	var treeBuf bytes.Buffer
 	treeBuf.WriteString("100644 file.txt\x00")
-	treeBuf.Write(newBlobOID[:])
+	treeBuf.Write(newBlobOID.Bytes())
 	treeData := treeBuf.Bytes()
 	treeOID := pack.ComputeOID(pack.ObjTree, treeData)
 
@@ -587,7 +587,7 @@ func encodeRawPackfile(t *testing.T, objs []rawPackObj) []byte {
 		}
 		buf.WriteByte(b)
 		if o.typ == pack.ObjRefDelta {
-			buf.Write(o.refBase[:])
+			buf.Write(o.refBase.Bytes())
 		}
 		zw := zlib.NewWriter(&buf)
 		if _, err := zw.Write(o.data); err != nil {
@@ -1045,7 +1045,8 @@ func TestPackObjectReaderAdapter_CommitsDiffAndBlob(t *testing.T) {
 	}
 	adapter := NewPackObjectReaderAdapter(pack.NewPackReader(parsed, nil))
 
-	commits, err := adapter.ListNewCommits([20]byte{}, [20]byte(commit1), 10)
+	c1Raw, _ := commit1.SHA1Bytes()
+	commits, err := adapter.ListNewCommits([20]byte{}, c1Raw, 10)
 	if err != nil {
 		t.Fatalf("ListNewCommits: %v", err)
 	}
@@ -1061,7 +1062,8 @@ func TestPackObjectReaderAdapter_CommitsDiffAndBlob(t *testing.T) {
 		t.Fatalf("unexpected tree changes: %+v", changes)
 	}
 
-	chunk, err := adapter.ReadBlobChunk([20]byte(blob1), 0, 64)
+	b1Raw, _ := blob1.SHA1Bytes()
+	chunk, err := adapter.ReadBlobChunk(b1Raw, 0, 64)
 	if err != nil {
 		t.Fatalf("ReadBlobChunk: %v", err)
 	}

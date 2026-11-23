@@ -2,6 +2,7 @@ package wasm
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -146,6 +147,132 @@ func (r *budgetedObjectReader) ReadBlobChunk(blobOID [20]byte, offset uint64, ma
 	return chunk, nil
 }
 
+func (r *budgetedObjectReader) ListNewCommitsByHex(oldOIDHex, newOIDHex string, limit uint32) ([]CommitMeta, error) {
+	if err := r.chargeHostCall(); err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	if r.commitsWalked >= r.maxCommits {
+		r.mu.Unlock()
+		return nil, ErrBudgetExceeded
+	}
+	remaining := r.maxCommits - r.commitsWalked
+	r.mu.Unlock()
+
+	if r.inner == nil {
+		return nil, nil
+	}
+	effectiveLimit := limit
+	if effectiveLimit == 0 || effectiveLimit > remaining {
+		effectiveLimit = remaining
+	}
+
+	var (
+		commits []CommitMeta
+		err     error
+	)
+	if dual, ok := r.inner.(DualHashObjectReader); ok {
+		commits, err = dual.ListNewCommitsByHex(oldOIDHex, newOIDHex, effectiveLimit)
+	} else {
+		oldB, err1 := decodeSHA1Hex(oldOIDHex)
+		newB, err2 := decodeSHA1Hex(newOIDHex)
+		if err1 != nil || err2 != nil {
+			return nil, fmt.Errorf("hooks/wasm: reader does not support non-sha1 oids")
+		}
+		commits, err = r.inner.ListNewCommits(oldB, newB, effectiveLimit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	r.commitsWalked += uint32(len(commits))
+	r.mu.Unlock()
+	return commits, nil
+}
+
+func (r *budgetedObjectReader) DiffTreeByHex(ctx context.Context, oldTreeOIDHex, newTreeOIDHex string, limit uint32) ([]TreeChange, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := r.chargeHostCall(); err != nil {
+		return nil, err
+	}
+	if r.inner == nil {
+		return nil, nil
+	}
+	effectiveLimit := clampDiffTreeLimit(limit)
+	if dual, ok := r.inner.(DualHashObjectReader); ok {
+		return dual.DiffTreeByHex(ctx, oldTreeOIDHex, newTreeOIDHex, effectiveLimit)
+	}
+	oldB, err1 := decodeSHA1Hex(oldTreeOIDHex)
+	newB, err2 := decodeSHA1Hex(newTreeOIDHex)
+	if err1 != nil || err2 != nil {
+		return nil, fmt.Errorf("hooks/wasm: reader does not support non-sha1 oids")
+	}
+	if ctxReader, ok := r.inner.(ContextDiffTreeReader); ok {
+		return ctxReader.DiffTreeContext(ctx, oldB, newB, effectiveLimit)
+	}
+	return r.inner.DiffTree(oldB, newB, effectiveLimit)
+}
+
+func (r *budgetedObjectReader) ReadBlobChunkByHex(blobOIDHex string, offset uint64, maxBytes uint32) ([]byte, error) {
+	if err := r.chargeHostCall(); err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	if r.blobBytesRead >= r.maxBlobBytes {
+		r.mu.Unlock()
+		return nil, ErrBudgetExceeded
+	}
+	remaining := r.maxBlobBytes - r.blobBytesRead
+	r.mu.Unlock()
+
+	if r.inner == nil {
+		return []byte{}, nil
+	}
+	effectiveMax := maxBytes
+	if uint64(effectiveMax) > remaining {
+		effectiveMax = uint32(remaining)
+	}
+
+	var (
+		chunk []byte
+		err   error
+	)
+	if dual, ok := r.inner.(DualHashObjectReader); ok {
+		chunk, err = dual.ReadBlobChunkByHex(blobOIDHex, offset, effectiveMax)
+	} else {
+		blobB, decErr := decodeSHA1Hex(blobOIDHex)
+		if decErr != nil {
+			return nil, fmt.Errorf("hooks/wasm: reader does not support non-sha1 oids")
+		}
+		chunk, err = r.inner.ReadBlobChunk(blobB, offset, effectiveMax)
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	r.blobBytesRead += uint64(len(chunk))
+	r.mu.Unlock()
+	return chunk, nil
+}
+
+func decodeSHA1Hex(s string) ([20]byte, error) {
+	var out [20]byte
+	if len(s) != 40 {
+		return out, errors.New("not a 40-char sha1 hex oid")
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return out, err
+	}
+	copy(out[:], b)
+	return out, nil
+}
+
 type invocationState struct {
 	pushCtx PushContext
 	reader  *budgetedObjectReader
@@ -176,11 +303,12 @@ type wireRefUpdate struct {
 }
 
 type wirePushContext struct {
-	TenantID string          `json:"tenant_id"`
-	RepoID   string          `json:"repo_id"`
-	OrgID    string          `json:"org_id,omitempty"`
-	ActorID  string          `json:"actor_id,omitempty"`
-	Updates  []wireRefUpdate `json:"updates"`
+	TenantID     string          `json:"tenant_id"`
+	RepoID       string          `json:"repo_id"`
+	OrgID        string          `json:"org_id,omitempty"`
+	ActorID      string          `json:"actor_id,omitempty"`
+	ObjectFormat string          `json:"object_format,omitempty"`
+	Updates      []wireRefUpdate `json:"updates"`
 }
 
 type wireCommitMeta struct {
@@ -204,6 +332,7 @@ type wireTreeChange struct {
 }
 
 // registerHostABI exposes the read-only HookHostABI Facade under the "stravin" Wasm host module.
+// Both v1 (20-byte SHA-1 pointer) and v2 (length-prefixed SHA-1/SHA-256 raw or hex OID) exports are registered.
 func registerHostABI(ctx context.Context, rt wazero.Runtime) error {
 	_, err := rt.NewHostModuleBuilder(hostModuleName).
 		NewFunctionBuilder().
@@ -218,6 +347,15 @@ func registerHostABI(ctx context.Context, rt wazero.Runtime) error {
 		NewFunctionBuilder().
 		WithFunc(hostReadBlobChunk).
 		Export("read_blob_chunk").
+		NewFunctionBuilder().
+		WithFunc(hostListNewCommitsV2).
+		Export("list_new_commits_v2").
+		NewFunctionBuilder().
+		WithFunc(hostDiffTreeV2).
+		Export("diff_tree_v2").
+		NewFunctionBuilder().
+		WithFunc(hostReadBlobChunkV2).
+		Export("read_blob_chunk_v2").
 		NewFunctionBuilder().
 		WithFunc(hostSetVerdict).
 		Export("set_verdict").
@@ -246,6 +384,42 @@ func readOID(mem api.Memory, ptr uint32) ([20]byte, bool) {
 	return oid, true
 }
 
+// readFlexOID reads an algorithm-agnostic OID from guest linear memory.
+// It accepts either raw hash bytes (20B for sha1, 32B for sha256) or lowercase
+// hex strings (40B for sha1, 64B for sha256) and validates against expectedFormat.
+func readFlexOID(mem api.Memory, ptr, length uint32, expectedFormat string) (string, bool) {
+	if mem == nil {
+		return "", false
+	}
+	wantRawLen := uint32(20)
+	wantHexLen := uint32(40)
+	if expectedFormat == ObjectFormatSHA256 {
+		wantRawLen = 32
+		wantHexLen = 64
+	}
+	switch length {
+	case wantRawLen:
+		raw, ok := mem.Read(ptr, length)
+		if !ok {
+			return "", false
+		}
+		return hex.EncodeToString(raw), true
+	case wantHexLen:
+		raw, ok := mem.Read(ptr, length)
+		if !ok {
+			return "", false
+		}
+		for _, c := range raw {
+			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+				return "", false
+			}
+		}
+		return string(raw), true
+	default:
+		return "", false
+	}
+}
+
 func writeGuestBytes(mem api.Memory, outPtr, outCap uint32, payload []byte) int32 {
 	if mem == nil {
 		return abiErrGeneric
@@ -269,17 +443,18 @@ func hostGetPushContext(ctx context.Context, mod api.Module, outPtr, outCap uint
 	}
 
 	wire := wirePushContext{
-		TenantID: st.pushCtx.TenantID,
-		RepoID:   st.pushCtx.RepoID,
-		OrgID:    st.pushCtx.OrgID,
-		ActorID:  st.pushCtx.ActorID,
-		Updates:  make([]wireRefUpdate, 0, len(st.pushCtx.Updates)),
+		TenantID:     st.pushCtx.TenantID,
+		RepoID:       st.pushCtx.RepoID,
+		OrgID:        st.pushCtx.OrgID,
+		ActorID:      st.pushCtx.ActorID,
+		ObjectFormat: st.pushCtx.EffectiveObjectFormat(),
+		Updates:      make([]wireRefUpdate, 0, len(st.pushCtx.Updates)),
 	}
 	for _, u := range st.pushCtx.Updates {
 		wire.Updates = append(wire.Updates, wireRefUpdate{
 			Ref:    u.Ref,
-			OldOID: encodeOIDHex(u.OldOID),
-			NewOID: encodeOIDHex(u.NewOID),
+			OldOID: u.EffectiveOldOIDHex(),
+			NewOID: u.EffectiveNewOIDHex(),
 		})
 	}
 	raw, err := json.Marshal(wire)
@@ -289,9 +464,41 @@ func hostGetPushContext(ctx context.Context, mod api.Module, outPtr, outCap uint
 	return writeGuestBytes(mod.Memory(), outPtr, outCap, raw)
 }
 
+func marshalCommitsWire(commits []CommitMeta) ([]byte, error) {
+	wire := make([]wireCommitMeta, 0, len(commits))
+	for _, c := range commits {
+		wire = append(wire, wireCommitMeta{
+			OID:       c.EffectiveOIDHex(),
+			TreeOID:   c.EffectiveTreeOIDHex(),
+			Parents:   c.EffectiveParentHexes(),
+			Author:    c.Author,
+			Committer: c.Committer,
+			Message:   c.Message,
+		})
+	}
+	return json.Marshal(wire)
+}
+
+func marshalTreeChangesWire(changes []TreeChange) ([]byte, error) {
+	wire := make([]wireTreeChange, 0, len(changes))
+	for _, ch := range changes {
+		wire = append(wire, wireTreeChange{
+			Path:    ch.Path,
+			Kind:    ch.Kind,
+			OldMode: ch.OldMode,
+			NewMode: ch.NewMode,
+			OldOID:  ch.EffectiveOldOIDHex(),
+			NewOID:  ch.EffectiveNewOIDHex(),
+			OldSize: ch.OldSize,
+			NewSize: ch.NewSize,
+		})
+	}
+	return json.Marshal(wire)
+}
+
 func hostListNewCommits(ctx context.Context, mod api.Module, oldOIDPtr, newOIDPtr, limit, outPtr, outCap uint32) int32 {
 	st, ok := stateFromContext(ctx)
-	if !ok {
+	if !ok || st.pushCtx.EffectiveObjectFormat() == ObjectFormatSHA256 {
 		return abiErrGeneric
 	}
 	mem := mod.Memory()
@@ -312,22 +519,38 @@ func hostListNewCommits(ctx context.Context, mod api.Module, oldOIDPtr, newOIDPt
 		return abiErrGeneric
 	}
 
-	wire := make([]wireCommitMeta, 0, len(commits))
-	for _, c := range commits {
-		parents := make([]string, 0, len(c.Parents))
-		for _, p := range c.Parents {
-			parents = append(parents, encodeOIDHex(p))
-		}
-		wire = append(wire, wireCommitMeta{
-			OID:       encodeOIDHex(c.OID),
-			TreeOID:   encodeOIDHex(c.TreeOID),
-			Parents:   parents,
-			Author:    c.Author,
-			Committer: c.Committer,
-			Message:   c.Message,
-		})
+	raw, err := marshalCommitsWire(commits)
+	if err != nil {
+		return abiErrGeneric
 	}
-	raw, err := json.Marshal(wire)
+	return writeGuestBytes(mem, outPtr, outCap, raw)
+}
+
+func hostListNewCommitsV2(ctx context.Context, mod api.Module, oldOIDPtr, oldOIDLen, newOIDPtr, newOIDLen, limit, outPtr, outCap uint32) int32 {
+	st, ok := stateFromContext(ctx)
+	if !ok {
+		return abiErrGeneric
+	}
+	mem := mod.Memory()
+	objFmt := st.pushCtx.EffectiveObjectFormat()
+	oldHex, ok := readFlexOID(mem, oldOIDPtr, oldOIDLen, objFmt)
+	if !ok {
+		return abiErrGeneric
+	}
+	newHex, ok := readFlexOID(mem, newOIDPtr, newOIDLen, objFmt)
+	if !ok {
+		return abiErrGeneric
+	}
+
+	commits, err := st.reader.ListNewCommitsByHex(oldHex, newHex, limit)
+	if err != nil {
+		if errors.Is(err, ErrBudgetExceeded) {
+			return abiErrBudgetExceeded
+		}
+		return abiErrGeneric
+	}
+
+	raw, err := marshalCommitsWire(commits)
 	if err != nil {
 		return abiErrGeneric
 	}
@@ -336,7 +559,7 @@ func hostListNewCommits(ctx context.Context, mod api.Module, oldOIDPtr, newOIDPt
 
 func hostDiffTree(ctx context.Context, mod api.Module, oldTreePtr, newTreePtr, limit, outPtr, outCap uint32) int32 {
 	st, ok := stateFromContext(ctx)
-	if !ok {
+	if !ok || st.pushCtx.EffectiveObjectFormat() == ObjectFormatSHA256 {
 		return abiErrGeneric
 	}
 	mem := mod.Memory()
@@ -357,20 +580,38 @@ func hostDiffTree(ctx context.Context, mod api.Module, oldTreePtr, newTreePtr, l
 		return abiErrGeneric
 	}
 
-	wire := make([]wireTreeChange, 0, len(changes))
-	for _, ch := range changes {
-		wire = append(wire, wireTreeChange{
-			Path:    ch.Path,
-			Kind:    ch.Kind,
-			OldMode: ch.OldMode,
-			NewMode: ch.NewMode,
-			OldOID:  encodeOIDHex(ch.OldOID),
-			NewOID:  encodeOIDHex(ch.NewOID),
-			OldSize: ch.OldSize,
-			NewSize: ch.NewSize,
-		})
+	raw, err := marshalTreeChangesWire(changes)
+	if err != nil {
+		return abiErrGeneric
 	}
-	raw, err := json.Marshal(wire)
+	return writeGuestBytes(mem, outPtr, outCap, raw)
+}
+
+func hostDiffTreeV2(ctx context.Context, mod api.Module, oldTreePtr, oldTreeLen, newTreePtr, newTreeLen, limit, outPtr, outCap uint32) int32 {
+	st, ok := stateFromContext(ctx)
+	if !ok {
+		return abiErrGeneric
+	}
+	mem := mod.Memory()
+	objFmt := st.pushCtx.EffectiveObjectFormat()
+	oldHex, ok := readFlexOID(mem, oldTreePtr, oldTreeLen, objFmt)
+	if !ok {
+		return abiErrGeneric
+	}
+	newHex, ok := readFlexOID(mem, newTreePtr, newTreeLen, objFmt)
+	if !ok {
+		return abiErrGeneric
+	}
+
+	changes, err := st.reader.DiffTreeByHex(ctx, oldHex, newHex, limit)
+	if err != nil {
+		if errors.Is(err, ErrBudgetExceeded) {
+			return abiErrBudgetExceeded
+		}
+		return abiErrGeneric
+	}
+
+	raw, err := marshalTreeChangesWire(changes)
 	if err != nil {
 		return abiErrGeneric
 	}
@@ -379,7 +620,7 @@ func hostDiffTree(ctx context.Context, mod api.Module, oldTreePtr, newTreePtr, l
 
 func hostReadBlobChunk(ctx context.Context, mod api.Module, blobOIDPtr uint32, offset uint64, maxBytes, outPtr, outCap uint32) int32 {
 	st, ok := stateFromContext(ctx)
-	if !ok {
+	if !ok || st.pushCtx.EffectiveObjectFormat() == ObjectFormatSHA256 {
 		return abiErrGeneric
 	}
 	mem := mod.Memory()
@@ -389,6 +630,27 @@ func hostReadBlobChunk(ctx context.Context, mod api.Module, blobOIDPtr uint32, o
 	}
 	reqBytes := min(maxBytes, outCap)
 	chunk, err := st.reader.ReadBlobChunk(blobOID, offset, reqBytes)
+	if err != nil {
+		if errors.Is(err, ErrBudgetExceeded) {
+			return abiErrBudgetExceeded
+		}
+		return abiErrGeneric
+	}
+	return writeGuestBytes(mem, outPtr, outCap, chunk)
+}
+
+func hostReadBlobChunkV2(ctx context.Context, mod api.Module, blobOIDPtr, blobOIDLen uint32, offset uint64, maxBytes, outPtr, outCap uint32) int32 {
+	st, ok := stateFromContext(ctx)
+	if !ok {
+		return abiErrGeneric
+	}
+	mem := mod.Memory()
+	blobHex, ok := readFlexOID(mem, blobOIDPtr, blobOIDLen, st.pushCtx.EffectiveObjectFormat())
+	if !ok {
+		return abiErrGeneric
+	}
+	reqBytes := min(maxBytes, outCap)
+	chunk, err := st.reader.ReadBlobChunkByHex(blobHex, offset, reqBytes)
 	if err != nil {
 		if errors.Is(err, ErrBudgetExceeded) {
 			return abiErrBudgetExceeded

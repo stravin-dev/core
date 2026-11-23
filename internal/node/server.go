@@ -289,6 +289,7 @@ func (s *Server) serveAdvertiseRefs(ctx context.Context, repoKey tenant.RepoKey,
 	payload := AdvertiseRefs(refs, repoMeta.DefaultBranch, AdvertiseOptions{
 		IncludeServiceHeader: boolHeader(ctx, HeaderSmartHTTPServiceHeader),
 		ServiceName:          string(rpc.OpUploadPack),
+		ObjectFormat:         repoMeta.EffectiveObjectFormat(),
 	})
 
 	if len(payload) > 0 {

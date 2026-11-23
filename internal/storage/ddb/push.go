@@ -51,12 +51,12 @@ type RefUpdate struct {
 
 // IsCreate reports whether this update creates a brand-new reference.
 func (u RefUpdate) IsCreate() bool {
-	return u.OldOID == "" || u.OldOID == ZeroOID
+	return u.OldOID == "" || IsZeroOID(u.OldOID)
 }
 
 // IsDelete reports whether this update deletes an existing reference.
 func (u RefUpdate) IsDelete() bool {
-	return u.NewOID == ZeroOID
+	return IsZeroOID(u.NewOID)
 }
 
 // PackUpload describes the S3-persisted packfile recorded alongside a push.
@@ -74,6 +74,7 @@ type CommitPushInput struct {
 	Epoch          lease.Epoch
 	OriginRegion   lease.Region
 	TraceParent    string
+	ObjectFormat   ObjectFormat
 	Updates        []RefUpdate
 	Pack           *PackUpload
 }
@@ -114,9 +115,13 @@ func BuildPushTransaction(in CommitPushInput, ulid string, now time.Time, tableN
 			return nil, nil, err
 		}
 
+		zeroOID := ZeroOIDForFormat(in.ObjectFormat)
+		if in.ObjectFormat == "" && len(u.NewOID) == 64 {
+			zeroOID = ZeroOIDSHA256
+		}
 		oldOID := u.OldOID
 		if oldOID == "" {
-			oldOID = ZeroOID
+			oldOID = zeroOID
 		}
 
 		refIndex[len(items)] = u.RefName
@@ -138,7 +143,7 @@ func BuildPushTransaction(in CommitPushInput, ulid string, now time.Time, tableN
 				AttrSK:          attrS(rsKey.SK),
 				"ref_name":      attrS(u.RefName),
 				"oid":           attrS(u.NewOID),
-				"prev_oid":      attrS(ZeroOID),
+				"prev_oid":      attrS(zeroOID),
 				"pack_id":       attrS(packID),
 				"updated_at":    attrS(nowStr),
 				"epoch":         attrNUint64(uint64(in.Epoch)),
@@ -252,6 +257,10 @@ func validateCommitPushInput(in CommitPushInput, ulid, tableName string) error {
 		return fmt.Errorf("%w: got %d refs (max %d)", ErrTooManyRefs, len(in.Updates), MaxAtomicPushRefs)
 	}
 
+	if err := ValidateObjectFormat(in.ObjectFormat); err != nil {
+		return err
+	}
+
 	seen := make(map[string]struct{}, len(in.Updates))
 	for _, u := range in.Updates {
 		if err := validateNonEmpty("ref_name", u.RefName); err != nil {
@@ -262,13 +271,23 @@ func validateCommitPushInput(in CommitPushInput, ulid, tableName string) error {
 		}
 		seen[u.RefName] = struct{}{}
 
+		validate := ValidateOID
+		if in.ObjectFormat != "" {
+			validate = func(oid string) error {
+				return ValidateOIDForFormat(oid, in.ObjectFormat)
+			}
+		}
+
 		if u.OldOID != "" {
-			if err := ValidateOID(u.OldOID); err != nil {
+			if err := validate(u.OldOID); err != nil {
 				return fmt.Errorf("old_oid for %s: %w", u.RefName, err)
 			}
 		}
-		if err := ValidateOID(u.NewOID); err != nil {
+		if err := validate(u.NewOID); err != nil {
 			return fmt.Errorf("new_oid for %s: %w", u.RefName, err)
+		}
+		if u.OldOID != "" && len(u.OldOID) != len(u.NewOID) {
+			return fmt.Errorf("%w: mismatched old_oid/new_oid lengths (%d vs %d) for %s", ErrInvalidOID, len(u.OldOID), len(u.NewOID), u.RefName)
 		}
 		if u.IsCreate() && u.IsDelete() {
 			return fmt.Errorf("%w: ref %q has both zero old_oid and zero new_oid", ErrInvalidInput, u.RefName)

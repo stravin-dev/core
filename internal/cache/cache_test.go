@@ -67,7 +67,7 @@ func buildTestRawPack(t *testing.T, entries []testPackEntry) []byte {
 		buf.WriteByte(b)
 
 		if e.typ == pack.ObjRefDelta {
-			buf.Write(e.refBase[:])
+			buf.Write(e.refBase.Bytes())
 		}
 
 		zw := zlib.NewWriter(&buf)

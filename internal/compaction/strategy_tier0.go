@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
-	"crypto/sha1" //nolint:gosec // Git packfile v2 trailer requires SHA-1 per Git specification
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -46,6 +45,8 @@ func (s *Tier0Strategy) Compact(ctx context.Context, req StrategyRequest) (Strat
 		return StrategyResult{}, ErrNothingToCompact
 	}
 
+	algo := pack.DefaultHashAlgorithm(req.HashAlgorithm)
+
 	objects := make(map[pack.OID]*pack.Object)
 	for _, in := range req.Inputs {
 		if err := ctx.Err(); err != nil {
@@ -56,8 +57,9 @@ func (s *Tier0Strategy) Compact(ctx context.Context, req StrategyRequest) (Strat
 			return StrategyResult{}, fmt.Errorf("compaction tier0: get pack %s: %w", in.PackID, err)
 		}
 		parsed, err := pack.Parse(bytes.NewReader(rawPack), pack.ParseOptions{
-			Limits:       s.limits,
-			BaseResolver: mapObjectResolver(objects),
+			Limits:        s.limits,
+			HashAlgorithm: algo,
+			BaseResolver:  mapObjectResolver(objects),
 		})
 		if err != nil {
 			return StrategyResult{}, fmt.Errorf("compaction tier0: parse pack %s: %w", in.PackID, err)
@@ -69,13 +71,14 @@ func (s *Tier0Strategy) Compact(ctx context.Context, req StrategyRequest) (Strat
 		}
 	}
 
-	mergedPack, err := buildConsolidatedPack(objects)
+	mergedPack, err := buildConsolidatedPack(objects, algo)
 	if err != nil {
 		return StrategyResult{}, fmt.Errorf("compaction tier0: build merged pack: %w", err)
 	}
 
 	parsedMerged, err := pack.Parse(bytes.NewReader(mergedPack), pack.ParseOptions{
-		Limits: s.limits,
+		Limits:        s.limits,
+		HashAlgorithm: algo,
 	})
 	if err != nil {
 		return StrategyResult{}, fmt.Errorf("compaction tier0: verify merged pack: %w", err)
@@ -108,14 +111,15 @@ func (m mapObjectResolver) ResolveBase(oid pack.OID) (pack.ObjectType, []byte, e
 }
 
 // buildConsolidatedPack serializes a deterministic Git packfile v2 containing
-// all deduplicated base objects sorted by OID.
-func buildConsolidatedPack(objects map[pack.OID]*pack.Object) ([]byte, error) {
+// all deduplicated base objects sorted by OID, using algo for the pack trailer checksum.
+func buildConsolidatedPack(objects map[pack.OID]*pack.Object, algo pack.HashAlgorithm) ([]byte, error) {
+	algo = pack.DefaultHashAlgorithm(algo)
 	oids := make([]pack.OID, 0, len(objects))
 	for oid := range objects {
 		oids = append(oids, oid)
 	}
 	sort.Slice(oids, func(i, j int) bool {
-		return bytes.Compare(oids[i][:], oids[j][:]) < 0
+		return oids[i].Compare(oids[j]) < 0
 	})
 
 	var buf bytes.Buffer
@@ -130,8 +134,8 @@ func buildConsolidatedPack(objects map[pack.OID]*pack.Object) ([]byte, error) {
 		}
 	}
 
-	sum := sha1.Sum(buf.Bytes()) //nolint:gosec // Git packfile v2 trailer requires SHA-1
-	buf.Write(sum[:])
+	sum := algo.Sum(buf.Bytes())
+	buf.Write(sum.Bytes())
 	return buf.Bytes(), nil
 }
 

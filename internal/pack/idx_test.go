@@ -75,8 +75,7 @@ func TestIdxBuilderRoundTripAndGitVerifyPack(t *testing.T) {
 }
 
 func TestIdxLarge64BitOffsets(t *testing.T) {
-	var packSum OID
-	packSum[0] = 0xaa
+	packSum := OIDFromSHA1([20]byte{0xaa})
 
 	oidSmall := ComputeOID(ObjBlob, []byte("small"))
 	oidLarge := ComputeOID(ObjBlob, []byte("large"))

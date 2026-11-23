@@ -166,6 +166,9 @@ func (m *Materializer) SyncAndPin(ctx context.Context, repo tenant.RepoKey) (Syn
 		fetchedCount = fetched
 		cachedCount = cached
 
+		if err := ensureBareRepoObjectFormat(repoPath, meta.EffectiveObjectFormat()); err != nil {
+			return fmt.Errorf("node: configure object format %s: %w", repo, err)
+		}
 		if err := materializeDisposableRefs(repoPath, refs, meta.DefaultBranch); err != nil {
 			return fmt.Errorf("node: materialize disposable refs %s: %w", repo, err)
 		}
@@ -419,6 +422,21 @@ func (m *Materializer) fetchPackPair(ctx context.Context, repo tenant.RepoKey, p
 		return nil, nil, idxErr
 	}
 	return packData, idxData, nil
+}
+
+// ensureBareRepoObjectFormat ensures the disposable bare repo's git config
+// declares extensions.objectformat = sha256 for SHA-256 repositories.
+func ensureBareRepoObjectFormat(repoPath string, format ddb.ObjectFormat) error {
+	if ddb.NormalizeObjectFormat(format) != ddb.ObjectFormatSHA256 {
+		return nil
+	}
+	cfgPath := filepath.Join(repoPath, "config")
+	existing, err := os.ReadFile(cfgPath) //nolint:gosec // path is derived from cache RepoPath
+	if err == nil && strings.Contains(string(existing), "objectformat = sha256") {
+		return nil
+	}
+	cfg := "[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = true\n[extensions]\n\tobjectformat = sha256\n"
+	return writeFileAtomicLocal(cfgPath, []byte(cfg))
 }
 
 // materializeDisposableRefs overwrites the bare repo's local refs/ and HEAD

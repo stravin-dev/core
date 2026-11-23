@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"stravin.dev/core/internal/lease"
+	"stravin.dev/core/internal/pack"
 	"stravin.dev/core/internal/storage/ddb"
 	"stravin.dev/core/internal/storage/s3"
 	"stravin.dev/core/internal/tenant"
@@ -44,6 +45,7 @@ type ShardTarget struct {
 	OriginRegion   lease.Region
 	Tier           Tier
 	Epoch          string
+	ObjectFormat   ddb.ObjectFormat
 }
 
 // JobResult summarizes the outcome of a single shard compaction run.
@@ -121,12 +123,13 @@ type PackObjectStore interface {
 
 // StrategyRequest passes inputs to a CompactionStrategy implementation.
 type StrategyRequest struct {
-	Repo         tenant.RepoKey
-	Shard        int
-	Epoch        string
-	OriginRegion lease.Region
-	Inputs       []ddb.PackManifest
-	Refs         []ddb.RefState
+	Repo          tenant.RepoKey
+	Shard         int
+	Epoch         string
+	OriginRegion  lease.Region
+	HashAlgorithm pack.HashAlgorithm
+	Inputs        []ddb.PackManifest
+	Refs          []ddb.RefState
 }
 
 // StrategyResult reports the S3 artifacts produced by a CompactionStrategy.

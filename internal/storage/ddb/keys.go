@@ -28,12 +28,58 @@ const (
 	// DynamoDB's 100-item TransactWriteItems limit (45*2 RS+RH + 1 MS = 91).
 	MaxAtomicPushRefs = 45
 
-	// ZeroOID is Git's 40-zero null object ID used for branch creation/deletion.
+	// ZeroOID is Git's 40-zero null SHA-1 object ID used for branch creation/deletion.
 	ZeroOID = "0000000000000000000000000000000000000000"
+
+	// ZeroOIDSHA256 is Git's 64-zero null SHA-256 object ID used for branch creation/deletion.
+	ZeroOIDSHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
 
 	// RefHistoryTTL is the automatic DynamoDB TTL retention window for Ref History outbox items.
 	RefHistoryTTL = 7 * 24 * time.Hour
 )
+
+// ObjectFormat identifies the Git object hash format of a repository ("sha1" or "sha256").
+type ObjectFormat string
+
+const (
+	// ObjectFormatSHA1 is the default 20-byte / 40-hex Git SHA-1 object format.
+	ObjectFormatSHA1 ObjectFormat = "sha1"
+	// ObjectFormatSHA256 is the 32-byte / 64-hex Git SHA-256 object format.
+	ObjectFormatSHA256 ObjectFormat = "sha256"
+)
+
+// NormalizeObjectFormat returns ObjectFormatSHA1 when format is empty, otherwise
+// the lowercase trimmed ObjectFormat.
+func NormalizeObjectFormat(format ObjectFormat) ObjectFormat {
+	norm := ObjectFormat(strings.ToLower(strings.TrimSpace(string(format))))
+	if norm == "" {
+		return ObjectFormatSHA1
+	}
+	return norm
+}
+
+// ValidateObjectFormat checks that format is empty (default sha1), "sha1", or "sha256".
+func ValidateObjectFormat(format ObjectFormat) error {
+	switch NormalizeObjectFormat(format) {
+	case ObjectFormatSHA1, ObjectFormatSHA256:
+		return nil
+	default:
+		return fmt.Errorf("%w: invalid object_format %q (want sha1 or sha256)", ErrInvalidInput, format)
+	}
+}
+
+// ZeroOIDForFormat returns Git's all-zero null OID for format (40 zeros for sha1, 64 zeros for sha256).
+func ZeroOIDForFormat(format ObjectFormat) string {
+	if NormalizeObjectFormat(format) == ObjectFormatSHA256 {
+		return ZeroOIDSHA256
+	}
+	return ZeroOID
+}
+
+// IsZeroOID reports whether oid is Git's all-zero null OID for either SHA-1 or SHA-256.
+func IsZeroOID(oid string) bool {
+	return oid == ZeroOID || oid == ZeroOIDSHA256
+}
 
 // Key holds the single-table DynamoDB primary key (PK, SK).
 type Key struct {
@@ -239,11 +285,32 @@ func StreamCheckpointKey(shardID string) (Key, error) {
 	return Key{PK: "STREAMS#CHECKPOINT", SK: "SHARD#" + shardID}, nil
 }
 
-// ValidateOID verifies that oid is a 40-character lowercase hex Git object ID.
+// ValidateOID verifies that oid is a 40-character (SHA-1) or 64-character (SHA-256)
+// lowercase hex Git object ID.
 func ValidateOID(oid string) error {
-	if len(oid) != 40 {
+	if len(oid) != 40 && len(oid) != 64 {
 		return fmt.Errorf("%w: length=%d", ErrInvalidOID, len(oid))
 	}
+	return validateLowerHex(oid)
+}
+
+// ValidateOIDForFormat verifies that oid is a lowercase hex Git object ID matching format
+// (40 hex chars for sha1/empty, 64 hex chars for sha256).
+func ValidateOIDForFormat(oid string, format ObjectFormat) error {
+	if err := ValidateObjectFormat(format); err != nil {
+		return err
+	}
+	wantLen := 40
+	if NormalizeObjectFormat(format) == ObjectFormatSHA256 {
+		wantLen = 64
+	}
+	if len(oid) != wantLen {
+		return fmt.Errorf("%w: length=%d (want %d for %s)", ErrInvalidOID, len(oid), wantLen, NormalizeObjectFormat(format))
+	}
+	return validateLowerHex(oid)
+}
+
+func validateLowerHex(oid string) error {
 	for i := 0; i < len(oid); i++ {
 		c := oid[i]
 		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {

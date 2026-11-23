@@ -22,6 +22,13 @@ type RepoMeta struct {
 	ManifestShards int
 	WriteState     lease.Mode
 	DefaultBranch  string
+	ObjectFormat   ObjectFormat
+}
+
+// EffectiveObjectFormat returns the repository's object format, defaulting to sha1
+// when omitted for backward compatibility with existing DynamoDB META records.
+func (m RepoMeta) EffectiveObjectFormat() ObjectFormat {
+	return NormalizeObjectFormat(m.ObjectFormat)
 }
 
 // Validate checks all required META fields and shard bounds.
@@ -39,6 +46,9 @@ func (m RepoMeta) Validate() error {
 		return err
 	}
 	if err := ValidateManifestShards(m.ManifestShards); err != nil {
+		return err
+	}
+	if err := ValidateObjectFormat(m.ObjectFormat); err != nil {
 		return err
 	}
 	switch m.WriteState {
@@ -121,6 +131,10 @@ func (r *Repository) UpdateMeta(ctx context.Context, meta RepoMeta, expectedEpoc
 		expr += ", default_branch = :default_branch"
 		values[":default_branch"] = attrS(meta.DefaultBranch)
 	}
+	if meta.ObjectFormat != "" {
+		expr += ", object_format = :object_format"
+		values[":object_format"] = attrS(string(meta.EffectiveObjectFormat()))
+	}
 
 	_, err = r.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(r.tableName),
@@ -149,6 +163,7 @@ func marshalRepoMeta(key Key, meta RepoMeta) map[string]types.AttributeValue {
 		"ref_shards":      attrNInt(meta.RefShards),
 		"manifest_shards": attrNInt(meta.ManifestShards),
 		"write_state":     attrS(string(meta.WriteState)),
+		"object_format":   attrS(string(meta.EffectiveObjectFormat())),
 	}
 	if meta.DefaultBranch != "" {
 		item["default_branch"] = attrS(meta.DefaultBranch)
@@ -169,6 +184,7 @@ func unmarshalRepoMeta(repo tenant.RepoKey, item map[string]types.AttributeValue
 	if err != nil {
 		return RepoMeta{}, err
 	}
+	objFormat := NormalizeObjectFormat(ObjectFormat(getString(item, "object_format")))
 	return RepoMeta{
 		Repo:           repo,
 		HomeRegion:     lease.Region(getString(item, "home_region")),
@@ -177,5 +193,6 @@ func unmarshalRepoMeta(repo tenant.RepoKey, item map[string]types.AttributeValue
 		ManifestShards: manifestShards,
 		WriteState:     lease.Mode(getString(item, "write_state")),
 		DefaultBranch:  getString(item, "default_branch"),
+		ObjectFormat:   objFormat,
 	}, nil
 }

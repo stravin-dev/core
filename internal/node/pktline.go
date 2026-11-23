@@ -71,6 +71,8 @@ type AdvertiseOptions struct {
 	ServiceName string
 	// Agent overrides the Git agent capability string.
 	Agent string
+	// ObjectFormat specifies the repository's Git object hash format (defaults to sha1).
+	ObjectFormat ddb.ObjectFormat
 }
 
 // AdvertiseRefs encodes a standard Git protocol v1 pkt-line ref advertisement
@@ -110,15 +112,16 @@ func AdvertiseRefs(refs []ddb.RefState, defaultBranch string, opts AdvertiseOpti
 	})
 
 	isReceivePack := serviceName == receiveServiceName
+	objFormat := ddb.NormalizeObjectFormat(opts.ObjectFormat)
 	var caps string
 	if isReceivePack {
-		caps = receivePackCapabilities(agent)
+		caps = receivePackCapabilities(agent, objFormat)
 	} else {
-		caps = uploadPackCapabilities(agent, headOID != "", defaultBranch)
+		caps = uploadPackCapabilities(agent, headOID != "", defaultBranch, objFormat)
 	}
 
 	if len(sorted) == 0 {
-		line := fmt.Sprintf("%s capabilities^{}\x00%s\n", ddb.ZeroOID, caps)
+		line := fmt.Sprintf("%s capabilities^{}\x00%s\n", ddb.ZeroOIDForFormat(objFormat), caps)
 		buf.Write(EncodePktLine([]byte(line)))
 		buf.Write(FlushPkt)
 		return buf.Bytes()
@@ -146,15 +149,18 @@ func AdvertiseRefs(refs []ddb.RefState, defaultBranch string, opts AdvertiseOpti
 	return buf.Bytes()
 }
 
-func receivePackCapabilities(agent string) string {
+func receivePackCapabilities(agent string, objFormat ddb.ObjectFormat) string {
 	caps := []string{
 		"report-status",
 		"delete-refs",
 		"side-band-64k",
 		"ofs-delta",
 		"atomic",
-		"agent=" + agent,
 	}
+	if objFormat == ddb.ObjectFormatSHA256 {
+		caps = append(caps, "object-format=sha256")
+	}
+	caps = append(caps, "agent="+agent)
 	return strings.Join(caps, " ")
 }
 
@@ -284,7 +290,7 @@ func ParseReceiveCommands(r io.Reader) ([]ddb.RefUpdate, map[string]bool, error)
 	}
 }
 
-func uploadPackCapabilities(agent string, hasHEAD bool, defaultBranch string) string {
+func uploadPackCapabilities(agent string, hasHEAD bool, defaultBranch string, objFormat ddb.ObjectFormat) string {
 	caps := []string{
 		"multi_ack",
 		"thin-pack",
@@ -301,6 +307,9 @@ func uploadPackCapabilities(agent string, hasHEAD bool, defaultBranch string) st
 		"allow-tip-sha1-in-want",
 		"allow-reachable-sha1-in-want",
 		"no-done",
+	}
+	if objFormat == ddb.ObjectFormatSHA256 {
+		caps = append(caps, "object-format=sha256")
 	}
 	if hasHEAD {
 		caps = append(caps, "symref=HEAD:"+defaultBranch)

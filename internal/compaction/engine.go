@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"stravin.dev/core/internal/lease"
+	"stravin.dev/core/internal/pack"
 	"stravin.dev/core/internal/storage/ddb"
 	"stravin.dev/core/internal/telemetry"
 )
@@ -154,6 +155,10 @@ func (e *Engine) CompactShard(ctx context.Context, target ShardTarget) (JobResul
 	if err := ddb.ValidateManifestShards(target.ManifestShards); err != nil {
 		return JobResult{}, err
 	}
+	hashAlgo, err := pack.HashAlgorithmForFormat(string(target.ObjectFormat))
+	if err != nil {
+		return JobResult{}, err
+	}
 
 	spanCtx, rootSpan := e.metrics.Tracer().Start(ctx, "pack.compact.shard",
 		trace.WithAttributes(
@@ -249,12 +254,13 @@ func (e *Engine) CompactShard(ctx context.Context, target ShardTarget) (JobResul
 	}
 
 	stratRes, err := strategy.Compact(leaseCtx, StrategyRequest{
-		Repo:         target.Repo,
-		Shard:        target.Shard,
-		Epoch:        target.Epoch,
-		OriginRegion: originRegion,
-		Inputs:       activePacks,
-		Refs:         refs,
+		Repo:          target.Repo,
+		Shard:         target.Shard,
+		Epoch:         target.Epoch,
+		OriginRegion:  originRegion,
+		HashAlgorithm: hashAlgo,
+		Inputs:        activePacks,
+		Refs:          refs,
 	})
 	if err != nil {
 		e.metrics.recordCompactionCycle(spanCtx, target.Tier, "error", e.clock.Now().Sub(start))

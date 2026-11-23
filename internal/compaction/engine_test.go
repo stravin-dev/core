@@ -25,7 +25,7 @@ func buildTestGitPack(t *testing.T, objs ...pack.Object) ([]byte, []byte, string
 		o.OID = pack.ComputeOID(o.Type, o.Data)
 		objMap[o.OID] = &o
 	}
-	packBytes, err := buildConsolidatedPack(objMap)
+	packBytes, err := buildConsolidatedPack(objMap, pack.SHA1)
 	if err != nil {
 		t.Fatalf("buildConsolidatedPack: %v", err)
 	}
@@ -47,7 +47,7 @@ func buildCommitTreeBlob(t *testing.T, filename, content, msg string, parent *pa
 
 	var treeBuf bytes.Buffer
 	fmt.Fprintf(&treeBuf, "100644 %s\x00", filename)
-	treeBuf.Write(blobOID[:])
+	treeBuf.Write(blobOID.Bytes())
 	treeData := treeBuf.Bytes()
 	treeOID := pack.ComputeOID(pack.ObjTree, treeData)
 

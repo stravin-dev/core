@@ -66,7 +66,7 @@ func run(ctx context.Context, args []string, factory serviceFactory, stdout, std
 
 func printUsage(w io.Writer) {
 	_, _ = fmt.Fprintln(w, "Usage:")
-	_, _ = fmt.Fprintln(w, "  stravin-admin repo create    --tenant <t> --repo <r> [--region us-east-1] [--ref-shards 1] [--manifest-shards 1] [--default-branch refs/heads/main] [--idempotent]")
+	_, _ = fmt.Fprintln(w, "  stravin-admin repo create    --tenant <t> --repo <r> [--region us-east-1] [--ref-shards 1] [--manifest-shards 1] [--default-branch refs/heads/main] [--object-format sha1|sha256] [--idempotent]")
 	_, _ = fmt.Fprintln(w, "  stravin-admin hook put       --tenant <t> --repo <r> --hook-id <id> --wasm <file.wasm> [--ref-glob refs/heads/*] [--timeout-ms 500] [--memory-mb 64] [--fail-mode closed] [--append]")
 	_, _ = fmt.Fprintln(w, "  stravin-admin webhook put    --tenant <t> --repo <r> --webhook-id <id> --url <url> --secret <secret> [--ref-glob refs/heads/*] [--kms-key-id alias/stravin-local-dev] [--max-attempts 3] [--append]")
 }
@@ -82,6 +82,7 @@ func runRepoCreate(ctx context.Context, args []string, factory serviceFactory, s
 	refShards := fs.Int("ref-shards", 1, "number of ref shards")
 	manifestShards := fs.Int("manifest-shards", 1, "number of manifest shards")
 	defaultBranch := fs.String("default-branch", "refs/heads/main", "default branch ref")
+	objectFormat := fs.String("object-format", string(ddb.ObjectFormatSHA1), "Git object hash format (sha1 or sha256)")
 	idempotent := fs.Bool("idempotent", false, "succeed if repo already exists")
 
 	if err := fs.Parse(args); err != nil {
@@ -99,6 +100,7 @@ func runRepoCreate(ctx context.Context, args []string, factory serviceFactory, s
 		RefShards:      *refShards,
 		ManifestShards: *manifestShards,
 		DefaultBranch:  *defaultBranch,
+		ObjectFormat:   ddb.ObjectFormat(*objectFormat),
 		Idempotent:     *idempotent,
 	})
 	if err != nil {

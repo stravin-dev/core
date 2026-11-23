@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
-	"crypto/sha1" //nolint:gosec // Git packfile v2 requires SHA-1 checksums per Git specification
 	"encoding/binary"
 	"fmt"
 )
@@ -15,29 +14,54 @@ type ThinPackCompleter interface {
 	Complete(ctx context.Context, thinPack []byte, resolver BaseResolver) ([]byte, error)
 }
 
-// PureGoThinCompleter implements ThinPackCompleter in pure Go by resolving external
-// REF_DELTA bases via BaseResolver and appending them as base entries before
-// updating the object count header and recomputing the SHA-1 trailer.
-type PureGoThinCompleter struct {
-	limits Limits
+// AlgorithmAwareThinPackCompleter is an optional extension of ThinPackCompleter
+// that accepts an explicit HashAlgorithm (SHA-1 or SHA-256).
+type AlgorithmAwareThinPackCompleter interface {
+	CompleteWithAlgorithm(ctx context.Context, thinPack []byte, resolver BaseResolver, algo HashAlgorithm) ([]byte, error)
 }
 
-// NewPureGoThinCompleter creates a PureGoThinCompleter with the given resource limits.
+// PureGoThinCompleter implements ThinPackCompleter and AlgorithmAwareThinPackCompleter
+// in pure Go by resolving external REF_DELTA bases via BaseResolver and appending
+// them as base entries before updating the object count header and recomputing
+// the trailing pack checksum.
+type PureGoThinCompleter struct {
+	limits Limits
+	algo   HashAlgorithm
+}
+
+var (
+	_ ThinPackCompleter               = (*PureGoThinCompleter)(nil)
+	_ AlgorithmAwareThinPackCompleter = (*PureGoThinCompleter)(nil)
+)
+
+// NewPureGoThinCompleter creates a PureGoThinCompleter with the given resource limits (defaulting to SHA-1).
 func NewPureGoThinCompleter(limits Limits) *PureGoThinCompleter {
-	return &PureGoThinCompleter{limits: limits.withDefaults()}
+	return &PureGoThinCompleter{limits: limits.withDefaults(), algo: SHA1}
+}
+
+// NewPureGoThinCompleterWithAlgorithm creates a PureGoThinCompleter with explicit limits and HashAlgorithm.
+func NewPureGoThinCompleterWithAlgorithm(limits Limits, algo HashAlgorithm) *PureGoThinCompleter {
+	return &PureGoThinCompleter{limits: limits.withDefaults(), algo: DefaultHashAlgorithm(algo)}
 }
 
 // Complete validates thinPack, resolves any missing external REF_DELTA base objects
 // using resolver, and returns a self-contained packfile v2.
 func (c *PureGoThinCompleter) Complete(ctx context.Context, thinPack []byte, resolver BaseResolver) ([]byte, error) {
+	return c.CompleteWithAlgorithm(ctx, thinPack, resolver, c.algo)
+}
+
+// CompleteWithAlgorithm validates thinPack using algo (defaulting to SHA-1), resolves
+// any missing external REF_DELTA base objects via resolver, and returns a self-contained packfile v2.
+func (c *PureGoThinCompleter) CompleteWithAlgorithm(ctx context.Context, thinPack []byte, resolver BaseResolver, algo HashAlgorithm) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return CompleteThinPack(thinPack, resolver, c.limits)
+	return CompleteThinPackWithAlgorithm(thinPack, resolver, c.limits, algo)
 }
 
 type trackingBaseResolver struct {
 	inner    BaseResolver
+	algo     HashAlgorithm
 	seen     map[OID]struct{}
 	appended []Object
 }
@@ -50,7 +74,7 @@ func (t *trackingBaseResolver) ResolveBase(oid OID) (ObjectType, []byte, error) 
 	if !typ.IsBase() {
 		return 0, nil, fmt.Errorf("base %s has non-base type %s: %w", oid, typ, ErrInvalidObjectType)
 	}
-	if ComputeOID(typ, data) != oid {
+	if ComputeOIDWith(t.algo, typ, data) != oid {
 		return 0, nil, fmt.Errorf("base %s checksum mismatch: %w", oid, ErrChecksumMismatch)
 	}
 	if _, ok := t.seen[oid]; !ok {
@@ -64,12 +88,22 @@ func (t *trackingBaseResolver) ResolveBase(oid OID) (ObjectType, []byte, error) 
 	return typ, data, nil
 }
 
-// CompleteThinPack validates thinPack, resolves any external REF_DELTA base objects
+// CompleteThinPack validates thinPack (SHA-1), resolves any external REF_DELTA base objects
 // via resolver, appends them to the pack, updates the object count header, and
 // recomputes the trailing SHA-1 checksum so the resulting pack is self-contained.
 func CompleteThinPack(thinPack []byte, resolver BaseResolver, limits Limits) ([]byte, error) {
+	return CompleteThinPackWithAlgorithm(thinPack, resolver, limits, SHA1)
+}
+
+// CompleteThinPackWithAlgorithm validates thinPack using algo (SHA-1 or SHA-256),
+// resolves external REF_DELTA bases via resolver, appends them, updates the header
+// object count, and recomputes the trailing checksum.
+func CompleteThinPackWithAlgorithm(thinPack []byte, resolver BaseResolver, limits Limits, algo HashAlgorithm) ([]byte, error) {
 	limits = limits.withDefaults()
-	rawEntries, checksum, err := parseRawEntries(bytes.NewReader(thinPack), limits)
+	algo = DefaultHashAlgorithm(algo)
+	trailerSize := algo.Size()
+
+	rawEntries, checksum, err := parseRawEntries(bytes.NewReader(thinPack), limits, algo)
 	if err != nil {
 		return nil, err
 	}
@@ -79,12 +113,13 @@ func CompleteThinPack(thinPack []byte, resolver BaseResolver, limits Limits) ([]
 	if resolver != nil {
 		tracker = &trackingBaseResolver{
 			inner: resolver,
+			algo:  algo,
 			seen:  make(map[OID]struct{}),
 		}
 		activeResolver = tracker
 	}
 
-	if _, err := resolveEntries(rawEntries, checksum, limits, activeResolver); err != nil {
+	if _, err := resolveEntries(rawEntries, checksum, limits, algo, activeResolver); err != nil {
 		return nil, err
 	}
 
@@ -99,9 +134,9 @@ func CompleteThinPack(thinPack []byte, resolver BaseResolver, limits Limits) ([]
 		return nil, fmt.Errorf("completed object count %d > max %d: %w", totalCount, limits.MaxObjects, ErrLimitExceeded)
 	}
 
-	bodyLen := len(thinPack) - packTrailerSize
+	bodyLen := len(thinPack) - trailerSize
 	var buf bytes.Buffer
-	buf.Grow(bodyLen + packTrailerSize + len(tracker.appended)*64)
+	buf.Grow(bodyLen + trailerSize + len(tracker.appended)*64)
 	buf.Write(thinPack[:bodyLen])
 
 	// Patch 4-byte big-endian object count in header.
@@ -113,12 +148,12 @@ func CompleteThinPack(thinPack []byte, resolver BaseResolver, limits Limits) ([]
 		}
 	}
 
-	if limits.MaxPackSize > 0 && int64(buf.Len()+packTrailerSize) > limits.MaxPackSize {
+	if limits.MaxPackSize > 0 && int64(buf.Len()+trailerSize) > limits.MaxPackSize {
 		return nil, fmt.Errorf("completed pack size exceeds %d bytes: %w", limits.MaxPackSize, ErrLimitExceeded)
 	}
 
-	newSum := sha1.Sum(buf.Bytes()) //nolint:gosec // Git packfile v2 trailer requires SHA-1
-	buf.Write(newSum[:])
+	newSum := algo.Sum(buf.Bytes())
+	buf.Write(newSum.Bytes())
 	return buf.Bytes(), nil
 }
 
