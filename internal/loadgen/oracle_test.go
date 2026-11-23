@@ -42,6 +42,18 @@ func TestClassifyError(t *testing.T) {
 			want: ErrorUnexpected,
 		},
 		{
+			name: "stravin-node stale old_oid on shared branch is retryable conflict",
+			err:  &GitError{Op: "push", ExitCode: 1, Stderr: "! [remote rejected]   HEAD -> agent/shared-race (stale old_oid)"},
+			opts: ClassifyOptions{ExclusiveBranch: false},
+			want: ErrorRetryableConflict,
+		},
+		{
+			name: "stravin-node stale old_oid on exclusive branch is unexpected",
+			err:  &GitError{Op: "push", ExitCode: 1, Stderr: "! [remote rejected]   HEAD -> agent/shared-race (stale old_oid)"},
+			opts: ClassifyOptions{ExclusiveBranch: true},
+			want: ErrorUnexpected,
+		},
+		{
 			name: "non-fast-forward on exclusive branch is unexpected",
 			err:  &GitError{Op: "push", ExitCode: 1, Stderr: "! [rejected] agent-1/feat -> agent-1/feat (non-fast-forward)"},
 			opts: ClassifyOptions{ExclusiveBranch: true},
