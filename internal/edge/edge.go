@@ -23,20 +23,21 @@ const defaultShutdownTimeout = 10 * time.Second
 
 // ServerConfig configures the unified stravin-edge daemon facade.
 type ServerConfig struct {
-	SSHAddr         string
-	HTTPAddr        string
-	HealthAddr      string // Optional dedicated health probe listener (e.g. ":8081").
-	ShutdownTimeout time.Duration
-	DrainDelay      time.Duration
-	Probes          *health.Registry
-	HostKey         ssh.Signer
-	Authenticator   Authenticator
-	Limiter         Limiter
-	Resolver        *Resolver
-	Router          NodeSelector
-	Proxy           *WireProxy
-	Telemetry       *telemetry.Provider
-	Logger          *slog.Logger
+	SSHAddr                  string
+	HTTPAddr                 string
+	HealthAddr               string // Optional dedicated health probe listener (e.g. ":8081").
+	MaxDecompressedBodyBytes int64
+	ShutdownTimeout          time.Duration
+	DrainDelay               time.Duration
+	Probes                   *health.Registry
+	HostKey                  ssh.Signer
+	Authenticator            Authenticator
+	Limiter                  Limiter
+	Resolver                 *Resolver
+	Router                   NodeSelector
+	Proxy                    *WireProxy
+	Telemetry                *telemetry.Provider
+	Logger                   *slog.Logger
 }
 
 // Server coordinates the SSH, Smart HTTP, and optional dedicated health listeners.
@@ -71,6 +72,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	httpHandler.SetMaxDecompressedBodyBytes(cfg.MaxDecompressedBodyBytes)
 	sshServer, err := NewSSHServer(cfg.HostKey, cfg.Authenticator, cfg.Limiter, cfg.Resolver, cfg.Router, cfg.Proxy, metrics, cfg.Logger)
 	if err != nil {
 		return nil, err

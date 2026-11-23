@@ -112,17 +112,18 @@ func run() error {
 	}
 
 	srv, err := edge.NewServer(edge.ServerConfig{
-		SSHAddr:       sshAddr,
-		HTTPAddr:      httpAddr,
-		HealthAddr:    healthAddr,
-		HostKey:       hostKey,
-		Authenticator: auth,
-		Limiter:       limiter,
-		Resolver:      resolver,
-		Router:        router,
-		Proxy:         proxy,
-		Telemetry:     telProvider,
-		Logger:        logger,
+		SSHAddr:                  sshAddr,
+		HTTPAddr:                 httpAddr,
+		HealthAddr:               healthAddr,
+		MaxDecompressedBodyBytes: envInt64OrDefault("STRAVIN_MAX_DECOMPRESSED_BODY_BYTES", edge.DefaultMaxDecompressedBodyBytes),
+		HostKey:                  hostKey,
+		Authenticator:            auth,
+		Limiter:                  limiter,
+		Resolver:                 resolver,
+		Router:                   router,
+		Proxy:                    proxy,
+		Telemetry:                telProvider,
+		Logger:                   logger,
 	})
 	if err != nil {
 		return fmt.Errorf("init edge server: %w", err)
