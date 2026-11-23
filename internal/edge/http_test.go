@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -14,9 +15,12 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	"stravin.dev/core/internal/lease"
 	"stravin.dev/core/internal/rpc"
@@ -33,9 +37,16 @@ type mockGitNode struct {
 	responseData []byte
 	errMessage   string
 	exitCode     int32
+	onHandle     func(ctx context.Context, meta rpc.RequestMeta, stream rpc.GitWireStream) error
 }
 
 func (m *mockGitNode) HandleGitWire(ctx context.Context, meta rpc.RequestMeta, stream rpc.GitWireStream) error {
+	m.mu.Lock()
+	custom := m.onHandle
+	m.mu.Unlock()
+	if custom != nil {
+		return custom(ctx, meta, stream)
+	}
 	var received bytes.Buffer
 	for {
 		frame, err := stream.Recv()
@@ -742,5 +753,270 @@ func TestHTTPHandler_GzipBombAndDecompressedByteLimit(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatal("ServeHTTP deadlocked when decompressed stream exceeded PackBytesPerMin")
 		}
+	})
+}
+
+type edgeRequestMetricKey struct {
+	statusCode string
+	errorClass string
+}
+
+func collectEdgeRequestCounts(t *testing.T, tel *telemetry.Provider) map[edgeRequestMetricKey]int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := tel.MetricReader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect OTel metrics: %v", err)
+	}
+	counts := make(map[edgeRequestMetricKey]int64)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "stravin_edge_requests_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("expected int64 sum for stravin_edge_requests_total, got %T", m.Data)
+			}
+			for _, dp := range sum.DataPoints {
+				var k edgeRequestMetricKey
+				if v, ok := dp.Attributes.Value(attribute.Key("status_code")); ok {
+					k.statusCode = v.AsString()
+				}
+				if v, ok := dp.Attributes.Value(attribute.Key("error_class")); ok {
+					k.errorClass = v.AsString()
+				}
+				counts[k] += dp.Value
+			}
+		}
+	}
+	return counts
+}
+
+func TestHTTPHandler_ClientCanceledClassifiedAs499(t *testing.T) {
+	t.Run("canceled request context before headers records 499 client_canceled", func(t *testing.T) {
+		env := newTestEdgeEnv(t, LimiterConfig{})
+		defer env.close()
+
+		started := make(chan struct{})
+		env.node.mu.Lock()
+		env.node.onHandle = func(ctx context.Context, _ rpc.RequestMeta, _ rpc.GitWireStream) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		env.node.mu.Unlock()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodPost, "/acme/core.git/git-upload-pack", strings.NewReader("want")).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer tok-acme")
+		rec := httptest.NewRecorder()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			env.handler.ServeHTTP(rec, req)
+		}()
+
+		select {
+		case <-started:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for upstream node to start")
+		}
+		cancel()
+
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("ServeHTTP did not return after client context cancellation")
+		}
+
+		if rec.Code != httpStatusClientClosedRequest {
+			t.Fatalf("HTTP status = %d, want %d", rec.Code, httpStatusClientClosedRequest)
+		}
+		counts := collectEdgeRequestCounts(t, env.tel)
+		if got := counts[edgeRequestMetricKey{statusCode: "499", errorClass: "client_canceled"}]; got != 1 {
+			t.Fatalf("expected 1 (499, client_canceled) metric, got %d (all: %+v)", got, counts)
+		}
+		if got := counts[edgeRequestMetricKey{statusCode: "502", errorClass: "upstream"}]; got != 0 {
+			t.Fatalf("expected 0 (502, upstream) metrics on client cancel, got %d", got)
+		}
+	})
+
+	t.Run("canceled request context mid-stream after headers records 499 client_canceled", func(t *testing.T) {
+		env := newTestEdgeEnv(t, LimiterConfig{})
+		defer env.close()
+
+		sentChunk := make(chan struct{})
+		env.node.mu.Lock()
+		env.node.onHandle = func(ctx context.Context, _ rpc.RequestMeta, stream rpc.GitWireStream) error {
+			if err := stream.Send(&rpc.Frame{Data: []byte("partial-pack-chunk")}); err != nil {
+				return err
+			}
+			close(sentChunk)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		env.node.mu.Unlock()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodPost, "/acme/core.git/git-upload-pack", strings.NewReader("want")).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer tok-acme")
+		rec := httptest.NewRecorder()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			env.handler.ServeHTTP(rec, req)
+		}()
+
+		select {
+		case <-sentChunk:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for initial chunk")
+		}
+		// Give the proxy goroutine a moment to flush the first chunk to the ResponseWriter.
+		cancel()
+
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("ServeHTTP did not return after mid-stream client cancellation")
+		}
+
+		counts := collectEdgeRequestCounts(t, env.tel)
+		if got := counts[edgeRequestMetricKey{statusCode: "499", errorClass: "client_canceled"}]; got != 1 {
+			t.Fatalf("expected 1 (499, client_canceled) metric, got %d (all: %+v)", got, counts)
+		}
+		if got := counts[edgeRequestMetricKey{statusCode: "502", errorClass: "upstream"}]; got != 0 {
+			t.Fatalf("expected 0 (502, upstream) metrics on mid-stream client cancel, got %d", got)
+		}
+	})
+
+	t.Run("grpc codes.Canceled from proxy records 499 client_canceled", func(t *testing.T) {
+		env := newTestEdgeEnv(t, LimiterConfig{})
+		defer env.close()
+
+		env.node.mu.Lock()
+		env.node.onHandle = func(_ context.Context, _ rpc.RequestMeta, _ rpc.GitWireStream) error {
+			return status.Error(codes.Canceled, "client aborted stream")
+		}
+		env.node.mu.Unlock()
+
+		req := httptest.NewRequest(http.MethodPost, "/acme/core.git/git-upload-pack", strings.NewReader("want"))
+		req.Header.Set("Authorization", "Bearer tok-acme")
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+
+		if rec.Code != httpStatusClientClosedRequest {
+			t.Fatalf("HTTP status = %d, want %d", rec.Code, httpStatusClientClosedRequest)
+		}
+		counts := collectEdgeRequestCounts(t, env.tel)
+		if got := counts[edgeRequestMetricKey{statusCode: "499", errorClass: "client_canceled"}]; got != 1 {
+			t.Fatalf("expected 1 (499, client_canceled) metric, got %d (all: %+v)", got, counts)
+		}
+		if got := counts[edgeRequestMetricKey{statusCode: "502", errorClass: "upstream"}]; got != 0 {
+			t.Fatalf("expected 0 (502, upstream) metrics on codes.Canceled, got %d", got)
+		}
+	})
+
+	t.Run("handleProxyError classifies direct context.Canceled and wrapped codes.Canceled", func(t *testing.T) {
+		cases := []struct {
+			name string
+			ctx  func() context.Context
+			err  error
+		}{
+			{
+				name: "direct context.Canceled",
+				ctx:  context.Background,
+				err:  fmt.Errorf("proxy read: %w", context.Canceled),
+			},
+			{
+				name: "wrapped grpc codes.Canceled",
+				ctx:  context.Background,
+				err:  fmt.Errorf("edge: open stream: %w", status.Error(codes.Canceled, "canceled")),
+			},
+			{
+				name: "canceled request ctx with generic transport error",
+				ctx: func() context.Context {
+					ctx, cancel := context.WithCancel(context.Background())
+					cancel()
+					return ctx
+				},
+				err: io.ErrUnexpectedEOF,
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				env := newTestEdgeEnv(t, LimiterConfig{})
+				defer env.close()
+
+				rec := httptest.NewRecorder()
+				sw := &smartHTTPStreamWriter{w: rec, contentType: "application/x-git-upload-pack-result"}
+				env.handler.handleProxyError(rec, tc.ctx(), sw, "fetch", tc.err, time.Now())
+
+				if rec.Code != httpStatusClientClosedRequest {
+					t.Fatalf("HTTP status = %d, want %d", rec.Code, httpStatusClientClosedRequest)
+				}
+				counts := collectEdgeRequestCounts(t, env.tel)
+				if got := counts[edgeRequestMetricKey{statusCode: "499", errorClass: "client_canceled"}]; got != 1 {
+					t.Fatalf("expected 1 (499, client_canceled) metric, got %d (all: %+v)", got, counts)
+				}
+				if got := counts[edgeRequestMetricKey{statusCode: "502", errorClass: "upstream"}]; got != 0 {
+					t.Fatalf("expected 0 (502, upstream) metrics, got %d", got)
+				}
+			})
+		}
+	})
+
+	t.Run("real upstream errors still record 502 upstream", func(t *testing.T) {
+		t.Run("grpc codes.Internal", func(t *testing.T) {
+			env := newTestEdgeEnv(t, LimiterConfig{})
+			defer env.close()
+
+			env.node.mu.Lock()
+			env.node.onHandle = func(_ context.Context, _ rpc.RequestMeta, _ rpc.GitWireStream) error {
+				return status.Error(codes.Internal, "disk failure")
+			}
+			env.node.mu.Unlock()
+
+			req := httptest.NewRequest(http.MethodPost, "/acme/core.git/git-upload-pack", strings.NewReader("want"))
+			req.Header.Set("Authorization", "Bearer tok-acme")
+			rec := httptest.NewRecorder()
+			env.handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("HTTP status = %d, want 502", rec.Code)
+			}
+			counts := collectEdgeRequestCounts(t, env.tel)
+			if got := counts[edgeRequestMetricKey{statusCode: "502", errorClass: "upstream"}]; got != 1 {
+				t.Fatalf("expected 1 (502, upstream) metric, got %d (all: %+v)", got, counts)
+			}
+			if got := counts[edgeRequestMetricKey{statusCode: "499", errorClass: "client_canceled"}]; got != 0 {
+				t.Fatalf("expected 0 (499, client_canceled) metrics, got %d", got)
+			}
+		})
+
+		t.Run("non-zero git exit code", func(t *testing.T) {
+			env := newTestEdgeEnv(t, LimiterConfig{})
+			defer env.close()
+
+			env.node.mu.Lock()
+			env.node.exitCode = 128
+			env.node.mu.Unlock()
+
+			req := httptest.NewRequest(http.MethodPost, "/acme/core.git/git-upload-pack", strings.NewReader("want"))
+			req.Header.Set("Authorization", "Bearer tok-acme")
+			rec := httptest.NewRecorder()
+			env.handler.ServeHTTP(rec, req)
+
+			counts := collectEdgeRequestCounts(t, env.tel)
+			if got := counts[edgeRequestMetricKey{statusCode: "502", errorClass: "upstream"}]; got != 1 {
+				t.Fatalf("expected 1 (502, upstream) metric on non-zero exit, got %d (all: %+v)", got, counts)
+			}
+			if got := counts[edgeRequestMetricKey{statusCode: "499", errorClass: "client_canceled"}]; got != 0 {
+				t.Fatalf("expected 0 (499, client_canceled) metrics, got %d", got)
+			}
+		})
 	})
 }
