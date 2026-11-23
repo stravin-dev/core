@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"stravin.dev/core/internal/cache"
 	"stravin.dev/core/internal/lease"
@@ -56,6 +57,17 @@ func (f *fakeMetadataStore) AddManifest(repo tenant.RepoKey, shard int, pm ddb.P
 		f.manifestsByShard[repo] = make(map[int][]ddb.PackManifest)
 	}
 	f.manifestsByShard[repo][shard] = append(f.manifestsByShard[repo][shard], pm)
+}
+
+func (f *fakeMetadataStore) SetManifestStatus(repo tenant.RepoKey, shard int, ulid string, status ddb.PackStatus) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	items := f.manifestsByShard[repo][shard]
+	for i := range items {
+		if items[i].ULID == ulid {
+			items[i].Status = status
+		}
+	}
 }
 
 func (f *fakeMetadataStore) GetMeta(_ context.Context, repo tenant.RepoKey) (ddb.RepoMeta, error) {
@@ -402,5 +414,136 @@ func TestMaterializeDisposableRefs_PrunesEmptyDirsOnRefReplacement(t *testing.T)
 	got, err := os.ReadFile(filepath.Join(repoPath, "refs", "heads", "a"))
 	if err != nil || strings.TrimSpace(string(got)) != oid2 {
 		t.Fatalf("refs/heads/a = %q (err=%v), want %s", string(got), err, oid2)
+	}
+}
+
+func TestMaterializer_PrunesSupersededPacksAfterCompaction(t *testing.T) {
+	ctx := context.Background()
+	rk, _ := tenant.NewRepoKey("acme", "compacted")
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	metaStore := newFakeMetadataStore()
+	packStore := newFakePackFetcher()
+
+	pack1 := strings.Repeat("1", 64)
+	pack2 := strings.Repeat("2", 64)
+	packMerged := strings.Repeat("3", 64)
+
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1, RefShards: 1, ManifestShards: 1, WriteState: lease.ModeActive,
+	})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FC1", PackID: pack1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FC2", PackID: pack2, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	packStore.Put(pack1, []byte("PACK-1"), []byte("IDX-1"))
+	packStore.Put(pack2, []byte("PACK-2"), []byte("IDX-2"))
+	packStore.Put(packMerged, []byte("PACK-MERGED"), []byte("IDX-MERGED"))
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:  metaStore,
+		Packs: packStore,
+		Cache: c,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+
+	res1, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(1): %v", err)
+	}
+	res1.Handle.Release()
+
+	// Simulate compaction: publish packMerged ACTIVE and supersede pack1 & pack2 to COMPACTED.
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FC3", PackID: packMerged, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	metaStore.SetManifestStatus(rk, 0, "01ARZ3NDEKTSV4RRFFQ69G5FC1", ddb.PackStatusCompacted)
+	metaStore.SetManifestStatus(rk, 0, "01ARZ3NDEKTSV4RRFFQ69G5FC2", ddb.PackStatusCompacted)
+
+	res2, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(2): %v", err)
+	}
+
+	// While pinned, superseded pack files remain on disk for in-flight git-upload-pack readers.
+	pack1Path := filepath.Join(res2.Handle.Path(), "objects", "pack", "pack-"+pack1+".pack")
+	if _, statErr := os.Stat(pack1Path); statErr != nil {
+		t.Fatalf("expected pinned pack1 to remain on disk before release, err=%v", statErr)
+	}
+	res2.Handle.Release()
+
+	// Once released, superseded packs must be unlinked and only packMerged should remain.
+	if _, statErr := os.Stat(pack1Path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("expected superseded pack1 to be unlinked after release, stat err=%v", statErr)
+	}
+	if c.HasPack(rk, pack1) || c.HasPack(rk, pack2) {
+		t.Fatalf("expected pack1 and pack2 pruned, cached=%v", c.CachedPackIDs(rk))
+	}
+	if !c.HasPack(rk, packMerged) {
+		t.Fatalf("expected packMerged to remain cached, cached=%v", c.CachedPackIDs(rk))
+	}
+}
+
+func TestMaterializer_PrunesSupersededPacksOnPeriodicReconcile(t *testing.T) {
+	ctx := context.Background()
+	rk, _ := tenant.NewRepoKey("acme", "reconcile")
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	metaStore := newFakeMetadataStore()
+	packStore := newFakePackFetcher()
+
+	pack1 := strings.Repeat("4", 64)
+	pack2 := strings.Repeat("5", 64)
+
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1, RefShards: 1, ManifestShards: 1, WriteState: lease.ModeActive,
+	})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FD1", PackID: pack1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FD2", PackID: pack2, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	packStore.Put(pack1, []byte("PACK-1"), []byte("IDX-1"))
+	packStore.Put(pack2, []byte("PACK-2"), []byte("IDX-2"))
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:                   metaStore,
+		Packs:                  packStore,
+		Cache:                  c,
+		PruneReconcileInterval: time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+
+	res1, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(1): %v", err)
+	}
+	res1.Handle.Release()
+
+	// Supersede pack1 without publishing a new pack (simulates Phase 2 finishing after an earlier sync).
+	metaStore.SetManifestStatus(rk, 0, "01ARZ3NDEKTSV4RRFFQ69G5FD1", ddb.PackStatusCompacted)
+
+	res2, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(2): %v", err)
+	}
+	res2.Handle.Release()
+
+	if c.HasPack(rk, pack1) {
+		t.Fatalf("expected pack1 pruned on periodic reconcile, cached=%v", c.CachedPackIDs(rk))
+	}
+	if !c.HasPack(rk, pack2) {
+		t.Fatalf("expected pack2 to remain cached, cached=%v", c.CachedPackIDs(rk))
 	}
 }

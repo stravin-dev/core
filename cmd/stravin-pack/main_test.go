@@ -57,6 +57,34 @@ func TestLoadConfig_CRRReplicationGateDefaultsAndOverrides(t *testing.T) {
 	})
 }
 
+func TestLoadConfig_Tier0DefaultsAndOverrides(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		t.Setenv("STRAVIN_PACK_MIN_PACKS_TIER0", "")
+		t.Setenv("STRAVIN_PACK_MAX_TIER0_PACK_BYTES", "")
+
+		cfg := loadConfig()
+		if cfg.MinPacksTier0 != defaultMinPacksTier0 {
+			t.Fatalf("MinPacksTier0 = %d, want %d", cfg.MinPacksTier0, defaultMinPacksTier0)
+		}
+		if cfg.MaxTier0PackBytes != compaction.DefaultMaxTier0PackBytes {
+			t.Fatalf("MaxTier0PackBytes = %d, want %d", cfg.MaxTier0PackBytes, compaction.DefaultMaxTier0PackBytes)
+		}
+	})
+
+	t.Run("overrides", func(t *testing.T) {
+		t.Setenv("STRAVIN_PACK_MIN_PACKS_TIER0", "24")
+		t.Setenv("STRAVIN_PACK_MAX_TIER0_PACK_BYTES", "8388608")
+
+		cfg := loadConfig()
+		if cfg.MinPacksTier0 != 24 {
+			t.Fatalf("MinPacksTier0 = %d, want 24", cfg.MinPacksTier0)
+		}
+		if cfg.MaxTier0PackBytes != 8388608 {
+			t.Fatalf("MaxTier0PackBytes = %d, want 8388608", cfg.MaxTier0PackBytes)
+		}
+	})
+}
+
 func TestLoadConfigGitExecDefaults(t *testing.T) {
 	t.Setenv("STRAVIN_GITEXEC_ENABLE_NAMESPACES", "")
 	t.Setenv("STRAVIN_GITEXEC_ENABLE_CGROUP", "")
