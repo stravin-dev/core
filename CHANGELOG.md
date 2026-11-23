@@ -1,3 +1,13 @@
+## [1.2.1](https://github.com/stravin-dev/core/compare/v1.2.0...v1.2.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* **edge:** classify client disconnects as HTTP 499 client_canceled ([ba59700](https://github.com/stravin-dev/core/commit/ba59700de011d06734c49413518e304e4aaa3ed5))
+* **edge:** classify client disconnects as HTTP 499 client_canceled ([#113](https://github.com/stravin-dev/core/issues/113)) ([3bae825](https://github.com/stravin-dev/core/commit/3bae825eb16efe057e91d9e590f0c14dc10eb772))
+* **gitexec:** enable uploadpack.allowReachableSHA1InWant ([287d9f5](https://github.com/stravin-dev/core/commit/287d9f562b0d4aebea37705f32b7b0e27a645bc7))
+* **gitexec:** enable uploadpack.allowReachableSHA1InWant ([#110](https://github.com/stravin-dev/core/issues/110)) ([#112](https://github.com/stravin-dev/core/issues/112)) [skip ci] ([655d501](https://github.com/stravin-dev/core/commit/655d501a91601ff5a3d4b261bf191d0e94da78e6))
+
 # [1.2.0](https://github.com/stravin-dev/core/compare/v1.1.1...v1.2.0) (2026-11-23)
 
 
