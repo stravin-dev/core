@@ -1,3 +1,11 @@
+## [1.8.1](https://github.com/stravin-dev/core/compare/v1.8.0...v1.8.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* **node,cache:** build MIDX/bitmap via --stdin-packs and run refreshAuxIndexes asynchronously ([ca98647](https://github.com/stravin-dev/core/commit/ca98647c19fd20851a32b4b93ff609dbd326946a))
+* **node,cache:** build MIDX/bitmap via --stdin-packs and run refreshAuxIndexes asynchronously ([#142](https://github.com/stravin-dev/core/issues/142)) ([be26232](https://github.com/stravin-dev/core/commit/be26232c6eeaf747321f9fdcf91eca6927ff10ed))
+
 # [1.8.0](https://github.com/stravin-dev/core/compare/v1.7.2...v1.8.0) (2026-11-23)
 
 
