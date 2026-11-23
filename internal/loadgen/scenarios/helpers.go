@@ -61,7 +61,7 @@ func ensureBaseCommit(ctx context.Context, env *loadgen.ScenarioEnv, scenario st
 	if _, err := g.Run(ctx, "checkout", "-B", "main"); err != nil {
 		return err
 	}
-	if err := g.WriteFile("README.md", ent.TextPayload(4)); err != nil {
+	if err := g.WriteFile("README.md", ent.WeightedPayload()); err != nil {
 		return err
 	}
 	if err := g.AddAll(ctx); err != nil {
