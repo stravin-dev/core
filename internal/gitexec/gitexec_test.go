@@ -178,6 +178,83 @@ func TestExecUploadPackAdvertiseRefsRealGit(t *testing.T) {
 	}
 }
 
+func TestExecUploadPackPassesAllowReachableSHA1InWantBeforeSubcommand(t *testing.T) {
+	helperPath := filepath.Join(t.TempDir(), "dump-args.sh")
+	script := "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n"
+	if err := os.WriteFile(helperPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write helper script: %v", err)
+	}
+
+	repoDir := t.TempDir()
+	var stdout bytes.Buffer
+	execImpl := NewSubprocessExecutor(Config{
+		GitBinary: helperPath,
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	err := execImpl.ExecUploadPack(context.Background(), UploadPackRequest{
+		RepoDir:      repoDir,
+		StatelessRPC: true,
+		Stdout:       &stdout,
+	})
+	if err != nil {
+		t.Fatalf("ExecUploadPack with arg-dump helper failed: %v", err)
+	}
+
+	args := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
+	flagIdx := -1
+	subcmdIdx := -1
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-c" && i+1 < len(args) && args[i+1] == "uploadpack.allowReachableSHA1InWant=true" {
+			flagIdx = i
+		}
+		if args[i] == "upload-pack" && subcmdIdx == -1 {
+			subcmdIdx = i
+		}
+	}
+	if flagIdx == -1 {
+		t.Fatalf("expected -c uploadpack.allowReachableSHA1InWant=true in args: %v", args)
+	}
+	if subcmdIdx == -1 {
+		t.Fatalf("expected upload-pack subcommand in args: %v", args)
+	}
+	if flagIdx >= subcmdIdx {
+		t.Fatalf("expected -c uploadpack.allowReachableSHA1InWant=true (idx %d) before upload-pack (idx %d): %v", flagIdx, subcmdIdx, args)
+	}
+}
+
+func TestExecUploadPackAllowsReachableNonTipSHA1RealGit(t *testing.T) {
+	requireGit(t)
+	bareDir, commits := createBareRepoWithCommits(t, 2)
+	firstCommitSHA, tipCommitSHA := commits[0], commits[1]
+	if firstCommitSHA == tipCommitSHA {
+		t.Fatalf("expected distinct commit SHAs, both were %s", firstCommitSHA)
+	}
+
+	// Simulate a Smart HTTP client requesting a recently-superseded but still
+	// reachable ancestor commit (refs/heads/main already advanced to tipCommitSHA).
+	reqBody := "0032want " + firstCommitSHA + "\n00000009done\n"
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	execImpl := NewSubprocessExecutor(Config{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	err := execImpl.ExecUploadPack(context.Background(), UploadPackRequest{
+		RepoDir:      bareDir,
+		StatelessRPC: true,
+		Stdin:        strings.NewReader(reqBody),
+		Stdout:       &stdout,
+		Stderr:       &stderr,
+	})
+	if err != nil {
+		t.Fatalf("ExecUploadPack for reachable non-tip SHA %s failed: %v (stderr: %s)", firstCommitSHA, err, stderr.String())
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("PACK")) {
+		t.Errorf("expected packfile payload in upload-pack response, got %d bytes", stdout.Len())
+	}
+}
+
 func TestExecIndexPackStdinRealGit(t *testing.T) {
 	requireGit(t)
 	bareDir, commitSHA := createBareRepoWithCommit(t)
@@ -346,6 +423,12 @@ func requireGit(t *testing.T) {
 
 func createBareRepoWithCommit(t *testing.T) (bareDir string, commitSHA string) {
 	t.Helper()
+	bareDir, commits := createBareRepoWithCommits(t, 1)
+	return bareDir, commits[0]
+}
+
+func createBareRepoWithCommits(t *testing.T, count int) (bareDir string, commits []string) {
+	t.Helper()
 	workDir := filepath.Join(t.TempDir(), "work")
 	bareDir = filepath.Join(t.TempDir(), "repo.git")
 
@@ -374,13 +457,17 @@ func createBareRepoWithCommit(t *testing.T) (bareDir string, commitSHA string) {
 		t.Fatalf("mkdir workDir: %v", err)
 	}
 	run(workDir, "init", "-b", "main")
-	if err := os.WriteFile(filepath.Join(workDir, "README.md"), []byte("hello stravin\n"), 0o644); err != nil {
-		t.Fatalf("write README: %v", err)
+	commits = make([]string, 0, count)
+	for i := 1; i <= count; i++ {
+		content := "hello stravin commit " + strconv.Itoa(i) + "\n"
+		if err := os.WriteFile(filepath.Join(workDir, "README.md"), []byte(content), 0o644); err != nil {
+			t.Fatalf("write README %d: %v", i, err)
+		}
+		run(workDir, "add", "README.md")
+		run(workDir, "commit", "-m", "commit "+strconv.Itoa(i))
+		commits = append(commits, run(workDir, "rev-parse", "HEAD"))
 	}
-	run(workDir, "add", "README.md")
-	run(workDir, "commit", "-m", "initial commit")
-	commitSHA = run(workDir, "rev-parse", "HEAD")
 
 	run(filepath.Dir(bareDir), "clone", "--bare", workDir, bareDir)
-	return bareDir, commitSHA
+	return bareDir, commits
 }
