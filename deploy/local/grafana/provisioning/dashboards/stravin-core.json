@@ -54,7 +54,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Overall server error rate on stravin-edge excluding client_canceled (499) and rate_limited (429). Green < 1%, Yellow 1-5%, Red >= 5%.",
+      "description": "Overall server error rate over the selected time range on stravin-edge excluding client_canceled (499) and rate_limited (429). Green < 1%, Yellow 1-5%, Red >= 5%.",
       "fieldConfig": {
         "defaults": {
           "thresholds": {
@@ -82,7 +82,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "((sum(rate(stravin_edge_requests_total{status_code!~\"2..|ok\",error_class!~\"client_canceled|rate_limited\"}[5m])) or vector(0)) / clamp_min(sum(rate(stravin_edge_requests_total[5m])), 1e-9)) or vector(0)",
+          "expr": "((sum(increase(stravin_edge_requests_total{status_code!~\"2..|ok\",error_class!~\"client_canceled|rate_limited\"}[$__range])) or vector(0)) / clamp_min(sum(increase(stravin_edge_requests_total[$__range])), 1)) or vector(0)",
           "legendFormat": "server error rate",
           "refId": "A"
         }
@@ -92,7 +92,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Cumulative non-client_canceled server errors across edge, node, S3 pack fetches, and compaction (must remain zero under healthy operation).",
+      "description": "Non-client_canceled server errors over the selected time range across edge, node, S3 pack fetches, and compaction (must remain zero under healthy operation).",
       "fieldConfig": {
         "defaults": {
           "thresholds": {
@@ -120,7 +120,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "(sum(stravin_edge_requests_total{status_code!~\"2..|ok\",error_class!~\"client_canceled|rate_limited\"}) or vector(0)) + (sum(stravin_node_requests_total{status_code=\"error\"}) or vector(0)) + (sum(stravin_node_s3_pack_fetches_total{status_code=\"error\"}) or vector(0)) + (sum(stravin_pack_compaction_cycles_total{result=\"error\"}) or vector(0))",
+          "expr": "round((sum(increase(stravin_edge_requests_total{status_code!~\"2..|ok\",error_class!~\"client_canceled|rate_limited\"}[$__range])) or vector(0)) + (sum(increase(stravin_node_requests_total{status_code=\"error\"}[$__range])) or vector(0)) + (sum(increase(stravin_node_s3_pack_fetches_total{status_code=\"error\"}[$__range])) or vector(0)) + (sum(increase(stravin_pack_compaction_cycles_total{result=\"error\"}[$__range])) or vector(0)))",
           "legendFormat": "server errors",
           "refId": "A"
         }
@@ -130,7 +130,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Expected client-side cancellations (HTTP 499 / client_canceled) and rate-limit rejections (HTTP 429 / rate_limited), separated from real server errors.",
+      "description": "Expected client-side cancellations (HTTP 499 / client_canceled) and rate-limit rejections (HTTP 429 / rate_limited) over the selected time range, separated from real server errors.",
       "fieldConfig": {
         "defaults": {
           "unit": "short"
@@ -150,13 +150,13 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(stravin_edge_requests_total{error_class=\"client_canceled\"}) or vector(0)",
+          "expr": "round(sum(increase(stravin_edge_requests_total{error_class=\"client_canceled\"}[$__range])) or vector(0))",
           "legendFormat": "client_canceled (499)",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(stravin_edge_requests_total{error_class=\"rate_limited\"}) or vector(0)",
+          "expr": "round(sum(increase(stravin_edge_requests_total{error_class=\"rate_limited\"}[$__range])) or vector(0))",
           "legendFormat": "rate_limited (429)",
           "refId": "B"
         }
@@ -166,7 +166,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Cumulative compaction cycle, lease renewal, integrity scrub, and recovery errors across stravin-pack and stravin-ctrl.",
+      "description": "Compaction cycle, lease renewal, integrity scrub, and recovery errors over the selected time range across stravin-pack and stravin-ctrl.",
       "fieldConfig": {
         "defaults": {
           "thresholds": {
@@ -194,7 +194,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "(sum(stravin_pack_compaction_cycles_total{result=\"error\"}) or vector(0)) + (sum(stravin_ctrl_lease_renewals_total{result=\"error\"}) or vector(0)) + (sum(stravin_ctrl_scrub_runs_total{result=\"error\"}) or vector(0)) + (sum(stravin_ctrl_recovery_runs_total{result=\"error\"}) or vector(0))",
+          "expr": "round((sum(increase(stravin_pack_compaction_cycles_total{result=\"error\"}[$__range])) or vector(0)) + (sum(increase(stravin_ctrl_lease_renewals_total{result=\"error\"}[$__range])) or vector(0)) + (sum(increase(stravin_ctrl_scrub_runs_total{result=\"error\"}[$__range])) or vector(0)) + (sum(increase(stravin_ctrl_recovery_runs_total{result=\"error\"}[$__range])) or vector(0)))",
           "legendFormat": "pack + ctrl errors",
           "refId": "A"
         }
