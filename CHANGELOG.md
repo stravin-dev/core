@@ -1,3 +1,14 @@
+## [1.7.2](https://github.com/stravin-dev/core/compare/v1.7.1...v1.7.2) (2026-11-23)
+
+
+### Bug Fixes
+
+* **cache:** prune superseded packs via epoch tracking without waiting for pins == 0 ([845ca9f](https://github.com/stravin-dev/core/commit/845ca9fd2c587b5b852f92d4009189bbf98421f9))
+* **cache:** prune superseded packs via epoch tracking without waiting for pins == 0 ([#138](https://github.com/stravin-dev/core/issues/138)) ([8e9a398](https://github.com/stravin-dev/core/commit/8e9a39883e6e27626f172caee409125e22bf53db))
+* **loadgen:** classify stale old_oid Ref-CAS rejection as retryable_conflict ([de3a384](https://github.com/stravin-dev/core/commit/de3a38484d154699f0dcd477c90861c7705c5584))
+* **node:** clean up stale multi-pack-index and commit-graph locks in refreshAuxIndexes ([af23ef9](https://github.com/stravin-dev/core/commit/af23ef914085277fda14cecfa94a331b446ed122))
+* **observability:** scope Overview error metrics to selected Grafana time range on both dashboards ([ff4edf9](https://github.com/stravin-dev/core/commit/ff4edf9e1850415d053f6102513a65e5da228d0c))
+
 ## [1.7.1](https://github.com/stravin-dev/core/compare/v1.7.0...v1.7.1) (2026-11-23)
 
 
