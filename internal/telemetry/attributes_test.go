@@ -6,6 +6,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 
 	"stravin.dev/core/internal/telemetry"
+	"stravin.dev/core/internal/version"
 )
 
 func TestNewResource_StandardAttributes(t *testing.T) {
@@ -41,6 +42,23 @@ func TestNewResource_StandardAttributes(t *testing.T) {
 func TestNewResource_RequiresServiceName(t *testing.T) {
 	if _, err := telemetry.NewResource(telemetry.ResourceConfig{}); err == nil {
 		t.Fatal("expected error when ServiceName is empty")
+	}
+}
+
+func TestNewResource_DefaultsServiceVersion(t *testing.T) {
+	res, err := telemetry.NewResource(telemetry.ResourceConfig{
+		ServiceName: "stravin-node",
+	})
+	if err != nil {
+		t.Fatalf("NewResource returned error: %v", err)
+	}
+
+	got := make(map[attribute.Key]string)
+	for _, kv := range res.Attributes() {
+		got[kv.Key] = kv.Value.AsString()
+	}
+	if got["service.version"] != version.String() {
+		t.Errorf("service.version = %q, want %q", got["service.version"], version.String())
 	}
 }
 
