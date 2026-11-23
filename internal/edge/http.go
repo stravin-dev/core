@@ -212,6 +212,7 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		RepoID:      route.repo.RepoID,
 		Operation:   route.op,
 		TraceParent: telemetry.TraceparentFromContext(ctx),
+		GitProtocol: extractHTTPGitProtocol(r.Header.Values("Git-Protocol")),
 	}
 
 	sw := &smartHTTPStreamWriter{
@@ -498,6 +499,17 @@ func parseSmartHTTPPath(method, rawPath, service string) (smartHTTPRoute, error)
 
 func pktLine(payload string) string {
 	return fmt.Sprintf("%04x%s", len(payload)+4, payload)
+}
+
+func extractHTTPGitProtocol(values []string) string {
+	if len(values) != 1 {
+		return ""
+	}
+	clean, ok := rpc.SanitizeGitProtocol(values[0])
+	if !ok {
+		return ""
+	}
+	return clean
 }
 
 func extractHTTPToken(authHeader string) (string, bool) {

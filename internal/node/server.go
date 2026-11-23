@@ -165,7 +165,7 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 	repo := meta.RepoKey()
 
 	if boolHeader(ctx, HeaderAdvertiseRefs) {
-		return nil, s.serveAdvertiseRefs(ctx, repo, stream)
+		return nil, s.serveAdvertiseRefs(ctx, repo, meta.GitProtocol, stream)
 	}
 
 	syncRes, err := s.materializer.SyncAndPin(ctx, repo)
@@ -227,6 +227,7 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 		Repo:         repo,
 		RepoDir:      syncRes.Handle.Path(),
 		StatelessRPC: statelessRPC,
+		GitProtocol:  meta.GitProtocol,
 		Stdin:        stdinR,
 		Stdout:       stdoutW,
 		Stderr:       &stderrBuf,
@@ -277,7 +278,7 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 	return nil, stream.Send(&rpc.Frame{EOF: true, ExitCode: 0})
 }
 
-func (s *Server) serveAdvertiseRefs(ctx context.Context, repoKey tenant.RepoKey, stream rpc.GitWireStream) error {
+func (s *Server) serveAdvertiseRefs(ctx context.Context, repoKey tenant.RepoKey, gitProtocol string, stream rpc.GitWireStream) error {
 	repoMeta, refs, err := s.materializer.LoadAuthoritativeRefs(ctx, repoKey)
 	if err != nil {
 		if errors.Is(err, ddb.ErrNotFound) {
@@ -286,11 +287,18 @@ func (s *Server) serveAdvertiseRefs(ctx context.Context, repoKey tenant.RepoKey,
 		return status.Errorf(codes.Internal, "load refs %s: %v", repoKey, err)
 	}
 
-	payload := AdvertiseRefs(refs, repoMeta.DefaultBranch, AdvertiseOptions{
+	opts := AdvertiseOptions{
 		IncludeServiceHeader: boolHeader(ctx, HeaderSmartHTTPServiceHeader),
 		ServiceName:          string(rpc.OpUploadPack),
 		ObjectFormat:         repoMeta.EffectiveObjectFormat(),
-	})
+	}
+
+	var payload []byte
+	if rpc.GitProtocolVersion(gitProtocol) == "2" {
+		payload = AdvertiseV2Capabilities(opts)
+	} else {
+		payload = AdvertiseRefs(refs, repoMeta.DefaultBranch, opts)
+	}
 
 	if len(payload) > 0 {
 		if err := stream.Send(&rpc.Frame{Data: payload}); err != nil {

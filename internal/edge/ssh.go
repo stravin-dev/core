@@ -386,6 +386,8 @@ func (s *SSHServer) handleSession(connCtx context.Context, principal Principal, 
 	timer := time.NewTimer(s.execIdleTimeout)
 	defer timer.Stop()
 
+	var gitProtocol string
+
 	for {
 		select {
 		case <-connCtx.Done():
@@ -397,6 +399,21 @@ func (s *SSHServer) handleSession(connCtx context.Context, principal Principal, 
 				return
 			}
 			switch req.Type {
+			case "env":
+				name, val, err := decodeSSHEnvPayload(req.Payload)
+				if err == nil && name == "GIT_PROTOCOL" {
+					if clean, valid := rpc.SanitizeGitProtocol(val); valid {
+						gitProtocol = clean
+						if req.WantReply {
+							_ = req.Reply(true, nil)
+						}
+						continue
+					}
+					gitProtocol = ""
+				}
+				if req.WantReply {
+					_ = req.Reply(false, nil)
+				}
 			case "exec":
 				cmd, err := decodeSSHExecPayload(req.Payload)
 				if err != nil {
@@ -404,7 +421,7 @@ func (s *SSHServer) handleSession(connCtx context.Context, principal Principal, 
 					return
 				}
 				_ = req.Reply(true, nil)
-				code := s.executeGitCommand(connCtx, principal, cmd, ch)
+				code := s.executeGitCommand(connCtx, principal, cmd, gitProtocol, ch)
 				sendSSHExitStatus(ch, code)
 				return
 			default:
@@ -416,7 +433,7 @@ func (s *SSHServer) handleSession(connCtx context.Context, principal Principal, 
 	}
 }
 
-func (s *SSHServer) executeGitCommand(connCtx context.Context, principal Principal, cmd string, ch ssh.Channel) uint32 {
+func (s *SSHServer) executeGitCommand(connCtx context.Context, principal Principal, cmd, gitProtocol string, ch ssh.Channel) uint32 {
 	start := time.Now()
 	op, repoKey, err := ParseSSHExecCommand(cmd)
 	if err != nil {
@@ -486,6 +503,7 @@ func (s *SSHServer) executeGitCommand(connCtx context.Context, principal Princip
 		RepoID:      repoKey.RepoID,
 		Operation:   op,
 		TraceParent: telemetry.TraceparentFromContext(ctx),
+		GitProtocol: gitProtocol,
 	}
 
 	stdin := NewByteLimitingReader(ctx, ch, s.limiter, repoKey.TenantID)
@@ -535,6 +553,29 @@ func principalFromSSHPerms(perms *ssh.Permissions) Principal {
 		TenantID: tenant.TenantID(perms.Extensions[sshExtTenantID]),
 		ActorID:  perms.Extensions[sshExtActorID],
 	}
+}
+
+func decodeSSHEnvPayload(payload []byte) (string, string, error) {
+	name, rest, err := decodeSSHString(payload)
+	if err != nil {
+		return "", "", errors.New("edge: invalid ssh env name")
+	}
+	val, tail, err := decodeSSHString(rest)
+	if err != nil || len(tail) != 0 {
+		return "", "", errors.New("edge: invalid ssh env value")
+	}
+	return name, val, nil
+}
+
+func decodeSSHString(b []byte) (string, []byte, error) {
+	if len(b) < 4 {
+		return "", nil, errors.New("edge: truncated ssh string")
+	}
+	n := int(binary.BigEndian.Uint32(b[:4]))
+	if n < 0 || 4+n > len(b) {
+		return "", nil, errors.New("edge: invalid ssh string length")
+	}
+	return string(b[4 : 4+n]), b[4+n:], nil
 }
 
 func decodeSSHExecPayload(payload []byte) (string, error) {
