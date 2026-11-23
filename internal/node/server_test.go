@@ -9,12 +9,19 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -422,4 +429,342 @@ func buildSampleGitPack(t *testing.T) (commitOID string, packBytes, idxBytes []b
 		t.Fatalf("failed to generate sample pack/idx files")
 	}
 	return commitOID, packBytes, idxBytes
+}
+
+type fakeGitExecutor struct {
+	uploadPackFn func(ctx context.Context, req gitexec.UploadPackRequest) error
+}
+
+func (f *fakeGitExecutor) ExecUploadPack(ctx context.Context, req gitexec.UploadPackRequest) error {
+	if f.uploadPackFn != nil {
+		return f.uploadPackFn(ctx, req)
+	}
+	return nil
+}
+
+func (f *fakeGitExecutor) ExecIndexPack(_ context.Context, _ gitexec.IndexPackRequest) error {
+	return nil
+}
+
+func (f *fakeGitExecutor) ExecRepack(_ context.Context, _ gitexec.RepackRequest) error {
+	return nil
+}
+
+type errWriteHandler struct {
+	err error
+}
+
+func (w *errWriteHandler) HandleReceivePack(_ context.Context, _ rpc.RequestMeta, _ rpc.GitWireStream) error {
+	return w.err
+}
+
+func setupTestNodeServer(t *testing.T, execImpl gitexec.GitExecutor, wh WriteHandler) (tenant.RepoKey, rpc.GitWireClient, *telemetry.Provider, *Metrics) {
+	t.Helper()
+	rk, err := tenant.NewRepoKey("acme", "obs-test")
+	if err != nil {
+		t.Fatalf("NewRepoKey: %v", err)
+	}
+	metaStore := newFakeMetadataStore()
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	})
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	tp, err := telemetry.NewInMemoryProvider("stravin-node")
+	if err != nil {
+		t.Fatalf("NewInMemoryProvider: %v", err)
+	}
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:      metaStore,
+		Packs:     newFakePackFetcher(),
+		Cache:     c,
+		Telemetry: tp,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+
+	metrics := NewMetrics(tp, "us-east-1")
+	srv, err := NewServer(ServerConfig{
+		Materializer: mat,
+		GitExecutor:  execImpl,
+		WriteHandler: wh,
+		Telemetry:    tp,
+		Metrics:      metrics,
+		Region:       "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	return rk, startBufconnNode(t, srv), tp, metrics
+}
+
+func collectNodeRequestCounts(t *testing.T, tp *telemetry.Provider, gitOp string) map[string]int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := tp.MetricReader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("MetricReader.Collect: %v", err)
+	}
+	counts := make(map[string]int64)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "stravin_node_requests_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("stravin_node_requests_total type = %T, want metricdata.Sum[int64]", m.Data)
+			}
+			for _, dp := range sum.DataPoints {
+				opVal, _ := dp.Attributes.Value(telemetry.AttrGitOperation)
+				if opVal.AsString() != gitOp {
+					continue
+				}
+				scVal, ok := dp.Attributes.Value(telemetry.AttrStatusCode)
+				if ok {
+					counts[scVal.AsString()] += dp.Value
+				}
+			}
+		}
+	}
+	return counts
+}
+
+func assertSpanStringsValidUTF8(t *testing.T, s tracetest.SpanStub) {
+	t.Helper()
+	if !utf8.ValidString(s.Status.Description) {
+		t.Errorf("span %q status description contains invalid UTF-8: %q", s.Name, s.Status.Description)
+	}
+	for _, ev := range s.Events {
+		for _, attr := range ev.Attributes {
+			if attr.Value.Type() == attribute.STRING && !utf8.ValidString(attr.Value.AsString()) {
+				t.Errorf("span %q event %q attr %q contains invalid UTF-8: %q", s.Name, ev.Name, attr.Key, attr.Value.AsString())
+			}
+		}
+	}
+}
+
+func TestServer_UploadPackSanitizesInvalidUTF8Stderr(t *testing.T) {
+	rawStderr := "fatal: bad pkt-line \xff\xfe\x80 trailing"
+	execImpl := &fakeGitExecutor{
+		uploadPackFn: func(_ context.Context, req gitexec.UploadPackRequest) error {
+			if req.Stderr != nil {
+				_, _ = req.Stderr.Write([]byte(rawStderr + "\n"))
+			}
+			return &gitexec.ExecError{
+				Subcommand: "upload-pack",
+				ExitCode:   128,
+				Stderr:     rawStderr,
+				Err:        errors.New("exit status 128"),
+			}
+		},
+	}
+
+	rk, client, tp, _ := setupTestNodeServer(t, execImpl, nil)
+	stream, err := client.OpenStream(context.Background(), rpc.RequestMeta{
+		TenantID:  rk.TenantID,
+		RepoID:    rk.RepoID,
+		Operation: rpc.OpUploadPack,
+	})
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	if err := stream.Send(&rpc.Frame{EOF: true}); err != nil {
+		t.Fatalf("stream.Send: %v", err)
+	}
+
+	var eofFrame *rpc.Frame
+	for {
+		frame, recvErr := stream.Recv()
+		if errors.Is(recvErr, io.EOF) {
+			break
+		}
+		if recvErr != nil {
+			t.Fatalf("stream.Recv: %v", recvErr)
+		}
+		if frame.EOF {
+			eofFrame = frame
+		}
+	}
+	if eofFrame == nil {
+		t.Fatal("expected EOF frame from server")
+	}
+	if eofFrame.ExitCode != 128 {
+		t.Fatalf("ExitCode = %d, want 128", eofFrame.ExitCode)
+	}
+	if !utf8.ValidString(eofFrame.ErrMessage) {
+		t.Errorf("rpc.Frame.ErrMessage contains invalid UTF-8: %q", eofFrame.ErrMessage)
+	}
+	if !strings.Contains(eofFrame.ErrMessage, "\uFFFD") || !strings.Contains(eofFrame.ErrMessage, "fatal: bad pkt-line") {
+		t.Errorf("rpc.Frame.ErrMessage = %q, want sanitized message containing replacement char", eofFrame.ErrMessage)
+	}
+
+	var sawRoot, sawExec bool
+	for _, s := range tp.SpanExporter.GetSpans() {
+		switch s.Name {
+		case "node.git.stream":
+			sawRoot = true
+			if s.Status.Code != otelcodes.Error {
+				t.Errorf("root span status = %v, want Error", s.Status.Code)
+			}
+			assertSpanStringsValidUTF8(t, s)
+		case "node.git.upload_pack":
+			sawExec = true
+			if s.Status.Code != otelcodes.Error {
+				t.Errorf("exec span status = %v, want Error", s.Status.Code)
+			}
+			assertSpanStringsValidUTF8(t, s)
+		}
+	}
+	if !sawRoot || !sawExec {
+		t.Fatalf("missing spans: sawRoot=%v sawExec=%v", sawRoot, sawExec)
+	}
+}
+
+func TestServer_UploadPackExitStatusMetricAndRootSpan(t *testing.T) {
+	tests := []struct {
+		name           string
+		execErr        error
+		wantExitCode   int32
+		wantStatusCode string
+		wantSpanCode   otelcodes.Code
+	}{
+		{
+			name: "non-zero exit code records error status and root span error",
+			execErr: &gitexec.ExecError{
+				Subcommand: "upload-pack",
+				ExitCode:   128,
+				Stderr:     "fatal: not a git repository",
+				Err:        errors.New("exit status 128"),
+			},
+			wantExitCode:   128,
+			wantStatusCode: "error",
+			wantSpanCode:   otelcodes.Error,
+		},
+		{
+			name:           "zero exit code records ok status and non-error root span",
+			execErr:        nil,
+			wantExitCode:   0,
+			wantStatusCode: "ok",
+			wantSpanCode:   otelcodes.Unset,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			execImpl := &fakeGitExecutor{
+				uploadPackFn: func(_ context.Context, _ gitexec.UploadPackRequest) error {
+					return tc.execErr
+				},
+			}
+			rk, client, tp, metrics := setupTestNodeServer(t, execImpl, nil)
+			stream, err := client.OpenStream(context.Background(), rpc.RequestMeta{
+				TenantID:  rk.TenantID,
+				RepoID:    rk.RepoID,
+				Operation: rpc.OpUploadPack,
+			})
+			if err != nil {
+				t.Fatalf("OpenStream: %v", err)
+			}
+			if err := stream.Send(&rpc.Frame{EOF: true}); err != nil {
+				t.Fatalf("stream.Send: %v", err)
+			}
+
+			var eofFrame *rpc.Frame
+			for {
+				frame, recvErr := stream.Recv()
+				if errors.Is(recvErr, io.EOF) {
+					break
+				}
+				if recvErr != nil {
+					t.Fatalf("stream.Recv: %v", recvErr)
+				}
+				if frame.EOF {
+					eofFrame = frame
+				}
+			}
+			if eofFrame == nil || eofFrame.ExitCode != tc.wantExitCode {
+				t.Fatalf("EOF frame = %+v, want ExitCode=%d", eofFrame, tc.wantExitCode)
+			}
+
+			var sawRoot bool
+			for _, s := range tp.SpanExporter.GetSpans() {
+				if s.Name == "node.git.stream" {
+					sawRoot = true
+					if s.Status.Code != tc.wantSpanCode {
+						t.Errorf("root span status = %v, want %v", s.Status.Code, tc.wantSpanCode)
+					}
+				}
+			}
+			if !sawRoot {
+				t.Fatal("expected node.git.stream root span")
+			}
+
+			counts := collectNodeRequestCounts(t, tp, "fetch")
+			if counts[tc.wantStatusCode] != 1 {
+				t.Errorf("stravin_node_requests_total[fetch,%s] = %d, want 1 (all=%v)", tc.wantStatusCode, counts[tc.wantStatusCode], counts)
+			}
+			other := "ok"
+			if tc.wantStatusCode == "ok" {
+				other = "error"
+			}
+			if counts[other] != 0 {
+				t.Errorf("stravin_node_requests_total[fetch,%s] = %d, want 0", other, counts[other])
+			}
+
+			rec := httptest.NewRecorder()
+			metrics.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+			wantPromLine := fmt.Sprintf("stravin_node_requests_total{region=\"us-east-1\",status_code=%q} 1", tc.wantStatusCode)
+			if !strings.Contains(rec.Body.String(), wantPromLine) {
+				t.Errorf("Prometheus /metrics missing %q:\n%s", wantPromLine, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestServer_ReceivePackSanitizesInvalidUTF8Error(t *testing.T) {
+	wh := &errWriteHandler{
+		err: errors.New("node: receive-pack failed: \xff\xfe\x80 invalid bytes"),
+	}
+	rk, client, tp, _ := setupTestNodeServer(t, &fakeGitExecutor{}, wh)
+	stream, err := client.OpenStream(context.Background(), rpc.RequestMeta{
+		TenantID:  rk.TenantID,
+		RepoID:    rk.RepoID,
+		Operation: rpc.OpReceivePack,
+	})
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	if _, recvErr := stream.Recv(); recvErr == nil {
+		t.Fatal("expected error from receive-pack stream")
+	}
+
+	var sawRoot bool
+	for _, s := range tp.SpanExporter.GetSpans() {
+		if s.Name == "node.git.stream" {
+			sawRoot = true
+			if s.Status.Code != otelcodes.Error {
+				t.Errorf("root span status = %v, want Error", s.Status.Code)
+			}
+			assertSpanStringsValidUTF8(t, s)
+		}
+	}
+	if !sawRoot {
+		t.Fatal("expected node.git.stream root span")
+	}
+
+	counts := collectNodeRequestCounts(t, tp, "push")
+	if counts["error"] != 1 {
+		t.Errorf("stravin_node_requests_total[push,error] = %d, want 1 (all=%v)", counts["error"], counts)
+	}
 }

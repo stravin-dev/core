@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 
-	otelcodes "go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -330,8 +329,7 @@ func (h *ReceivePackHandler) HandleReceivePack(ctx context.Context, meta rpc.Req
 		Pack:           packUpload,
 	})
 	if commitErr != nil {
-		ddbSpan.RecordError(commitErr)
-		ddbSpan.SetStatus(otelcodes.Error, commitErr.Error())
+		recordSpanError(ddbSpan, commitErr)
 		ddbSpan.End()
 
 		if errors.Is(commitErr, ddb.ErrRefCASConflict) {
@@ -422,27 +420,23 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 	}
 	rawPack, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, err.Error())
+		recordSpanError(span, err)
 		return ingestedPack{}, fmt.Errorf("read pack stream: %w", err)
 	}
 	if int64(len(rawPack)) > maxBytes {
 		err = fmt.Errorf("pack exceeds max size %d: %w", maxBytes, pack.ErrLimitExceeded)
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, err.Error())
+		recordSpanError(span, err)
 		return ingestedPack{}, err
 	}
 	if len(rawPack) == 0 {
 		err = errors.New("missing packfile data")
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, err.Error())
+		recordSpanError(span, err)
 		return ingestedPack{}, err
 	}
 
 	syncRes, err := h.materializer.SyncAndPin(packCtx, repo)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, err.Error())
+		recordSpanError(span, err)
 		return ingestedPack{}, fmt.Errorf("sync base packs: %w", err)
 	}
 	baseResolver := syncRes.Handle.BaseResolver()
@@ -450,8 +444,7 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 	completed, err := h.thinCompleter.Complete(packCtx, rawPack, baseResolver)
 	if err != nil {
 		syncRes.Handle.Release()
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, err.Error())
+		recordSpanError(span, err)
 		return ingestedPack{}, fmt.Errorf("thin-pack completion: %w", err)
 	}
 
@@ -460,8 +453,7 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 	})
 	if err != nil {
 		syncRes.Handle.Release()
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, err.Error())
+		recordSpanError(span, err)
 		return ingestedPack{}, fmt.Errorf("parse completed pack: %w", err)
 	}
 
@@ -473,16 +465,14 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 		oid, err := pack.ParseOID(c.NewOID)
 		if err != nil {
 			syncRes.Handle.Release()
-			span.RecordError(err)
-			span.SetStatus(otelcodes.Error, err.Error())
+			recordSpanError(span, err)
 			return ingestedPack{}, fmt.Errorf("invalid target oid for %s: %w", c.RefName, err)
 		}
 		if _, inNew := parsed.Objects[oid]; !inNew {
 			if _, _, baseErr := baseResolver.ResolveBase(oid); baseErr != nil {
 				syncRes.Handle.Release()
 				err = fmt.Errorf("missing target object %s for %s", c.NewOID, c.RefName)
-				span.RecordError(err)
-				span.SetStatus(otelcodes.Error, err.Error())
+				recordSpanError(span, err)
 				return ingestedPack{}, err
 			}
 		}
@@ -491,8 +481,7 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 	idxBytes, err := pack.BuildIdx(parsed)
 	if err != nil {
 		syncRes.Handle.Release()
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, err.Error())
+		recordSpanError(span, err)
 		return ingestedPack{}, fmt.Errorf("build idx v2: %w", err)
 	}
 
@@ -558,8 +547,7 @@ func (c *pushOverlapCoordinator) Execute(ctx context.Context, req pushOverlapReq
 
 			err := c.packs.PutPack(s3Ctx, req.Repo, req.PackSHA256, req.CompletedPack, req.IdxBytes)
 			if err != nil {
-				s3Span.RecordError(err)
-				s3Span.SetStatus(otelcodes.Error, err.Error())
+				recordSpanError(s3Span, err)
 				res.S3Err = err
 				cancel()
 			}
@@ -591,8 +579,7 @@ func (c *pushOverlapCoordinator) Execute(ctx context.Context, req pushOverlapReq
 			res.HookResult = pipeRes
 			res.HookErr = err
 			if err != nil {
-				hookSpan.RecordError(err)
-				hookSpan.SetStatus(otelcodes.Error, err.Error())
+				recordSpanError(hookSpan, err)
 				cancel()
 				return
 			}
