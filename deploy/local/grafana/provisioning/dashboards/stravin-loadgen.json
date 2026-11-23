@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Client-side load generator and chaos visibility: active threads by persona, ops/sec, p50/p95/p99 latency with Tempo exemplars, expected retries vs unexpected errors, git fsck failures, and correlated Loki logs.",
+  "description": "Client-side load generator and chaos visibility organized into collapsible sections: dev vs AI agent KPIs, separate scenario distribution pie charts, granular per-persona throughput/latency/retries/errors with Tempo exemplars, and correlated Loki logs.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -45,11 +45,150 @@
   ],
   "panels": [
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "panels": [],
+      "title": "Overview (Devs vs AI Agents)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Current operations per second comparing Developer and AI Agent personas.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
       },
-      "description": "Concurrent active developer and AI agent worker threads by persona.",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (persona) (rate(stravin_loadgen_ops_total[1m]))",
+          "legendFormat": "{{persona}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Total Ops/sec (Dev vs Agent)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Active concurrent worker goroutines by persona.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (persona) (stravin_loadgen_active_threads)",
+          "legendFormat": "{{persona}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Active Worker Threads",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Cumulative unexpected client/oracle errors across all personas (must remain zero).",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
+      "id": 4,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(stravin_loadgen_unexpected_errors_total) or vector(0)",
+          "legendFormat": "unexpected errors",
+          "refId": "A"
+        }
+      ],
+      "title": "Unexpected Errors (Total)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Cumulative git fsck --full --strict integrity failures (must remain zero).",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "id": 5,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(stravin_loadgen_fsck_failures_total) or vector(0)",
+          "legendFormat": "git fsck failures",
+          "refId": "A"
+        }
+      ],
+      "title": "git fsck Failures (Total)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Concurrent active developer and AI agent worker threads over time.",
       "fieldConfig": {
         "defaults": {
           "links": [
@@ -68,8 +207,8 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "id": 1,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 5 },
+      "id": 6,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom" },
         "tooltip": { "mode": "multi" }
@@ -86,19 +225,16 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "Client-observed Git operations per second broken down by persona, scenario, and outcome.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "High-level client Git operations per second comparing Developers vs AI Agents by outcome.",
       "fieldConfig": {
         "defaults": {
           "unit": "ops"
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "id": 2,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 5 },
+      "id": 7,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom" },
         "tooltip": { "mode": "multi" }
@@ -106,100 +242,17 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum by (persona, scenario, outcome) (rate(stravin_loadgen_ops_total[1m]))",
-          "legendFormat": "{{persona}} / {{scenario}} ({{outcome}})",
+          "expr": "sum by (persona, outcome) (rate(stravin_loadgen_ops_total[1m]))",
+          "legendFormat": "{{persona}} ({{outcome}})",
           "refId": "A"
         }
       ],
-      "title": "Client Ops/sec by Persona, Scenario & Outcome",
+      "title": "Total Ops/sec: Devs vs AI Agents",
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "Client-side Git operation p50/p95/p99 latency with clickable Tempo trace exemplars.",
-      "fieldConfig": {
-        "defaults": {
-          "links": [
-            {
-              "targetBlank": true,
-              "title": "Explore Slow Loadgen Traces in Tempo",
-              "url": "/explore?left=%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7Bresource.service.name%3D%5C%22stravin-loadgen%5C%22%20%26%26%20duration%3E500ms%7D%22%7D%5D%7D"
-            }
-          ],
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
-      "id": 3,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom" },
-        "tooltip": { "mode": "multi" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "exemplar": true,
-          "expr": "histogram_quantile(0.50, sum by (le, persona, scenario) (rate(stravin_loadgen_op_duration_seconds_bucket[1m])))",
-          "legendFormat": "p50 {{persona}} {{scenario}}",
-          "refId": "A"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "exemplar": true,
-          "expr": "histogram_quantile(0.95, sum by (le, persona, scenario) (rate(stravin_loadgen_op_duration_seconds_bucket[1m])))",
-          "legendFormat": "p95 {{persona}} {{scenario}}",
-          "refId": "B"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "exemplar": true,
-          "expr": "histogram_quantile(0.99, sum by (le, persona, scenario) (rate(stravin_loadgen_op_duration_seconds_bucket[1m])))",
-          "legendFormat": "p99 {{persona}} {{scenario}}",
-          "refId": "C"
-        }
-      ],
-      "title": "Client Latency p50 / p95 / p99 (with Tempo Exemplars)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "Expected transient retries (e.g., CAS conflicts, chaos restarts) grouped by reason.",
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
-      "id": 4,
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom" },
-        "tooltip": { "mode": "multi" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum by (reason) (rate(stravin_loadgen_retries_total[1m]))",
-          "legendFormat": "retry ({{reason}})",
-          "refId": "A"
-        }
-      ],
-      "title": "Expected Retries by Reason",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "Unexpected client failures and git fsck integrity failures (must remain zero).",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Unexpected client failures and git fsck integrity failures across all personas (must remain zero).",
       "fieldConfig": {
         "defaults": {
           "links": [
@@ -213,8 +266,8 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
-      "id": 5,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 5 },
+      "id": 8,
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom" },
         "tooltip": { "mode": "multi" }
@@ -237,13 +290,374 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "loki",
-        "uid": "loki"
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
+      "id": 9,
+      "panels": [],
+      "title": "Scenario Distribution",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Distribution of Developer (persona=\"dev\") scenarios executed over the selected time range.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
       },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 14 },
+      "id": 10,
+      "options": {
+        "displayLabels": ["percent"],
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "values": ["value", "percent"]
+        },
+        "pieType": "donut",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (scenario) (increase(stravin_loadgen_ops_total{persona=\"dev\",op=\"scenario\"}[$__range]))",
+          "legendFormat": "{{scenario}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Developer Scenarios Run",
+      "type": "piechart"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Distribution of AI Agent (persona=\"agent\") scenarios executed over the selected time range.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 14 },
+      "id": 11,
+      "options": {
+        "displayLabels": ["percent"],
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "values": ["value", "percent"]
+        },
+        "pieType": "donut",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (scenario) (increase(stravin_loadgen_ops_total{persona=\"agent\",op=\"scenario\"}[$__range]))",
+          "legendFormat": "{{scenario}}",
+          "refId": "A"
+        }
+      ],
+      "title": "AI Agent Scenarios Run",
+      "type": "piechart"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "id": 12,
+      "panels": [],
+      "title": "Developer Experience (persona=\"dev\")",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Granular Developer Git operations per second broken down by scenario, operation, and outcome.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "id": 13,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (scenario, op, outcome) (rate(stravin_loadgen_ops_total{persona=\"dev\"}[1m]))",
+          "legendFormat": "{{scenario}} / {{op}} ({{outcome}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Developer Ops/sec by Scenario & Operation",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Developer client-side p50/p95/p99 latency with clickable Tempo trace exemplars.",
+      "fieldConfig": {
+        "defaults": {
+          "links": [
+            {
+              "targetBlank": true,
+              "title": "Explore Slow Developer Traces in Tempo",
+              "url": "/explore?left=%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7Bresource.service.name%3D%5C%22stravin-loadgen%5C%22%20%26%26%20span.persona%3D%5C%22dev%5C%22%20%26%26%20duration%3E500ms%7D%22%7D%5D%7D"
+            }
+          ],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "id": 14,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "exemplar": true,
+          "expr": "histogram_quantile(0.50, sum by (le, scenario, op) (rate(stravin_loadgen_op_duration_seconds_bucket{persona=\"dev\"}[1m])))",
+          "legendFormat": "p50 {{scenario}} {{op}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, scenario, op) (rate(stravin_loadgen_op_duration_seconds_bucket{persona=\"dev\"}[1m])))",
+          "legendFormat": "p95 {{scenario}} {{op}}",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "exemplar": true,
+          "expr": "histogram_quantile(0.99, sum by (le, scenario, op) (rate(stravin_loadgen_op_duration_seconds_bucket{persona=\"dev\"}[1m])))",
+          "legendFormat": "p99 {{scenario}} {{op}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Developer Latency p50 / p95 / p99 (Tempo Exemplars)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Developer expected retries (Ref-CAS conflicts, transient chaos errors) by scenario and reason.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "id": 15,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (scenario, reason) (rate(stravin_loadgen_retries_total{persona=\"dev\"}[1m]))",
+          "legendFormat": "{{scenario}} ({{reason}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Developer Retries by Scenario & Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Developer unexpected errors and git fsck integrity failures (must remain zero).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "id": 16,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (scenario, op) (rate(stravin_loadgen_unexpected_errors_total{persona=\"dev\"}[1m]))",
+          "legendFormat": "unexpected {{scenario}} / {{op}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (scenario) (rate(stravin_loadgen_fsck_failures_total{scenario=~\"dev_.*\"}[1m]))",
+          "legendFormat": "git fsck {{scenario}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Developer Unexpected Errors & git fsck Failures",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
+      "id": 17,
+      "panels": [],
+      "title": "AI Agent Experience (persona=\"agent\")",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Granular AI Agent Git operations per second broken down by scenario, operation, and outcome.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "id": 18,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (scenario, op, outcome) (rate(stravin_loadgen_ops_total{persona=\"agent\"}[1m]))",
+          "legendFormat": "{{scenario}} / {{op}} ({{outcome}})",
+          "refId": "A"
+        }
+      ],
+      "title": "AI Agent Ops/sec by Scenario & Operation",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "AI Agent client-side p50/p95/p99 latency with clickable Tempo trace exemplars.",
+      "fieldConfig": {
+        "defaults": {
+          "links": [
+            {
+              "targetBlank": true,
+              "title": "Explore Slow AI Agent Traces in Tempo",
+              "url": "/explore?left=%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7Bresource.service.name%3D%5C%22stravin-loadgen%5C%22%20%26%26%20span.persona%3D%5C%22agent%5C%22%20%26%26%20duration%3E500ms%7D%22%7D%5D%7D"
+            }
+          ],
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "id": 19,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "exemplar": true,
+          "expr": "histogram_quantile(0.50, sum by (le, scenario, op) (rate(stravin_loadgen_op_duration_seconds_bucket{persona=\"agent\"}[1m])))",
+          "legendFormat": "p50 {{scenario}} {{op}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, scenario, op) (rate(stravin_loadgen_op_duration_seconds_bucket{persona=\"agent\"}[1m])))",
+          "legendFormat": "p95 {{scenario}} {{op}}",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "exemplar": true,
+          "expr": "histogram_quantile(0.99, sum by (le, scenario, op) (rate(stravin_loadgen_op_duration_seconds_bucket{persona=\"agent\"}[1m])))",
+          "legendFormat": "p99 {{scenario}} {{op}}",
+          "refId": "C"
+        }
+      ],
+      "title": "AI Agent Latency p50 / p95 / p99 (Tempo Exemplars)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "AI Agent expected retries (Ref-CAS conflicts, transient chaos errors) by scenario and reason.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
+      "id": 20,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (scenario, reason) (rate(stravin_loadgen_retries_total{persona=\"agent\"}[1m]))",
+          "legendFormat": "{{scenario}} ({{reason}})",
+          "refId": "A"
+        }
+      ],
+      "title": "AI Agent Retries by Scenario & Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "AI Agent unexpected errors and git fsck integrity failures (must remain zero).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
+      "id": 21,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (scenario, op) (rate(stravin_loadgen_unexpected_errors_total{persona=\"agent\"}[1m]))",
+          "legendFormat": "unexpected {{scenario}} / {{op}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (scenario) (rate(stravin_loadgen_fsck_failures_total{scenario=~\"agent_.*\"}[1m]))",
+          "legendFormat": "git fsck {{scenario}}",
+          "refId": "B"
+        }
+      ],
+      "title": "AI Agent Unexpected Errors & git fsck Failures",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
+      "id": 22,
+      "panels": [],
+      "title": "Traces & Logs (Loki + Tempo)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "loki", "uid": "loki" },
       "description": "Correlated loadgen errors and chaos fault injection logs with clickable Tempo trace links.",
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 24 },
-      "id": 6,
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 58 },
+      "id": 23,
       "options": {
         "dedupStrategy": "none",
         "enableLogDetails": true,
@@ -279,5 +693,5 @@
   "timezone": "browser",
   "title": "Stravin Load Tester",
   "uid": "stravin-loadgen",
-  "version": 1
+  "version": 2
 }
