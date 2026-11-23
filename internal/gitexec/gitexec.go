@@ -219,7 +219,7 @@ func (e *SubprocessExecutor) ExecIndexPack(ctx context.Context, req IndexPackReq
 		return fmt.Errorf("%w: index-pack requires FromStdin or PackPath", ErrInvalidRequest)
 	}
 
-	args := []string{"-C", req.RepoDir, "index-pack"}
+	args := []string{"--git-dir", req.RepoDir, "index-pack"}
 	if req.FromStdin {
 		args = append(args, "--stdin")
 	}
@@ -260,7 +260,7 @@ func (e *SubprocessExecutor) ExecRepack(ctx context.Context, req RepackRequest) 
 	}
 
 	if req.Repack {
-		args := []string{"-C", req.RepoDir, "repack"}
+		args := []string{"--git-dir", req.RepoDir, "repack"}
 		if req.All {
 			args = append(args, "-a")
 		}
@@ -282,7 +282,7 @@ func (e *SubprocessExecutor) ExecRepack(ctx context.Context, req RepackRequest) 
 	}
 
 	if req.WriteMIDX {
-		args := []string{"-C", req.RepoDir, "multi-pack-index", "write"}
+		args := []string{"--git-dir", req.RepoDir, "multi-pack-index", "write"}
 		if req.WriteBitmap {
 			args = append(args, "--bitmap")
 		}
@@ -292,7 +292,7 @@ func (e *SubprocessExecutor) ExecRepack(ctx context.Context, req RepackRequest) 
 	}
 
 	if req.WriteCommitGraph {
-		args := []string{"-C", req.RepoDir, "commit-graph", "write", "--reachable", "--changed-paths"}
+		args := []string{"--git-dir", req.RepoDir, "commit-graph", "write", "--reachable", "--changed-paths"}
 		if err := e.run(ctx, "commit-graph", spec, req.RepoDir, args, nil, req.Stdout, req.Stderr, req.Timeout); err != nil {
 			return err
 		}
@@ -445,13 +445,14 @@ func scrubbedEnv(allowedPATH string) []string {
 // buildGitArgs prepends mandatory config attack-surface lockdown flags before
 // the requested git subcommand and its arguments.
 func buildGitArgs(subcommandArgs ...string) []string {
-	args := make([]string, 0, 10+len(subcommandArgs))
+	args := make([]string, 0, 12+len(subcommandArgs))
 	args = append(args,
 		"-c", "core.hooksPath=/dev/null",
 		"-c", "core.fsmonitor=false",
 		"-c", "core.alternateRefsCommand=exit 0",
 		"-c", "core.sshCommand=false",
 		"-c", "protocol.ext.allow=never",
+		"-c", "safe.bareRepository=explicit",
 	)
 	args = append(args, subcommandArgs...)
 	return args

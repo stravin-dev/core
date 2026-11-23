@@ -359,7 +359,7 @@ func TestConcurrentSharedBranchPushRace(t *testing.T) {
 
 			// Verify remote branch contains at least workers+1 commits (initial + 4 workers).
 			bareGit := loadgen.NewGitClient(bareDir, loadgen.GitOptions{})
-			out, err := bareGit.Run(context.Background(), "rev-list", "--count", "refs/heads/"+tc.branch)
+			out, err := bareGit.Run(context.Background(), "--git-dir", bareDir, "rev-list", "--count", "refs/heads/"+tc.branch)
 			if err != nil {
 				t.Fatalf("rev-list --count %s: %v", tc.branch, err)
 			}
@@ -393,7 +393,7 @@ func TestWasmHookRejectClassification(t *testing.T) {
 
 	// Verify no reject/* branch exists in bare repo, while hook-allow branch does.
 	bareGit := loadgen.NewGitClient(bareDir, loadgen.GitOptions{})
-	refsOut, err := bareGit.Run(context.Background(), "for-each-ref", "--format=%(refname)")
+	refsOut, err := bareGit.Run(context.Background(), "--git-dir", bareDir, "for-each-ref", "--format=%(refname)")
 	if err != nil {
 		t.Fatal(err)
 	}

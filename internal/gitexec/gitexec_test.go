@@ -68,6 +68,7 @@ func TestLockdownArgsPrependedBeforeSubcommand(t *testing.T) {
 		"-c", "core.alternateRefsCommand=exit 0",
 		"-c", "core.sshCommand=false",
 		"-c", "protocol.ext.allow=never",
+		"-c", "safe.bareRepository=explicit",
 	}
 
 	if len(args) != len(expectedPrefix)+len(sub) {
@@ -260,7 +261,7 @@ func TestExecIndexPackStdinRealGit(t *testing.T) {
 	bareDir, commitSHA := createBareRepoWithCommit(t)
 
 	// Build a valid packfile from the bare repo using git pack-objects.
-	packCmd := exec.Command("git", "-C", bareDir, "pack-objects", "--stdout", "--revs")
+	packCmd := exec.Command("git", "--git-dir", bareDir, "pack-objects", "--stdout", "--revs")
 	packCmd.Stdin = strings.NewReader(commitSHA + "\n")
 	packBytes, err := packCmd.Output()
 	if err != nil {
