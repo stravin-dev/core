@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -311,6 +313,7 @@ func TestMaterializer_ColdCacheAndIncrementalWatermarkSync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
+	t.Cleanup(mat.Close)
 
 	// 1. Cold-cache sync pulls pack1 and pack2, skips COMPACTED packOld, and materializes reftable refs.
 	res1, err := mat.SyncAndPin(ctx, rk)
@@ -511,6 +514,7 @@ func TestMaterializeReftableRefs_HandlesDirectoryFileRefReplacement(t *testing.T
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
+	t.Cleanup(mat.Close)
 
 	metaStore.SetRefs(rk, []ddb.RefState{{Repo: rk, RefName: "refs/heads/a/b", OID: oid1}})
 	res1, err := mat.SyncAndPin(ctx, rk)
@@ -571,6 +575,7 @@ func TestMaterializer_PrunesSupersededPacksAfterCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
+	t.Cleanup(mat.Close)
 
 	res1, err := mat.SyncAndPin(ctx, rk)
 	if err != nil {
@@ -644,6 +649,7 @@ func TestMaterializer_PrunesSupersededPacksWhileNewerReadersPinned(t *testing.T)
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
+	t.Cleanup(mat.Close)
 
 	// Reader 1 holds a pre-compaction lease.
 	res1, err := mat.SyncAndPin(ctx, rk)
@@ -725,6 +731,7 @@ func TestMaterializer_PrunesSupersededPacksOnPeriodicReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
+	t.Cleanup(mat.Close)
 
 	res1, err := mat.SyncAndPin(ctx, rk)
 	if err != nil {
@@ -828,6 +835,7 @@ func TestMaterializer_SyncAndPinPreventsStaleRefOverwriteAndCoalescesLinearizabl
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
+	t.Cleanup(mat.Close)
 
 	// Start Sync 1 (reads v1 refs).
 	type syncOutcome struct {
@@ -960,14 +968,16 @@ func TestMaterializer_RefreshAuxIndexesRecoversFromStaleLocks(t *testing.T) {
 
 	gitExec := gitexec.NewSubprocessExecutor(gitexec.Config{})
 	mat, err := NewMaterializer(MaterializerConfig{
-		Meta:        metaStore,
-		Packs:       packStore,
-		Cache:       c,
-		GitExecutor: gitExec,
+		Meta:                    metaStore,
+		Packs:                   packStore,
+		Cache:                   c,
+		GitExecutor:             gitExec,
+		AuxIndexRefreshInterval: -1,
 	})
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
+	t.Cleanup(mat.Close)
 
 	// Initial sync creates multi-pack-index, .bitmap, and commit-graph.
 	res1, err := mat.SyncAndPin(ctx, rk)
@@ -976,6 +986,9 @@ func TestMaterializer_RefreshAuxIndexesRecoversFromStaleLocks(t *testing.T) {
 	}
 	repoPath := res1.Handle.Path()
 	res1.Handle.Release()
+	if err := mat.WaitAuxIndexes(ctx); err != nil {
+		t.Fatalf("WaitAuxIndexes(1): %v", err)
+	}
 
 	midxPath := filepath.Join(repoPath, "objects", "pack", "multi-pack-index")
 	midxLockPath := filepath.Join(repoPath, "objects", "pack", "multi-pack-index.lock")
@@ -1002,6 +1015,9 @@ func TestMaterializer_RefreshAuxIndexesRecoversFromStaleLocks(t *testing.T) {
 		t.Fatalf("SyncAndPin(2): %v", err)
 	}
 	res2.Handle.Release()
+	if err := mat.WaitAuxIndexes(ctx); err != nil {
+		t.Fatalf("WaitAuxIndexes(2): %v", err)
+	}
 
 	if _, err := os.Stat(midxLockPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected multi-pack-index.lock to be removed, stat err=%v", err)
@@ -1039,6 +1055,9 @@ func TestMaterializer_RefreshAuxIndexesRecoversFromStaleLocks(t *testing.T) {
 		t.Fatalf("SyncAndPin(3): %v", err)
 	}
 	res3.Handle.Release()
+	if err := mat.WaitAuxIndexes(ctx); err != nil {
+		t.Fatalf("WaitAuxIndexes(3): %v", err)
+	}
 
 	if _, err := os.Stat(midxLockPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected multi-pack-index.lock (2) to be removed, stat err=%v", err)
@@ -1282,5 +1301,352 @@ func TestMaterializer_RefreshAuxIndexesZeroCommitFallbackStaysQuiet(t *testing.T
 	}
 	if got := metrics.promAuxIndexRefreshFailures.Load(); got != 0 {
 		t.Fatalf("promAuxIndexRefreshFailures = %d, want 0", got)
+	}
+}
+
+func TestMaterializer_MIDXAndBitmapStayActiveDuringDeferredPruneAndUnlink(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not installed")
+	}
+	ctx := context.Background()
+	rk, err := tenant.NewRepoKey("acme", "midx-deferred-prune")
+	if err != nil {
+		t.Fatalf("NewRepoKey: %v", err)
+	}
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	metaStore := newFakeMetadataStore()
+	packStore := newFakePackFetcher()
+
+	oid1, p1Bytes, i1Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "v1\n", "commit 1\n")
+	oid2, p2Bytes, i2Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "v2\n", "commit 2\n")
+	oid3, p3Bytes, i3Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "v3\n", "commit 3\n")
+	p1 := strings.Repeat("1", 64)
+	p2 := strings.Repeat("2", 64)
+	p3 := strings.Repeat("3", 64)
+
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1, RefShards: 1, ManifestShards: 1, WriteState: lease.ModeActive, DefaultBranch: "refs/heads/main",
+	})
+	metaStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: oid2},
+		{Repo: rk, RefName: "refs/heads/old", OID: oid1},
+	})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FM1", PackID: p1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1"})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FM2", PackID: p2, Status: ddb.PackStatusActive, OriginRegion: "us-east-1"})
+	packStore.Put(p1, p1Bytes, i1Bytes)
+	packStore.Put(p2, p2Bytes, i2Bytes)
+	packStore.Put(p3, p3Bytes, i3Bytes)
+
+	gitExec := gitexec.NewSubprocessExecutor(gitexec.Config{})
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:                    metaStore,
+		Packs:                   packStore,
+		Cache:                   c,
+		GitExecutor:             gitExec,
+		AuxIndexRefreshInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	// Reader 1 pins gen-0.
+	res1, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(1): %v", err)
+	}
+	if err := mat.WaitAuxIndexes(ctx); err != nil {
+		res1.Handle.Release()
+		t.Fatalf("WaitAuxIndexes(1): %v", err)
+	}
+	repoPath := res1.Handle.Path()
+	packDir := filepath.Join(repoPath, "objects", "pack")
+
+	// Compaction adds p3 and supersedes p1 while Reader 1 is still pinned.
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FM3", PackID: p3, Status: ddb.PackStatusActive, OriginRegion: "us-east-1"})
+	metaStore.SetManifestStatus(rk, 0, "01ARZ3NDEKTSV4RRFFQ69G5FM1", ddb.PackStatusCompacted)
+	metaStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: oid3},
+	})
+
+	// Reader 2 syncs and schedules p1 for deferred prune (PendingPruneCount == 1).
+	res2, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		res1.Handle.Release()
+		t.Fatalf("SyncAndPin(2): %v", err)
+	}
+
+	// Reader 3 acquires a post-prune (gen-1) lease so pins never drop to 0.
+	res3, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		res1.Handle.Release()
+		res2.Handle.Release()
+		t.Fatalf("SyncAndPin(3): %v", err)
+	}
+	defer res3.Handle.Release()
+
+	if got := c.PendingPruneCount(rk); got != 1 {
+		res1.Handle.Release()
+		res2.Handle.Release()
+		t.Fatalf("PendingPruneCount = %d, want 1", got)
+	}
+	if err := mat.WaitAuxIndexes(ctx); err != nil {
+		res1.Handle.Release()
+		res2.Handle.Release()
+		t.Fatalf("WaitAuxIndexes(2): %v", err)
+	}
+
+	// MIDX and .bitmap MUST be present and valid while PendingPruneCount > 0.
+	midxPath := filepath.Join(packDir, "multi-pack-index")
+	if _, err := os.Stat(midxPath); err != nil {
+		res1.Handle.Release()
+		res2.Handle.Release()
+		t.Fatalf("expected multi-pack-index present while PendingPruneCount > 0: %v", err)
+	}
+	bitmaps, err := filepath.Glob(filepath.Join(packDir, "multi-pack-index-*.bitmap"))
+	if err != nil || len(bitmaps) == 0 {
+		res1.Handle.Release()
+		res2.Handle.Release()
+		t.Fatalf("expected .bitmap present while PendingPruneCount > 0: glob=%v err=%v", bitmaps, err)
+	}
+
+	// Release prior-generation readers (res1 & res2) while post-prune res3 stays pinned ->
+	// p1 is unlinked, and MIDX & .bitmap built via --stdin-packs MUST survive!
+	res1.Handle.Release()
+	res2.Handle.Release()
+	if got := c.PendingPruneCount(rk); got != 0 {
+		t.Fatalf("PendingPruneCount after gen-0 release = %d, want 0", got)
+	}
+	if _, err := os.Stat(filepath.Join(packDir, "pack-"+p1+".pack")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected p1 unlinked, stat err=%v", err)
+	}
+	if _, err := os.Stat(midxPath); err != nil {
+		t.Fatalf("expected multi-pack-index preserved after deferred unlink: %v", err)
+	}
+	bitmapsAfter, err := filepath.Glob(filepath.Join(packDir, "multi-pack-index-*.bitmap"))
+	if err != nil || len(bitmapsAfter) == 0 {
+		t.Fatalf("expected .bitmap preserved after deferred unlink: glob=%v err=%v", bitmapsAfter, err)
+	}
+
+	// git multi-pack-index verify and git upload-pack must both succeed with zero errors.
+	verifyCmd := exec.Command("git", "--git-dir", repoPath, "multi-pack-index", "verify")
+	if out, err := verifyCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git multi-pack-index verify failed after deferred unlink: %v\n%s", err, string(out))
+	}
+	var upOut, upErr bytes.Buffer
+	wantReq := fmt.Sprintf("0032want %s\n00000009done\n", oid3)
+	if err := gitExec.ExecUploadPack(ctx, gitexec.UploadPackRequest{
+		Repo:         rk,
+		RepoDir:      repoPath,
+		StatelessRPC: true,
+		Stdin:        strings.NewReader(wantReq),
+		Stdout:       &upOut,
+		Stderr:       &upErr,
+	}); err != nil {
+		t.Fatalf("ExecUploadPack failed after deferred unlink: %v (stderr=%s)", err, upErr.String())
+	}
+	if !bytes.Contains(upOut.Bytes(), []byte("PACK")) {
+		t.Fatalf("expected PACK payload from ExecUploadPack, got %d bytes", upOut.Len())
+	}
+}
+
+func TestMaterializer_SyncAndPinDoesNotBlockOnSlowAuxIndexAndCoalesces(t *testing.T) {
+	ctx := context.Background()
+	rk, err := tenant.NewRepoKey("acme", "async-coalesce")
+	if err != nil {
+		t.Fatalf("NewRepoKey: %v", err)
+	}
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	metaStore := newFakeMetadataStore()
+	packStore := newFakePackFetcher()
+
+	oid1, p1Bytes, i1Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "a1\n", "c1\n")
+	oid2, p2Bytes, i2Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "a2\n", "c2\n")
+	p1 := strings.Repeat("a", 64)
+	p2 := strings.Repeat("b", 64)
+
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1, RefShards: 1, ManifestShards: 1, WriteState: lease.ModeActive, DefaultBranch: "refs/heads/main",
+	})
+	metaStore.SetRefs(rk, []ddb.RefState{{Repo: rk, RefName: "refs/heads/main", OID: oid1}})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FN1", PackID: p1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1"})
+	packStore.Put(p1, p1Bytes, i1Bytes)
+	packStore.Put(p2, p2Bytes, i2Bytes)
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var midxCalls atomic.Int32
+
+	execStub := &stubRepackExecutor{
+		SubprocessExecutor: gitexec.NewSubprocessExecutor(gitexec.Config{}),
+		onRepack: func(ctx context.Context, req gitexec.RepackRequest) error {
+			if req.WriteMIDX {
+				if midxCalls.Add(1) == 1 {
+					close(firstStarted)
+					select {
+					case <-releaseFirst:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+			}
+			return nil
+		},
+	}
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:                    metaStore,
+		Packs:                   packStore,
+		Cache:                   c,
+		GitExecutor:             execStub,
+		AuxIndexRefreshInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	// SyncAndPin must return promptly even though ExecRepack is blocked on releaseFirst.
+	start := time.Now()
+	res1, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(1): %v", err)
+	}
+	res1.Handle.Release()
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("SyncAndPin blocked for %v on slow refreshAuxIndexes", elapsed)
+	}
+
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background refreshAuxIndexes did not start")
+	}
+
+	// Trigger 5 rapid syncs with ref changes while the first refresh is blocked.
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FN2", PackID: p2, Status: ddb.PackStatusActive, OriginRegion: "us-east-1"})
+	for i := 0; i < 5; i++ {
+		oid := oid2
+		if i%2 == 0 {
+			oid = oid1
+		}
+		metaStore.SetRefs(rk, []ddb.RefState{{Repo: rk, RefName: "refs/heads/main", OID: oid}})
+		res, err := mat.SyncAndPin(ctx, rk)
+		if err != nil {
+			close(releaseFirst)
+			t.Fatalf("SyncAndPin(burst %d): %v", i, err)
+		}
+		res.Handle.Release()
+	}
+
+	close(releaseFirst)
+	if err := mat.WaitAuxIndexes(ctx); err != nil {
+		t.Fatalf("WaitAuxIndexes: %v", err)
+	}
+
+	if got := midxCalls.Load(); got != 2 {
+		t.Fatalf("midxCalls = %d, want 2 (1 initial + 1 coalesced follow-up for 5 burst syncs)", got)
+	}
+}
+
+func TestMaterializer_UnchangedFlightsDoNotRebuildCommitGraph(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not installed")
+	}
+	ctx := context.Background()
+	rk, err := tenant.NewRepoKey("acme", "cg-unchanged")
+	if err != nil {
+		t.Fatalf("NewRepoKey: %v", err)
+	}
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	metaStore := newFakeMetadataStore()
+	packStore := newFakePackFetcher()
+
+	oid1, p1Bytes, i1Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "cg1\n", "commit 1\n")
+	p1 := strings.Repeat("7", 64)
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1, RefShards: 1, ManifestShards: 1, WriteState: lease.ModeActive, DefaultBranch: "refs/heads/main",
+	})
+	metaStore.SetRefs(rk, []ddb.RefState{{Repo: rk, RefName: "refs/heads/main", OID: oid1}})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FP1", PackID: p1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1"})
+	packStore.Put(p1, p1Bytes, i1Bytes)
+
+	var midxCalls, cgCalls atomic.Int32
+	baseExec := gitexec.NewSubprocessExecutor(gitexec.Config{})
+	execStub := &stubRepackExecutor{
+		SubprocessExecutor: baseExec,
+		onRepack: func(ctx context.Context, req gitexec.RepackRequest) error {
+			if req.WriteMIDX {
+				midxCalls.Add(1)
+			}
+			if req.WriteCommitGraph {
+				cgCalls.Add(1)
+			}
+			return baseExec.ExecRepack(ctx, req)
+		},
+	}
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:                    metaStore,
+		Packs:                   packStore,
+		Cache:                   c,
+		GitExecutor:             execStub,
+		AuxIndexRefreshInterval: -1,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	// 1. Initial sync builds both MIDX and commit-graph.
+	res1, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(1): %v", err)
+	}
+	repoPath := res1.Handle.Path()
+	res1.Handle.Release()
+	if err := mat.WaitAuxIndexes(ctx); err != nil {
+		t.Fatalf("WaitAuxIndexes(1): %v", err)
+	}
+	if midxCalls.Load() != 1 || cgCalls.Load() != 1 {
+		t.Fatalf("after initial sync: midx=%d cg=%d, want 1, 1", midxCalls.Load(), cgCalls.Load())
+	}
+
+	// 2. Unchanged sync must not rebuild either MIDX or commit-graph.
+	res2, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(2): %v", err)
+	}
+	res2.Handle.Release()
+	if err := mat.WaitAuxIndexes(ctx); err != nil {
+		t.Fatalf("WaitAuxIndexes(2): %v", err)
+	}
+	if midxCalls.Load() != 1 || cgCalls.Load() != 1 {
+		t.Fatalf("after unchanged sync: midx=%d cg=%d, want 1, 1", midxCalls.Load(), cgCalls.Load())
+	}
+
+	// 3. Remove only multi-pack-index; unchanged sync must rebuild ONLY MIDX, not commit-graph.
+	if err := os.Remove(filepath.Join(repoPath, "objects", "pack", "multi-pack-index")); err != nil {
+		t.Fatalf("remove multi-pack-index: %v", err)
+	}
+	res3, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(3): %v", err)
+	}
+	res3.Handle.Release()
+	if err := mat.WaitAuxIndexes(ctx); err != nil {
+		t.Fatalf("WaitAuxIndexes(3): %v", err)
+	}
+	if midxCalls.Load() != 2 || cgCalls.Load() != 1 {
+		t.Fatalf("after MIDX-only rebuild: midx=%d cg=%d, want 2, 1", midxCalls.Load(), cgCalls.Load())
 	}
 }

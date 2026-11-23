@@ -26,6 +26,8 @@ const (
 	defaultMaxConcurrentPackFetches = 8
 	defaultPruneReconcileInterval   = 30 * time.Second
 	defaultAuxIndexRefreshTimeout   = 30 * time.Second
+	defaultAuxIndexRefreshInterval  = 2 * time.Second
+	maxImmediateAuxRetries          = 2
 )
 
 // MetadataStore is the narrow DynamoDB read seam used by Materializer.
@@ -54,6 +56,10 @@ type MaterializerConfig struct {
 	Logger                   *slog.Logger
 	MaxConcurrentPackFetches int
 	PruneReconcileInterval   time.Duration
+	// AuxIndexRefreshInterval sets the minimum cooldown between background
+	// MIDX/bitmap/commit-graph refreshes per repository. Zero defaults to 2s;
+	// negative values disable the cooldown (useful for deterministic tests).
+	AuxIndexRefreshInterval time.Duration
 }
 
 // SyncResult holds the authoritative DynamoDB state and pinned NVMe bare-repo handle.
@@ -71,6 +77,18 @@ type repoSyncSnapshot struct {
 	refs []ddb.RefState
 }
 
+type auxRepoState struct {
+	running   bool
+	dirty     bool
+	changed   bool
+	hasRefs   bool
+	immediate bool
+	repoPath  string
+	lastRun   time.Time
+	doneCh    chan struct{}
+	wakeCh    chan struct{}
+}
+
 // Materializer implements the GoF Facade / Template Method pipeline for
 // synchronizing DynamoDB metadata and S3 packfiles into the warm NVMe cache.
 type Materializer struct {
@@ -84,12 +102,20 @@ type Materializer struct {
 	logger                 *slog.Logger
 	maxConcurrency         int
 	pruneReconcileInterval time.Duration
+	auxRefreshInterval     time.Duration
 
 	reconcileMu   sync.Mutex
 	lastReconcile map[tenant.RepoKey]time.Time
 
 	lastSyncMu sync.Mutex
 	lastSync   map[tenant.RepoKey]repoSyncSnapshot
+
+	auxMu     sync.Mutex
+	auxClosed bool
+	auxStates map[tenant.RepoKey]*auxRepoState
+	auxCtx    context.Context
+	auxCancel context.CancelFunc
+	auxWG     sync.WaitGroup
 }
 
 // NewMaterializer constructs a Materializer with validated dependencies.
@@ -127,6 +153,14 @@ func NewMaterializer(cfg MaterializerConfig) (*Materializer, error) {
 	if reconcileInterval <= 0 {
 		reconcileInterval = defaultPruneReconcileInterval
 	}
+	auxInterval := cfg.AuxIndexRefreshInterval
+	switch {
+	case auxInterval == 0:
+		auxInterval = defaultAuxIndexRefreshInterval
+	case auxInterval < 0:
+		auxInterval = 0
+	}
+	auxCtx, auxCancel := context.WithCancel(context.Background())
 	return &Materializer{
 		meta:                   cfg.Meta,
 		packs:                  cfg.Packs,
@@ -138,9 +172,49 @@ func NewMaterializer(cfg MaterializerConfig) (*Materializer, error) {
 		logger:                 logger,
 		maxConcurrency:         maxConc,
 		pruneReconcileInterval: reconcileInterval,
+		auxRefreshInterval:     auxInterval,
 		lastReconcile:          make(map[tenant.RepoKey]time.Time),
 		lastSync:               make(map[tenant.RepoKey]repoSyncSnapshot),
+		auxStates:              make(map[tenant.RepoKey]*auxRepoState),
+		auxCtx:                 auxCtx,
+		auxCancel:              auxCancel,
 	}, nil
+}
+
+// Close cancels pending background auxiliary index refreshes and waits for all
+// in-flight refresh goroutines to exit. It is safe to call multiple times.
+func (m *Materializer) Close() {
+	m.auxMu.Lock()
+	if !m.auxClosed {
+		m.auxClosed = true
+		m.auxCancel()
+	}
+	m.auxMu.Unlock()
+	m.auxWG.Wait()
+}
+
+// WaitAuxIndexes blocks until all currently scheduled or running background
+// auxiliary index refreshes complete, or ctx is canceled.
+func (m *Materializer) WaitAuxIndexes(ctx context.Context) error {
+	for {
+		m.auxMu.Lock()
+		var waitCh chan struct{}
+		for _, st := range m.auxStates {
+			if st.running && st.doneCh != nil {
+				waitCh = st.doneCh
+				break
+			}
+		}
+		m.auxMu.Unlock()
+		if waitCh == nil {
+			return nil
+		}
+		select {
+		case <-waitCh:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // LoadAuthoritativeRefs reads META and all ref shards (RS#{s}) strictly from
@@ -211,7 +285,7 @@ func (m *Materializer) SyncAndPin(ctx context.Context, repo tenant.RepoKey) (Syn
 		if err != nil {
 			return fmt.Errorf("node: materialize reftable refs %s: %w", repo, err)
 		}
-		m.refreshAuxIndexes(syncCtx, repo, repoPath, fetched > 0 || pruned > 0 || refsChanged, len(loadedRefs) > 0)
+		m.scheduleAuxIndexRefresh(repo, repoPath, fetched > 0 || pruned > 0 || refsChanged, len(loadedRefs) > 0)
 
 		m.recordLastSync(repo, loadedMeta, loadedRefs)
 		meta = loadedMeta
@@ -609,48 +683,187 @@ func (m *Materializer) materializeReftableRefs(ctx context.Context, repo tenant.
 	return len(updates) > 0, nil
 }
 
-// refreshAuxIndexes maintains multi-pack-index (+ reachability .bitmap) and
-// commit-graph on the warm NVMe bare repository when packs or refs change.
-// It runs inside the repo's serialized cache.Materialize flight with a detached
-// bounded timeout so client disconnects cannot abort writes mid-flight, removes
-// any stale lockfiles before and on failure, and surfaces unexpected failures
-// at Warn level + OTel counter while keeping zero-commit skips quiet.
-func (m *Materializer) refreshAuxIndexes(ctx context.Context, repo tenant.RepoKey, repoPath string, changed, hasRefs bool) {
-	packs, err := filepath.Glob(filepath.Join(repoPath, "objects", "pack", "*.pack"))
-	if err != nil || len(packs) == 0 {
-		return
-	}
-
+// scheduleAuxIndexRefresh enqueues a coalesced, debounced background refresh of
+// multi-pack-index (+ .bitmap) and commit-graph for repo without blocking
+// SyncAndPin. When multi-pack-index is absent on disk, the refresh runs
+// immediately without waiting for the cooldown interval.
+func (m *Materializer) scheduleAuxIndexRefresh(repo tenant.RepoKey, repoPath string, changed, hasRefs bool) {
 	_, midxStatErr := os.Stat(filepath.Join(repoPath, "objects", "pack", "multi-pack-index"))
 	_, cgStatErr := os.Stat(filepath.Join(repoPath, "objects", "info", "commit-graph"))
 	if !changed && midxStatErr == nil && (!hasRefs || cgStatErr == nil) {
 		return
 	}
+	midxMissing := midxStatErr != nil
 
-	// Detach from caller cancellation so a disconnected client does not abort
-	// MIDX/commit-graph writes mid-flight and strand .lock files.
-	auxCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultAuxIndexRefreshTimeout)
+	m.auxMu.Lock()
+	if m.auxClosed {
+		m.auxMu.Unlock()
+		return
+	}
+	st, ok := m.auxStates[repo]
+	if !ok {
+		st = &auxRepoState{wakeCh: make(chan struct{}, 1)}
+		m.auxStates[repo] = st
+	}
+	st.repoPath = repoPath
+	st.hasRefs = hasRefs
+	st.changed = st.changed || changed
+	st.immediate = st.immediate || midxMissing
+	st.dirty = true
+	if st.running {
+		if midxMissing {
+			select {
+			case st.wakeCh <- struct{}{}:
+			default:
+			}
+		}
+		m.auxMu.Unlock()
+		return
+	}
+	st.running = true
+	st.doneCh = make(chan struct{})
+	m.auxWG.Add(1)
+	m.auxMu.Unlock()
+
+	go m.runAuxIndexLoop(repo, st)
+}
+
+func (m *Materializer) runAuxIndexLoop(repo tenant.RepoKey, st *auxRepoState) {
+	defer m.auxWG.Done()
+	immediateRetries := 0
+	for {
+		m.auxMu.Lock()
+		if m.auxClosed || !st.dirty {
+			st.running = false
+			st.dirty = false
+			close(st.doneCh)
+			st.doneCh = nil
+			m.auxMu.Unlock()
+			return
+		}
+		var wait time.Duration
+		if !st.immediate && !st.lastRun.IsZero() && m.auxRefreshInterval > 0 {
+			if elapsed := time.Since(st.lastRun); elapsed < m.auxRefreshInterval {
+				wait = m.auxRefreshInterval - elapsed
+			}
+		}
+		if wait <= 0 {
+			repoPath := st.repoPath
+			changed := st.changed
+			hasRefs := st.hasRefs
+			st.dirty = false
+			st.changed = false
+			st.immediate = false
+			m.auxMu.Unlock()
+
+			needsRetry := m.runPinnedAuxIndexRefresh(repo, repoPath, changed, hasRefs)
+
+			m.auxMu.Lock()
+			st.lastRun = time.Now()
+			if needsRetry && !m.auxClosed {
+				st.dirty = true
+				st.changed = true
+				if immediateRetries < maxImmediateAuxRetries {
+					immediateRetries++
+					st.immediate = true
+				}
+			} else {
+				immediateRetries = 0
+			}
+			m.auxMu.Unlock()
+			continue
+		}
+		wakeCh := st.wakeCh
+		m.auxMu.Unlock()
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-m.auxCtx.Done():
+			timer.Stop()
+			m.auxMu.Lock()
+			st.running = false
+			st.dirty = false
+			close(st.doneCh)
+			st.doneCh = nil
+			m.auxMu.Unlock()
+			return
+		case <-wakeCh:
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
+}
+
+func (m *Materializer) runPinnedAuxIndexRefresh(repo tenant.RepoKey, fallbackPath string, changed, hasRefs bool) bool {
+	handle, err := m.cache.Pin(repo)
+	if err != nil {
+		return false
+	}
+	defer handle.Release()
+	repoPath := handle.Path()
+	if repoPath == "" {
+		repoPath = fallbackPath
+	}
+	return m.executeAuxIndexRefresh(m.auxCtx, repo, repoPath, changed, hasRefs)
+}
+
+// refreshAuxIndexes maintains multi-pack-index (+ reachability .bitmap) and
+// commit-graph on the warm NVMe bare repository when packs or refs change.
+// It detaches from caller cancellation with a bounded timeout so client
+// disconnects cannot abort writes mid-flight, removes stale lockfiles before
+// and on failure, and surfaces unexpected failures at Warn level + OTel counter.
+func (m *Materializer) refreshAuxIndexes(ctx context.Context, repo tenant.RepoKey, repoPath string, changed, hasRefs bool) {
+	m.executeAuxIndexRefresh(context.WithoutCancel(ctx), repo, repoPath, changed, hasRefs)
+}
+
+func (m *Materializer) executeAuxIndexRefresh(ctx context.Context, repo tenant.RepoKey, repoPath string, changed, hasRefs bool) (needsMIDXRetry bool) {
+	activeIdxNames, midxGen := m.cache.ActivePackIdxNames(repo)
+	hasActivePacks := len(activeIdxNames) > 0
+	if !hasActivePacks {
+		if len(m.cache.CachedPackIDs(repo)) > 0 {
+			// All cached packs are pending prune; skip MIDX until new packs arrive.
+			return false
+		}
+		packs, err := filepath.Glob(filepath.Join(repoPath, "objects", "pack", "*.pack"))
+		if err != nil || len(packs) == 0 {
+			return false
+		}
+	}
+
+	_, midxStatErr := os.Stat(filepath.Join(repoPath, "objects", "pack", "multi-pack-index"))
+	_, cgStatErr := os.Stat(filepath.Join(repoPath, "objects", "info", "commit-graph"))
+	needMIDX := changed || midxStatErr != nil
+	needCG := hasRefs && (changed || cgStatErr != nil)
+	if !needMIDX && !needCG {
+		return false
+	}
+
+	auxCtx, cancel := context.WithTimeout(ctx, defaultAuxIndexRefreshTimeout)
 	defer cancel()
 
 	midxLockPath := filepath.Join(repoPath, "objects", "pack", "multi-pack-index.lock")
 	cgLockPath := filepath.Join(repoPath, "objects", "info", "commit-graph.lock")
 
-	if m.cache.PendingPruneCount(repo) == 0 {
+	if needMIDX {
 		m.removeStaleAuxLock(auxCtx, midxLockPath)
+		midxBuilt := true
 		if err := m.gitExec.ExecRepack(auxCtx, gitexec.RepackRequest{
 			Repo:        repo,
 			RepoDir:     repoPath,
 			WriteMIDX:   true,
 			WriteBitmap: hasRefs,
+			StdinPacks:  activeIdxNames,
 		}); err != nil {
 			m.removeStaleAuxLock(auxCtx, midxLockPath)
 			if hasRefs {
 				// Gracefully fall back to MIDX without bitmap for zero-commit repos (e.g. blob/tag-only).
 				if fallbackErr := m.gitExec.ExecRepack(auxCtx, gitexec.RepackRequest{
-					Repo:      repo,
-					RepoDir:   repoPath,
-					WriteMIDX: true,
+					Repo:       repo,
+					RepoDir:    repoPath,
+					WriteMIDX:  true,
+					StdinPacks: activeIdxNames,
 				}); fallbackErr != nil {
+					midxBuilt = false
 					m.removeStaleAuxLock(auxCtx, midxLockPath)
 					m.logger.WarnContext(auxCtx, "node: failed to refresh multi-pack-index",
 						"repo", repo.String(), "error", fallbackErr)
@@ -659,6 +872,7 @@ func (m *Materializer) refreshAuxIndexes(ctx context.Context, repo tenant.RepoKe
 					}
 				}
 			} else {
+				midxBuilt = false
 				m.logger.WarnContext(auxCtx, "node: failed to refresh multi-pack-index",
 					"repo", repo.String(), "error", err)
 				if m.metrics != nil {
@@ -666,9 +880,14 @@ func (m *Materializer) refreshAuxIndexes(ctx context.Context, repo tenant.RepoKe
 				}
 			}
 		}
+		if midxBuilt && hasActivePacks {
+			if !m.cache.MarkMIDXBuilt(repo, midxGen) {
+				needsMIDXRetry = true
+			}
+		}
 	}
 
-	if hasRefs {
+	if needCG {
 		m.removeStaleAuxLock(auxCtx, cgLockPath)
 		if err := m.gitExec.ExecRepack(auxCtx, gitexec.RepackRequest{
 			Repo:             repo,
@@ -683,6 +902,7 @@ func (m *Materializer) refreshAuxIndexes(ctx context.Context, repo tenant.RepoKe
 			}
 		}
 	}
+	return needsMIDXRetry
 }
 
 func (m *Materializer) removeStaleAuxLock(ctx context.Context, path string) {

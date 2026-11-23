@@ -223,6 +223,7 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 	if err != nil {
 		return fmt.Errorf("node: init materializer: %w", err)
 	}
+	defer materializer.Close()
 
 	writeHandler := cfg.WriteHandler
 	if writeHandler == nil {

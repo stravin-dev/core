@@ -221,6 +221,7 @@ func newInMemoryStackWithOptions(t *testing.T, bundleResolver node.BundleURIReso
 			func() { _ = dialer.Close() },
 			grpcSrv.Stop,
 			func() { _ = grpcLn.Close() },
+			mat.Close,
 		},
 	}
 	t.Cleanup(func() {
@@ -231,6 +232,7 @@ func newInMemoryStackWithOptions(t *testing.T, bundleResolver node.BundleURIReso
 	return &inMemoryStackWithCache{
 		inMemoryStack: s,
 		nvmeCache:     nvmeCache,
+		materializer:  mat,
 	}
 }
 

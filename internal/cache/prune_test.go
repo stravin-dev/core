@@ -413,3 +413,128 @@ func TestCacheMetricsActiveAndPendingPrunePacks(t *testing.T) {
 		t.Fatalf("after prune stravin_cache_packs_pruned_total = %d, want 2", got["stravin_cache_packs_pruned_total"])
 	}
 }
+
+func TestActivePackIdxNamesAndMarkMIDXBuiltPreservesMIDXOnDeferredUnlink(t *testing.T) {
+	root := t.TempDir()
+	c, err := cache.New(cache.Config{
+		Root:              root,
+		MaxBytes:          1 << 20,
+		MaxTenantFraction: 1.0,
+	})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	repo := mustRepoKey(t, "local", "midx-keep")
+	if err := c.InstallPack(repo, "p1", make([]byte, 64), make([]byte, 16)); err != nil {
+		t.Fatalf("InstallPack p1: %v", err)
+	}
+	if err := c.InstallPack(repo, "p2", make([]byte, 64), make([]byte, 16)); err != nil {
+		t.Fatalf("InstallPack p2: %v", err)
+	}
+
+	// Gen-0 reader pins repo before prune.
+	gen0, err := c.Pin(repo)
+	if err != nil {
+		t.Fatalf("Pin gen0: %v", err)
+	}
+	if err := c.PrunePacks(repo, []string{"p1"}); err != nil {
+		t.Fatalf("PrunePacks p1: %v", err)
+	}
+
+	// ActivePackIdxNames must exclude pending-prune pack p1 and return gen >= 1.
+	idxNames, gen := c.ActivePackIdxNames(repo)
+	if len(idxNames) != 1 || idxNames[0] != "pack-p2.idx" {
+		t.Fatalf("ActivePackIdxNames = %v, want [pack-p2.idx]", idxNames)
+	}
+	if gen == 0 {
+		t.Fatalf("expected prune generation > 0 after PrunePacks, got %d", gen)
+	}
+
+	// Simulate building MIDX + .bitmap using --stdin-packs at gen while p1 is still pending prune.
+	packDir := filepath.Join(root, "t", "local", "midx-keep", "objects", "pack")
+	midxPath := filepath.Join(packDir, "multi-pack-index")
+	bitmapPath := filepath.Join(packDir, "multi-pack-index-deadbeef.bitmap")
+	if err := os.WriteFile(midxPath, []byte("MIDX-V1"), 0o600); err != nil {
+		t.Fatalf("write midx: %v", err)
+	}
+	if err := os.WriteFile(bitmapPath, []byte("BITM-V1"), 0o600); err != nil {
+		t.Fatalf("write bitmap: %v", err)
+	}
+	if ok := c.MarkMIDXBuilt(repo, gen); !ok {
+		t.Fatalf("MarkMIDXBuilt(gen=%d) = false, want true", gen)
+	}
+
+	// Gen-1 reader keeps repo pinned while gen-0 releases -> p1 unlinks, MIDX/bitmap stay intact!
+	gen1, err := c.Pin(repo)
+	if err != nil {
+		t.Fatalf("Pin gen1: %v", err)
+	}
+	defer gen1.Release()
+
+	gen0.Release()
+
+	if _, err := os.Stat(filepath.Join(packDir, "pack-p1.pack")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected pack-p1.pack unlinked after gen0 release, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(packDir, "pack-p1.idx")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected pack-p1.idx unlinked after gen0 release, err=%v", err)
+	}
+	if _, err := os.Stat(midxPath); err != nil {
+		t.Fatalf("expected multi-pack-index preserved after safe deferred unlink, err=%v", err)
+	}
+	if _, err := os.Stat(bitmapPath); err != nil {
+		t.Fatalf("expected .bitmap preserved after safe deferred unlink, err=%v", err)
+	}
+}
+
+func TestMarkMIDXBuiltInvalidatesStaleGeneration(t *testing.T) {
+	root := t.TempDir()
+	c, err := cache.New(cache.Config{
+		Root:              root,
+		MaxBytes:          1 << 20,
+		MaxTenantFraction: 1.0,
+	})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	repo := mustRepoKey(t, "local", "midx-stale")
+	if err := c.InstallPack(repo, "p1", make([]byte, 64), make([]byte, 16)); err != nil {
+		t.Fatalf("InstallPack p1: %v", err)
+	}
+	if err := c.InstallPack(repo, "p2", make([]byte, 64), make([]byte, 16)); err != nil {
+		t.Fatalf("InstallPack p2: %v", err)
+	}
+
+	gen0, err := c.Pin(repo)
+	if err != nil {
+		t.Fatalf("Pin gen0: %v", err)
+	}
+	defer gen0.Release()
+
+	_, staleGen := c.ActivePackIdxNames(repo)
+	if err := c.PrunePacks(repo, []string{"p1"}); err != nil {
+		t.Fatalf("PrunePacks p1: %v", err)
+	}
+
+	packDir := filepath.Join(root, "t", "local", "midx-stale", "objects", "pack")
+	midxPath := filepath.Join(packDir, "multi-pack-index")
+	bitmapPath := filepath.Join(packDir, "multi-pack-index-cafe.bitmap")
+	if err := os.WriteFile(midxPath, []byte("STALE-MIDX"), 0o600); err != nil {
+		t.Fatalf("write midx: %v", err)
+	}
+	if err := os.WriteFile(bitmapPath, []byte("STALE-BITM"), 0o600); err != nil {
+		t.Fatalf("write bitmap: %v", err)
+	}
+
+	if ok := c.MarkMIDXBuilt(repo, staleGen); ok {
+		t.Fatalf("MarkMIDXBuilt(staleGen=%d) = true, want false after prune", staleGen)
+	}
+	if _, err := os.Stat(midxPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected stale multi-pack-index invalidated, err=%v", err)
+	}
+	if _, err := os.Stat(bitmapPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected stale .bitmap invalidated, err=%v", err)
+	}
+}

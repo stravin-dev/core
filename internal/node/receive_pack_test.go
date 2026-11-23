@@ -268,6 +268,7 @@ func newTestReceivePackEnv(t *testing.T, repoName string) *testReceivePackEnv {
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
+	t.Cleanup(mat.Close)
 
 	hookEngine := wasm.NewEngine(
 		NewS3WasmLoader(s3Store),
