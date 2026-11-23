@@ -29,6 +29,16 @@ type Scenario interface {
 	Run(ctx context.Context, env *ScenarioEnv) error
 }
 
+// SSHScenario is an optional interface implemented by scenarios that require SSH transport.
+type SSHScenario interface {
+	RequiresSSH() bool
+}
+
+func scenarioRequiresSSH(s Scenario) bool {
+	sshScen, ok := s.(SSHScenario)
+	return ok && sshScen.RequiresSSH()
+}
+
 // ScenarioEnv provides per-worker isolated dependencies for executing a Scenario.
 type ScenarioEnv struct {
 	Config      Config
@@ -203,6 +213,22 @@ func (r *Registry) Filter(names []string) (*Registry, error) {
 		s, ok := r.byName[name]
 		if !ok {
 			return nil, fmt.Errorf("loadgen: unknown scenario %q", name)
+		}
+		if err := out.Register(s); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (r *Registry) withoutSSH() (*Registry, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := NewRegistry()
+	for _, s := range r.byName {
+		if scenarioRequiresSSH(s) {
+			continue
 		}
 		if err := out.Register(s); err != nil {
 			return nil, err

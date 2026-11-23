@@ -494,6 +494,7 @@ type devSSHFullLifecycle struct{}
 func (s *devSSHFullLifecycle) Name() string             { return "dev_ssh_full_lifecycle" }
 func (s *devSSHFullLifecycle) Persona() loadgen.Persona { return loadgen.PersonaDev }
 func (s *devSSHFullLifecycle) Weight() int              { return 8 }
+func (s *devSSHFullLifecycle) RequiresSSH() bool        { return true }
 
 func (s *devSSHFullLifecycle) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)

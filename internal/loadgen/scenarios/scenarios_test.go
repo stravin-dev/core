@@ -77,6 +77,12 @@ func TestRegisterAllAndCatalogInvariants(t *testing.T) {
 		if s.Persona() != wantPersona {
 			t.Errorf("scenario %q persona = %q, want %q", s.Name(), s.Persona(), wantPersona)
 		}
+		wantSSH := s.Name() == "dev_ssh_full_lifecycle" || s.Name() == "agent_protocol_switch_http_ssh"
+		sshScen, isSSH := s.(loadgen.SSHScenario)
+		gotSSH := isSSH && sshScen.RequiresSSH()
+		if gotSSH != wantSSH {
+			t.Errorf("scenario %q RequiresSSH() = %v, want %v", s.Name(), gotSSH, wantSSH)
+		}
 		seen[s.Name()] = true
 	}
 	for name := range wantNames {

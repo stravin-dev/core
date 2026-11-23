@@ -55,6 +55,9 @@ func TestParseFlagsDefaults(t *testing.T) {
 	if cfg.FlushTimeout != 10*time.Second {
 		t.Errorf("FlushTimeout = %v, want 10s", cfg.FlushTimeout)
 	}
+	if cfg.CmdTimeout != 30*time.Second {
+		t.Errorf("CmdTimeout = %v, want 30s", cfg.CmdTimeout)
+	}
 	if cfg.MaxRetries != 3 {
 		t.Errorf("MaxRetries = %d, want 3", cfg.MaxRetries)
 	}
@@ -84,6 +87,7 @@ func TestParseFlagsCustomValues(t *testing.T) {
 		"--think-max=100ms",
 		"--otel-endpoint=",
 		"--flush-timeout=5s",
+		"--cmd-timeout=45s",
 		"--scenarios=dev-push, agent-clone",
 		"--max-retries=5",
 		"--fail-fast",
@@ -110,8 +114,8 @@ func TestParseFlagsCustomValues(t *testing.T) {
 	if cfg.Tenant != "acme" || cfg.Seed != 42 || cfg.Duration != 2*time.Minute {
 		t.Errorf("tenant/seed/duration = %q/%d/%v", cfg.Tenant, cfg.Seed, cfg.Duration)
 	}
-	if cfg.OtelEndpoint != "" || cfg.FlushTimeout != 5*time.Second {
-		t.Errorf("otel/flush = %q/%v", cfg.OtelEndpoint, cfg.FlushTimeout)
+	if cfg.OtelEndpoint != "" || cfg.FlushTimeout != 5*time.Second || cfg.CmdTimeout != 45*time.Second {
+		t.Errorf("otel/flush/cmd = %q/%v/%v", cfg.OtelEndpoint, cfg.FlushTimeout, cfg.CmdTimeout)
 	}
 	if cfg.MaxRetries != 5 || !cfg.FailFast {
 		t.Errorf("retries/failfast = %d/%v", cfg.MaxRetries, cfg.FailFast)
@@ -136,6 +140,7 @@ func TestConfigValidateErrors(t *testing.T) {
 		{name: "negative think min", mutate: func(c *Config) { c.ThinkMin = -1 * time.Millisecond }},
 		{name: "negative duration", mutate: func(c *Config) { c.Duration = -1 * time.Second }},
 		{name: "zero flush timeout", mutate: func(c *Config) { c.FlushTimeout = 0 }},
+		{name: "negative cmd timeout", mutate: func(c *Config) { c.CmdTimeout = -1 * time.Second }},
 		{name: "negative max retries", mutate: func(c *Config) { c.MaxRetries = -1 }},
 		{name: "empty repos", mutate: func(c *Config) { c.Repos = nil }},
 		{name: "empty tenant", mutate: func(c *Config) { c.Tenant = "" }},

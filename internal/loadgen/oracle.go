@@ -55,6 +55,11 @@ func ClassifyError(err error, opts ClassifyOptions) ErrorClass {
 		return ErrorUnexpected
 	}
 
+	// Per-command git timeouts are retryable transient failures.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ErrorRetryableTransient
+	}
+
 	// Expected rejection in negative test scenarios (e.g. Wasm pre-receive reject).
 	if opts.ExpectReject && isCleanReject(httpStatus, combined) {
 		return ErrorExpectedReject

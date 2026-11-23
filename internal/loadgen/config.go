@@ -31,6 +31,7 @@ type Config struct {
 	ThinkMax     time.Duration
 	OtelEndpoint string
 	FlushTimeout time.Duration
+	CmdTimeout   time.Duration
 	Scenarios    []string
 	MaxRetries   int
 	FailFast     bool
@@ -55,6 +56,7 @@ func DefaultConfig() Config {
 		ThinkMax:     500 * time.Millisecond,
 		OtelEndpoint: "http://127.0.0.1:4317",
 		FlushTimeout: flushTimeout,
+		CmdTimeout:   30 * time.Second,
 		MaxRetries:   3,
 	}
 }
@@ -86,6 +88,7 @@ func ParseFlags(args []string, stderr io.Writer) (Config, error) {
 	fs.DurationVar(&cfg.ThinkMax, "think-max", cfg.ThinkMax, "maximum randomized think time between scenarios")
 	fs.StringVar(&cfg.OtelEndpoint, "otel-endpoint", cfg.OtelEndpoint, "OTLP gRPC endpoint (empty disables OTLP export)")
 	fs.DurationVar(&cfg.FlushTimeout, "flush-timeout", cfg.FlushTimeout, "timeout for flushing OTel providers on shutdown")
+	fs.DurationVar(&cfg.CmdTimeout, "cmd-timeout", cfg.CmdTimeout, "per-command git CLI timeout (0 disables)")
 	fs.StringVar(&scenariosCSV, "scenarios", "", "comma-separated scenario filter (empty runs all registered)")
 	fs.IntVar(&cfg.MaxRetries, "max-retries", cfg.MaxRetries, "maximum retries for retryable conflict/transient errors")
 	fs.BoolVar(&cfg.FailFast, "fail-fast", false, "stop immediately on first unexpected error or fsck failure")
@@ -132,6 +135,9 @@ func (c Config) Validate() error {
 	}
 	if c.FlushTimeout <= 0 {
 		return errors.New("loadgen: --flush-timeout must be positive")
+	}
+	if c.CmdTimeout < 0 {
+		return errors.New("loadgen: --cmd-timeout must be non-negative")
 	}
 	if c.MaxRetries < 0 {
 		return errors.New("loadgen: --max-retries must be non-negative")

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,12 @@ func NewRunner(cfg Config, reg *Registry, tel *Telemetry, oracle *Oracle) (*Runn
 	filtered, err := reg.Filter(cfg.Scenarios)
 	if err != nil {
 		return nil, err
+	}
+	if len(cfg.Scenarios) == 0 && strings.TrimSpace(cfg.SSHKey) == "" && !strings.HasPrefix(cfg.SSHAddr, "file://") {
+		filtered, err = filtered.withoutSSH()
+		if err != nil {
+			return nil, err
+		}
 	}
 	if cfg.Devs > 0 && len(filtered.Scenarios(PersonaDev)) == 0 {
 		return nil, errors.New("loadgen: no dev scenarios registered for --devs > 0")
@@ -122,8 +129,9 @@ func (r *Runner) runWorker(ctx context.Context, cancelRun context.CancelFunc, pe
 
 	rng := newWorkerRNG(baseSeed, persona, workerID)
 	gitClient := NewGitClient(workDir, GitOptions{
-		AuthToken: r.cfg.AuthToken,
-		SSHKey:    r.cfg.SSHKey,
+		AuthToken:  r.cfg.AuthToken,
+		SSHKey:     r.cfg.SSHKey,
+		CmdTimeout: r.cfg.CmdTimeout,
 	})
 
 	for {
@@ -195,7 +203,7 @@ func (r *Runner) executeScenario(
 		return
 	}
 
-	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 		r.tel.RecordOp(spanCtx, persona, scenario.Name(), "scenario", "canceled", opDur)
 		return
 	}
