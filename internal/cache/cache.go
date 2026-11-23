@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"stravin.dev/core/internal/pack"
+	"stravin.dev/core/internal/telemetry"
 	"stravin.dev/core/internal/tenant"
 )
 
@@ -28,14 +29,27 @@ type Config struct {
 	MaxTenantFraction float64
 	EvictionPolicy    EvictionPolicy
 	PackLimits        pack.Limits
+	Telemetry         *telemetry.Provider
+}
+
+// RepoStats reports point-in-time pack, pending-prune, byte, and pin accounting
+// for a single cached repository.
+type RepoStats struct {
+	ActivePacks  int
+	PendingPrune int
+	SizeBytes    int64
+	Pins         int
 }
 
 // Stats reports point-in-time byte and repository accounting across tenants.
 type Stats struct {
-	TotalBytes  int64
-	MaxBytes    int64
-	RepoCount   int
-	TenantBytes map[tenant.TenantID]int64
+	TotalBytes        int64
+	MaxBytes          int64
+	RepoCount         int
+	ActivePacks       int
+	PendingPrunePacks int
+	TenantBytes       map[tenant.TenantID]int64
+	RepoStats         map[tenant.RepoKey]RepoStats
 }
 
 // repoEntry is the shared internal Flyweight state for a single materialized repository.
@@ -44,11 +58,13 @@ type repoEntry struct {
 	path         string
 	packs        map[string]int64     // packID -> combined .pack + .idx size in bytes
 	idxCache     map[string]*pack.Idx // packID -> parsed .idx for O(log N) lookups
-	pendingPrune map[string]struct{}  // superseded packIDs awaiting lease release
+	pendingPrune map[string]uint64    // superseded packID -> cutoff pruneGen (unlink when no pins <= cutoff)
 	watermarks   map[int]string       // manifest shard -> last_seen_ulid
 	sizeBytes    int64
 	lastAccess   uint64
 	pins         int
+	pruneGen     uint64         // monotonically incremented when new packs are scheduled for pruning
+	pinsByGen    map[uint64]int // generation -> count of active pins acquired at that generation
 }
 
 // RepoHandle is a GoF Proxy representing an active reader lease on a materialized
@@ -93,6 +109,7 @@ type Cache struct {
 	policy     EvictionPolicy
 	packLimits pack.Limits
 	flights    *repoFlightGroup
+	metrics    *cacheMetrics
 
 	mu          sync.Mutex
 	accessSeq   uint64
@@ -144,6 +161,7 @@ func New(cfg Config) (*Cache, error) {
 		policy:      policy,
 		packLimits:  cfg.PackLimits,
 		flights:     newRepoFlightGroup(),
+		metrics:     newCacheMetrics(cfg.Telemetry),
 		tenantBytes: make(map[tenant.TenantID]int64),
 		repos:       make(map[tenant.RepoKey]*repoEntry),
 	}
@@ -151,6 +169,9 @@ func New(cfg Config) (*Cache, error) {
 	if err := c.recoverExisting(); err != nil {
 		return nil, err
 	}
+	c.mu.Lock()
+	c.recordPackMetricsLocked()
+	c.mu.Unlock()
 	return c, nil
 }
 
@@ -177,7 +198,7 @@ func (c *Cache) Materialize(ctx context.Context, repo tenant.RepoKey, syncFn fun
 	}
 	c.mu.Lock()
 	entry := c.getOrCreateEntryLocked(repo, repoPath)
-	entry.pins++
+	pinGen := c.acquirePinLocked(entry)
 	c.touchLocked(entry)
 	c.mu.Unlock()
 
@@ -188,11 +209,11 @@ func (c *Cache) Materialize(ctx context.Context, repo tenant.RepoKey, syncFn fun
 		return syncFn(flightCtx, repoPath)
 	})
 	if err != nil {
-		c.releasePin(repo)
+		c.releasePin(repo, pinGen)
 		return nil, err
 	}
 
-	return c.newHandle(repo, repoPath), nil
+	return c.newHandle(repo, repoPath, pinGen), nil
 }
 
 // Pin acquires a reader lease on an existing materialized repository, protecting it
@@ -208,12 +229,12 @@ func (c *Cache) Pin(repo tenant.RepoKey) (*RepoHandle, error) {
 		c.mu.Unlock()
 		return nil, fmt.Errorf("%s: %w", repo, ErrRepoNotFound)
 	}
-	entry.pins++
+	pinGen := c.acquirePinLocked(entry)
 	c.touchLocked(entry)
 	repoPath := entry.path
 	c.mu.Unlock()
 
-	return c.newHandle(repo, repoPath), nil
+	return c.newHandle(repo, repoPath, pinGen), nil
 }
 
 // InstallPack atomically installs pack-{packID}.pack and pack-{packID}.idx into
@@ -254,14 +275,16 @@ func (c *Cache) InstallPack(repo tenant.RepoKey, packID string, packBytes, idxBy
 	c.totalBytes += delta
 	c.touchLocked(entry)
 	c.evictLocked(repo)
+	c.recordPackMetricsLocked()
 	c.mu.Unlock()
 
 	return nil
 }
 
 // PrunePacks removes superseded packs (e.g. after compaction refresh).
-// If the repository currently has active reader leases, deletion is deferred
-// until the last lease is released so in-flight readers never see unlinked files.
+// Using epoch/generation tracking, packs are unlinked immediately if no pins from
+// prior generations (<= cutoff) are active; otherwise deletion is deferred until
+// those prior-generation pins release, without waiting for newer pins to drain to 0.
 func (c *Cache) PrunePacks(repo tenant.RepoKey, packIDs []string) error {
 	if err := repo.Validate(); err != nil {
 		return err
@@ -279,25 +302,59 @@ func (c *Cache) PrunePacks(repo tenant.RepoKey, packIDs []string) error {
 		return fmt.Errorf("%s: %w", repo, ErrRepoNotFound)
 	}
 
-	if entry.pins > 0 {
-		for _, id := range packIDs {
-			if _, exists := entry.packs[id]; exists {
-				entry.pendingPrune[id] = struct{}{}
-			}
+	seen := make(map[string]struct{}, len(packIDs))
+	newlyScheduled := make([]string, 0, len(packIDs))
+	for _, id := range packIDs {
+		if _, dup := seen[id]; dup {
+			continue
 		}
+		seen[id] = struct{}{}
+		if _, exists := entry.packs[id]; !exists {
+			continue
+		}
+		// Keep the earliest cutoff generation for already-pending packs so
+		// repeated PrunePacks calls cannot push a pack's cutoff forward.
+		if _, alreadyPending := entry.pendingPrune[id]; alreadyPending {
+			continue
+		}
+		newlyScheduled = append(newlyScheduled, id)
+	}
+	if len(newlyScheduled) == 0 {
 		c.mu.Unlock()
 		return nil
 	}
 
-	toDelete := make([]string, 0, len(packIDs))
-	for _, id := range packIDs {
-		if _, exists := entry.packs[id]; exists {
-			toDelete = append(toDelete, id)
-		}
+	cutoff := entry.pruneGen
+	entry.pruneGen++
+
+	if !hasPinsAtOrBefore(entry, cutoff) {
+		c.unlinkPacksLocked(entry, newlyScheduled)
+		c.recordPackMetricsLocked()
+		c.mu.Unlock()
+		return nil
 	}
-	c.unlinkPacksLocked(entry, toDelete)
+
+	for _, id := range newlyScheduled {
+		entry.pendingPrune[id] = cutoff
+	}
+	// Invalidate any existing multi-pack-index immediately so newer-generation readers
+	// do not open a MIDX referencing packs that will be unlinked once prior pins drain.
+	invalidatePackAuxIndexes(filepath.Join(entry.path, "objects", "pack"))
+	c.recordPackMetricsLocked()
 	c.mu.Unlock()
 	return nil
+}
+
+// PendingPruneCount returns the number of superseded packs awaiting prior-generation
+// pin release for repo.
+func (c *Cache) PendingPruneCount(repo tenant.RepoKey) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.repos[repo]
+	if !ok {
+		return 0
+	}
+	return len(entry.pendingPrune)
 }
 
 // Evict runs the configured EvictionPolicy across all unpinned repositories and
@@ -410,7 +467,7 @@ func (c *Cache) BaseResolver(repo tenant.RepoKey) *RepoBaseResolver {
 	}
 }
 
-// Stats returns a snapshot of global and per-tenant byte accounting.
+// Stats returns a snapshot of global, per-tenant, and per-repository cache accounting.
 func (c *Cache) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -418,26 +475,50 @@ func (c *Cache) Stats() Stats {
 	for k, v := range c.tenantBytes {
 		tb[k] = v
 	}
+	rs := make(map[tenant.RepoKey]RepoStats, len(c.repos))
+	var totalActive, totalPending int
+	for k, entry := range c.repos {
+		active := len(entry.packs)
+		pending := len(entry.pendingPrune)
+		totalActive += active
+		totalPending += pending
+		rs[k] = RepoStats{
+			ActivePacks:  active,
+			PendingPrune: pending,
+			SizeBytes:    entry.sizeBytes,
+			Pins:         entry.pins,
+		}
+	}
 	return Stats{
-		TotalBytes:  c.totalBytes,
-		MaxBytes:    c.maxBytes,
-		RepoCount:   len(c.repos),
-		TenantBytes: tb,
+		TotalBytes:        c.totalBytes,
+		MaxBytes:          c.maxBytes,
+		RepoCount:         len(c.repos),
+		ActivePacks:       totalActive,
+		PendingPrunePacks: totalPending,
+		TenantBytes:       tb,
+		RepoStats:         rs,
 	}
 }
 
-func (c *Cache) newHandle(repo tenant.RepoKey, repoPath string) *RepoHandle {
+func (c *Cache) newHandle(repo tenant.RepoKey, repoPath string, pinGen uint64) *RepoHandle {
 	return &RepoHandle{
 		cache: c,
 		repo:  repo,
 		path:  repoPath,
 		onClose: func() {
-			c.releasePin(repo)
+			c.releasePin(repo, pinGen)
 		},
 	}
 }
 
-func (c *Cache) releasePin(repo tenant.RepoKey) {
+func (c *Cache) acquirePinLocked(entry *repoEntry) uint64 {
+	gen := entry.pruneGen
+	entry.pins++
+	entry.pinsByGen[gen]++
+	return gen
+}
+
+func (c *Cache) releasePin(repo tenant.RepoKey, pinGen uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.repos[repo]
@@ -445,13 +526,80 @@ func (c *Cache) releasePin(repo tenant.RepoKey) {
 		return
 	}
 	entry.pins--
-	if entry.pins == 0 && len(entry.pendingPrune) > 0 {
-		ids := make([]string, 0, len(entry.pendingPrune))
-		for id := range entry.pendingPrune {
-			ids = append(ids, id)
-		}
-		c.unlinkPacksLocked(entry, ids)
+	decrementPinGenLocked(entry, pinGen)
+	if c.drainEligiblePrunesLocked(entry) {
+		c.recordPackMetricsLocked()
 	}
+}
+
+func decrementPinGenLocked(entry *repoEntry, gen uint64) {
+	if cnt := entry.pinsByGen[gen]; cnt <= 1 {
+		delete(entry.pinsByGen, gen)
+	} else {
+		entry.pinsByGen[gen] = cnt - 1
+	}
+}
+
+func hasPinsAtOrBefore(entry *repoEntry, cutoff uint64) bool {
+	for gen, cnt := range entry.pinsByGen {
+		if cnt > 0 && gen <= cutoff {
+			return true
+		}
+	}
+	return false
+}
+
+func minActivePinGen(entry *repoEntry) (uint64, bool) {
+	var minGen uint64
+	found := false
+	for gen, cnt := range entry.pinsByGen {
+		if cnt <= 0 {
+			continue
+		}
+		if !found || gen < minGen {
+			minGen = gen
+			found = true
+		}
+	}
+	return minGen, found
+}
+
+func (c *Cache) drainEligiblePrunesLocked(entry *repoEntry) bool {
+	if len(entry.pendingPrune) == 0 {
+		return false
+	}
+	minGen, hasActive := minActivePinGen(entry)
+	var ready []string
+	for id, cutoff := range entry.pendingPrune {
+		if !hasActive || cutoff < minGen {
+			ready = append(ready, id)
+		}
+	}
+	if len(ready) == 0 {
+		return false
+	}
+	c.unlinkPacksLocked(entry, ready)
+	return true
+}
+
+func (c *Cache) recordPackMetricsLocked() {
+	if c.metrics == nil {
+		return
+	}
+	var totalActive, totalPending, maxActive, maxPending int64
+	for _, entry := range c.repos {
+		a := int64(len(entry.packs))
+		p := int64(len(entry.pendingPrune))
+		totalActive += a
+		totalPending += p
+		if a > maxActive {
+			maxActive = a
+		}
+		if p > maxPending {
+			maxPending = p
+		}
+	}
+	c.metrics.recordPackCounts(totalActive, totalPending, maxActive, maxPending)
 }
 
 func (c *Cache) getOrCreateEntryLocked(repo tenant.RepoKey, repoPath string) *repoEntry {
@@ -463,8 +611,9 @@ func (c *Cache) getOrCreateEntryLocked(repo tenant.RepoKey, repoPath string) *re
 		path:         repoPath,
 		packs:        make(map[string]int64),
 		idxCache:     make(map[string]*pack.Idx),
-		pendingPrune: make(map[string]struct{}),
+		pendingPrune: make(map[string]uint64),
 		watermarks:   make(map[int]string),
+		pinsByGen:    make(map[uint64]int),
 	}
 	c.repos[repo] = entry
 	return entry
@@ -516,12 +665,15 @@ func (c *Cache) evictLocked(exclude tenant.RepoKey) []tenant.RepoKey {
 		delete(c.repos, key)
 		evicted = append(evicted, key)
 	}
+	if len(evicted) > 0 {
+		c.recordPackMetricsLocked()
+	}
 	return evicted
 }
 
 func (c *Cache) unlinkPacksLocked(entry *repoEntry, packIDs []string) {
 	packDir := filepath.Join(entry.path, "objects", "pack")
-	removedAny := false
+	var removedCount int64
 	for _, id := range packIDs {
 		sz, exists := entry.packs[id]
 		if !exists {
@@ -537,10 +689,11 @@ func (c *Cache) unlinkPacksLocked(entry *repoEntry, packIDs []string) {
 		entry.sizeBytes -= sz
 		c.tenantBytes[entry.key.TenantID] -= sz
 		c.totalBytes -= sz
-		removedAny = true
+		removedCount++
 	}
-	if removedAny {
+	if removedCount > 0 {
 		invalidatePackAuxIndexes(packDir)
+		c.metrics.recordPacksPruned(removedCount)
 	}
 	if c.tenantBytes[entry.key.TenantID] <= 0 {
 		delete(c.tenantBytes, entry.key.TenantID)

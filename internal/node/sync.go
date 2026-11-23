@@ -635,33 +635,35 @@ func (m *Materializer) refreshAuxIndexes(ctx context.Context, repo tenant.RepoKe
 	midxLockPath := filepath.Join(repoPath, "objects", "pack", "multi-pack-index.lock")
 	cgLockPath := filepath.Join(repoPath, "objects", "info", "commit-graph.lock")
 
-	m.removeStaleAuxLock(auxCtx, midxLockPath)
-	if err := m.gitExec.ExecRepack(auxCtx, gitexec.RepackRequest{
-		Repo:        repo,
-		RepoDir:     repoPath,
-		WriteMIDX:   true,
-		WriteBitmap: hasRefs,
-	}); err != nil {
+	if m.cache.PendingPruneCount(repo) == 0 {
 		m.removeStaleAuxLock(auxCtx, midxLockPath)
-		if hasRefs {
-			// Gracefully fall back to MIDX without bitmap for zero-commit repos (e.g. blob/tag-only).
-			if fallbackErr := m.gitExec.ExecRepack(auxCtx, gitexec.RepackRequest{
-				Repo:      repo,
-				RepoDir:   repoPath,
-				WriteMIDX: true,
-			}); fallbackErr != nil {
-				m.removeStaleAuxLock(auxCtx, midxLockPath)
+		if err := m.gitExec.ExecRepack(auxCtx, gitexec.RepackRequest{
+			Repo:        repo,
+			RepoDir:     repoPath,
+			WriteMIDX:   true,
+			WriteBitmap: hasRefs,
+		}); err != nil {
+			m.removeStaleAuxLock(auxCtx, midxLockPath)
+			if hasRefs {
+				// Gracefully fall back to MIDX without bitmap for zero-commit repos (e.g. blob/tag-only).
+				if fallbackErr := m.gitExec.ExecRepack(auxCtx, gitexec.RepackRequest{
+					Repo:      repo,
+					RepoDir:   repoPath,
+					WriteMIDX: true,
+				}); fallbackErr != nil {
+					m.removeStaleAuxLock(auxCtx, midxLockPath)
+					m.logger.WarnContext(auxCtx, "node: failed to refresh multi-pack-index",
+						"repo", repo.String(), "error", fallbackErr)
+					if m.metrics != nil {
+						m.metrics.RecordAuxIndexRefreshFailure(auxCtx, "midx")
+					}
+				}
+			} else {
 				m.logger.WarnContext(auxCtx, "node: failed to refresh multi-pack-index",
-					"repo", repo.String(), "error", fallbackErr)
+					"repo", repo.String(), "error", err)
 				if m.metrics != nil {
 					m.metrics.RecordAuxIndexRefreshFailure(auxCtx, "midx")
 				}
-			}
-		} else {
-			m.logger.WarnContext(auxCtx, "node: failed to refresh multi-pack-index",
-				"repo", repo.String(), "error", err)
-			if m.metrics != nil {
-				m.metrics.RecordAuxIndexRefreshFailure(auxCtx, "midx")
 			}
 		}
 	}
