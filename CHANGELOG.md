@@ -1,3 +1,11 @@
+# [1.4.0](https://github.com/stravin-dev/core/compare/v1.3.0...v1.4.0) (2026-11-23)
+
+
+### Features
+
+* **pack:** add dual-hash SHA-1/SHA-256 engine, DDB object format metadata, and Wasm ABI support ([1403c0a](https://github.com/stravin-dev/core/commit/1403c0a0f93fde14985b6e32523a49af7ca83da9))
+* **pack:** add dual-hash SHA-1/SHA-256 engine, DDB object format metadata, and Wasm ABI support ([#122](https://github.com/stravin-dev/core/issues/122)) ([067e528](https://github.com/stravin-dev/core/commit/067e528888e95a9aa909b0d4fd3cd162ca48b16a))
+
 # [1.3.0](https://github.com/stravin-dev/core/compare/v1.2.1...v1.3.0) (2026-11-23)
 
 
