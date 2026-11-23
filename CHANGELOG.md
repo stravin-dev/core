@@ -1,3 +1,11 @@
+# [1.2.0](https://github.com/stravin-dev/core/compare/v1.1.1...v1.2.0) (2026-11-23)
+
+
+### Features
+
+* **ci:** package release artifacts as tar.zst with zstd --long ([d4d4a8b](https://github.com/stravin-dev/core/commit/d4d4a8bdb3e93ac788c44adaa753d9768305511c))
+* **ci:** package release artifacts as tar.zst with zstd --long ([#109](https://github.com/stravin-dev/core/issues/109)) ([a0add5a](https://github.com/stravin-dev/core/commit/a0add5ac2914d546c5c9bf1e0958578e63808ed7))
+
 ## [1.1.1](https://github.com/stravin-dev/core/compare/v1.1.0...v1.1.1) (2026-11-23)
 
 
