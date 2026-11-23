@@ -197,3 +197,109 @@ jobs:
 
       - name: Run multi-region sync E2E suite
         run: make multi-region-e2e
+
+  semver-dry-run:
+    name: Semantic Release Dry Run
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    outputs:
+      has_release: ${{ steps.dry_run.outputs.has_release }}
+      next_version: ${{ steps.dry_run.outputs.next_version }}
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Run semantic-release dry run
+        id: dry_run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          output="$(npx --yes \
+            -p semantic-release \
+            -p @semantic-release/changelog \
+            -p @semantic-release/exec \
+            -p @semantic-release/git \
+            semantic-release --dry-run 2>&1 | tee /dev/stderr)"
+          next_version="$(printf '%s\n' "${output}" \
+            | sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' \
+            | sed -nE 's/.*The next release version is ([0-9]+\.[0-9]+\.[0-9]+[^[:space:]]*).*/\1/p' \
+            | tail -n 1)"
+          if [ -n "${next_version}" ]; then
+            echo "has_release=true" >> "$GITHUB_OUTPUT"
+            echo "next_version=v${next_version}" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_release=false" >> "$GITHUB_OUTPUT"
+            echo "next_version=" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+    needs: [semver-dry-run, pre-commit, unit-tests, integration-tests, e2e-tests, multi-region-e2e]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.semver-dry-run.outputs.has_release == 'true'
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      published: ${{ steps.publish.outputs.published }}
+      tag: ${{ steps.publish.outputs.tag }}
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run semantic-release
+        id: publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -f .semantic-release-tag
+          npx --yes \
+            -p semantic-release \
+            -p @semantic-release/changelog \
+            -p @semantic-release/exec \
+            -p @semantic-release/git \
+            semantic-release
+          if [ -s .semantic-release-tag ]; then
+            tag="$(tr -d '[:space:]' < .semantic-release-tag)"
+            rm -f .semantic-release-tag
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+  release-artifacts:
+    name: Release Artifacts
+    needs: [release]
+    if: needs.release.outputs.published == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-artifacts.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}

@@ -7,6 +7,8 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/resource"
+
+	"stravin.dev/core/internal/version"
 )
 
 // Standardized Stravin resource, span, log, and metric attribute keys.
@@ -50,7 +52,7 @@ func NewResource(cfg ResourceConfig) (*resource.Resource, error) {
 		return nil, errors.New("telemetry: service name is required")
 	}
 	if cfg.ServiceVersion == "" {
-		cfg.ServiceVersion = "dev"
+		cfg.ServiceVersion = version.String()
 	}
 	if cfg.Environment == "" {
 		cfg.Environment = "local"
