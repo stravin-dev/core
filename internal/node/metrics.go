@@ -49,6 +49,7 @@ func NewMetrics(tp *telemetry.Provider, region string) *Metrics {
 	reqDur, _ := meter.Float64Histogram("stravin_node_request_duration_seconds",
 		metric.WithDescription("Duration of stravin-node GitWire requests in seconds"),
 		metric.WithUnit("s"),
+		telemetry.WithDurationSecondsBuckets(),
 	)
 	hits, _ := meter.Int64Counter("stravin_node_cache_hits_total",
 		metric.WithDescription("Warm NVMe pack cache hits"),

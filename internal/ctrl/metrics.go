@@ -93,6 +93,7 @@ func NewMetrics(provider *telemetry.Provider) (*Metrics, error) {
 		"stravin_ctrl_scrub_duration_seconds",
 		metric.WithDescription("End-to-end duration of an S3 integrity scrub and ref rewind run"),
 		metric.WithUnit("s"),
+		telemetry.WithDurationSecondsBuckets(),
 	)
 	if err != nil {
 		return nil, err

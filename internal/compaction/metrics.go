@@ -97,6 +97,7 @@ func NewMetrics(provider *telemetry.Provider) (*Metrics, error) {
 		"stravin_pack_compaction_duration_seconds",
 		metric.WithDescription("End-to-end duration of a shard compaction cycle"),
 		metric.WithUnit("s"),
+		telemetry.WithDurationSecondsBuckets(),
 	)
 	if err != nil {
 		return nil, err
