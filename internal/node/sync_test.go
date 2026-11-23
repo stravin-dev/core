@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"stravin.dev/core/internal/cache"
 	"stravin.dev/core/internal/gitexec"
@@ -834,5 +837,368 @@ func TestMaterializer_SyncAndPinPreventsStaleRefOverwriteAndCoalescesLinearizabl
 	}
 	if diskRefs["refs/heads/agent/shared-race"] != oid2 {
 		t.Fatalf("disk refs/heads/agent/shared-race = %q, want %s", diskRefs["refs/heads/agent/shared-race"], oid2)
+	}
+}
+
+func TestMaterializer_RefreshAuxIndexesRecoversFromStaleLocks(t *testing.T) {
+	ctx := context.Background()
+	rk, err := tenant.NewRepoKey("acme", "stale-locks")
+	if err != nil {
+		t.Fatalf("NewRepoKey: %v", err)
+	}
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	metaStore := newFakeMetadataStore()
+	packStore := newFakePackFetcher()
+
+	oid1, p1Bytes, i1Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "lock-1\n", "commit 1\n")
+	oid2, p2Bytes, i2Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "lock-2\n", "commit 2\n")
+	p1 := strings.Repeat("a", 64)
+	p2 := strings.Repeat("b", 64)
+
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	})
+	metaStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: oid1},
+	})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FL1", PackID: p1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	packStore.Put(p1, p1Bytes, i1Bytes)
+	packStore.Put(p2, p2Bytes, i2Bytes)
+
+	gitExec := gitexec.NewSubprocessExecutor(gitexec.Config{})
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:        metaStore,
+		Packs:       packStore,
+		Cache:       c,
+		GitExecutor: gitExec,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+
+	// Initial sync creates multi-pack-index, .bitmap, and commit-graph.
+	res1, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(1): %v", err)
+	}
+	repoPath := res1.Handle.Path()
+	res1.Handle.Release()
+
+	midxPath := filepath.Join(repoPath, "objects", "pack", "multi-pack-index")
+	midxLockPath := filepath.Join(repoPath, "objects", "pack", "multi-pack-index.lock")
+	cgPath := filepath.Join(repoPath, "objects", "info", "commit-graph")
+	cgLockPath := filepath.Join(repoPath, "objects", "info", "commit-graph.lock")
+
+	// Simulate interrupted MIDX & commit-graph writes: remove indexes and leave stale lockfiles.
+	_ = os.Remove(midxPath)
+	bitmaps, _ := filepath.Glob(filepath.Join(repoPath, "objects", "pack", "multi-pack-index-*.bitmap"))
+	for _, b := range bitmaps {
+		_ = os.Remove(b)
+	}
+	_ = os.Remove(cgPath)
+	if err := os.WriteFile(midxLockPath, []byte("stale-midx-lock"), 0o600); err != nil {
+		t.Fatalf("write stale multi-pack-index.lock: %v", err)
+	}
+	if err := os.WriteFile(cgLockPath, []byte("stale-cg-lock"), 0o600); err != nil {
+		t.Fatalf("write stale commit-graph.lock: %v", err)
+	}
+
+	// Next sync must clean up stale locks and rebuild multi-pack-index, .bitmap, and commit-graph.
+	res2, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(2): %v", err)
+	}
+	res2.Handle.Release()
+
+	if _, err := os.Stat(midxLockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected multi-pack-index.lock to be removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(cgLockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected commit-graph.lock to be removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(midxPath); err != nil {
+		t.Fatalf("expected multi-pack-index to be rebuilt after stale lock cleanup: %v", err)
+	}
+	rebuiltBitmaps, err := filepath.Glob(filepath.Join(repoPath, "objects", "pack", "multi-pack-index-*.bitmap"))
+	if err != nil || len(rebuiltBitmaps) == 0 {
+		t.Fatalf("expected multi-pack-index .bitmap to be rebuilt, glob=%v err=%v", rebuiltBitmaps, err)
+	}
+	if _, err := os.Stat(cgPath); err != nil {
+		t.Fatalf("expected commit-graph to be rebuilt after stale lock cleanup: %v", err)
+	}
+
+	// Also verify recovery when indexes already exist but stale lockfiles are present on a new change.
+	if err := os.WriteFile(midxLockPath, []byte("stale-midx-lock-2"), 0o600); err != nil {
+		t.Fatalf("write stale multi-pack-index.lock (2): %v", err)
+	}
+	if err := os.WriteFile(cgLockPath, []byte("stale-cg-lock-2"), 0o600); err != nil {
+		t.Fatalf("write stale commit-graph.lock (2): %v", err)
+	}
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FL2", PackID: p2, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	metaStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: oid2},
+	})
+
+	res3, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(3): %v", err)
+	}
+	res3.Handle.Release()
+
+	if _, err := os.Stat(midxLockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected multi-pack-index.lock (2) to be removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(cgLockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected commit-graph.lock (2) to be removed, stat err=%v", err)
+	}
+}
+
+type stubRepackExecutor struct {
+	*gitexec.SubprocessExecutor
+	onRepack func(ctx context.Context, req gitexec.RepackRequest) error
+}
+
+func (s *stubRepackExecutor) ExecRepack(ctx context.Context, req gitexec.RepackRequest) error {
+	if s.onRepack != nil {
+		return s.onRepack(ctx, req)
+	}
+	return s.SubprocessExecutor.ExecRepack(ctx, req)
+}
+
+func TestMaterializer_RefreshAuxIndexesUsesDetachedBoundedContext(t *testing.T) {
+	rk, err := tenant.NewRepoKey("acme", "detached-aux")
+	if err != nil {
+		t.Fatalf("NewRepoKey: %v", err)
+	}
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	repoPath := t.TempDir()
+	packDir := filepath.Join(repoPath, "objects", "pack")
+	if err := os.MkdirAll(packDir, 0o750); err != nil {
+		t.Fatalf("mkdir packDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(packDir, "pack-dummy.pack"), []byte("PACK"), 0o600); err != nil {
+		t.Fatalf("write dummy pack: %v", err)
+	}
+
+	var calls int
+	execStub := &stubRepackExecutor{
+		SubprocessExecutor: gitexec.NewSubprocessExecutor(gitexec.Config{}),
+		onRepack: func(ctx context.Context, _ gitexec.RepackRequest) error {
+			calls++
+			if ctx.Err() != nil {
+				t.Errorf("ExecRepack received canceled context: %v", ctx.Err())
+			}
+			if _, ok := ctx.Deadline(); !ok {
+				t.Errorf("ExecRepack context missing bounded timeout deadline")
+			}
+			return nil
+		},
+	}
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:        newFakeMetadataStore(),
+		Packs:       newFakePackFetcher(),
+		Cache:       c,
+		GitExecutor: execStub,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+
+	parentCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	mat.refreshAuxIndexes(parentCtx, rk, repoPath, true, true)
+	if calls != 2 {
+		t.Fatalf("ExecRepack calls = %d, want 2 (MIDX+bitmap and commit-graph)", calls)
+	}
+}
+
+func TestMaterializer_RefreshAuxIndexesLogsWarnRecordsMetricAndCleansLockOnFailure(t *testing.T) {
+	ctx := context.Background()
+	rk, err := tenant.NewRepoKey("acme", "aux-failure-obs")
+	if err != nil {
+		t.Fatalf("NewRepoKey: %v", err)
+	}
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	tp, err := telemetry.NewInMemoryProvider("stravin-node")
+	if err != nil {
+		t.Fatalf("NewInMemoryProvider: %v", err)
+	}
+	t.Cleanup(func() { _ = tp.Shutdown(ctx) })
+
+	repoPath := t.TempDir()
+	packDir := filepath.Join(repoPath, "objects", "pack")
+	infoDir := filepath.Join(repoPath, "objects", "info")
+	if err := os.MkdirAll(packDir, 0o750); err != nil {
+		t.Fatalf("mkdir packDir: %v", err)
+	}
+	if err := os.MkdirAll(infoDir, 0o750); err != nil {
+		t.Fatalf("mkdir infoDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(packDir, "pack-dummy.pack"), []byte("PACK"), 0o600); err != nil {
+		t.Fatalf("write dummy pack: %v", err)
+	}
+
+	midxLockPath := filepath.Join(packDir, "multi-pack-index.lock")
+	cgLockPath := filepath.Join(infoDir, "commit-graph.lock")
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	metrics := NewMetrics(tp, "us-east-1")
+
+	execStub := &stubRepackExecutor{
+		SubprocessExecutor: gitexec.NewSubprocessExecutor(gitexec.Config{}),
+		onRepack: func(_ context.Context, req gitexec.RepackRequest) error {
+			if req.WriteMIDX {
+				_ = os.WriteFile(midxLockPath, []byte("aborted-midx"), 0o600)
+				return errors.New("simulated midx failure")
+			}
+			if req.WriteCommitGraph {
+				_ = os.WriteFile(cgLockPath, []byte("aborted-cg"), 0o600)
+				return errors.New("simulated commit-graph failure")
+			}
+			return nil
+		},
+	}
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:        newFakeMetadataStore(),
+		Packs:       newFakePackFetcher(),
+		Cache:       c,
+		GitExecutor: execStub,
+		Telemetry:   tp,
+		Metrics:     metrics,
+		Logger:      logger,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+
+	mat.refreshAuxIndexes(ctx, rk, repoPath, true, true)
+
+	// Lockfiles left by failing ExecRepack must be cleaned up.
+	if _, err := os.Stat(midxLockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected multi-pack-index.lock cleaned after failure, stat err=%v", err)
+	}
+	if _, err := os.Stat(cgLockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected commit-graph.lock cleaned after failure, stat err=%v", err)
+	}
+
+	// Both failures must be logged at WARN level.
+	logs := logBuf.String()
+	if !strings.Contains(logs, `"level":"WARN"`) || !strings.Contains(logs, "failed to refresh multi-pack-index") {
+		t.Fatalf("expected WARN log for multi-pack-index failure, got: %s", logs)
+	}
+	if !strings.Contains(logs, "failed to refresh commit-graph") {
+		t.Fatalf("expected WARN log for commit-graph failure, got: %s", logs)
+	}
+
+	// OTel counter stravin_node_aux_index_refresh_failures_total must record both failures.
+	var rm metricdata.ResourceMetrics
+	if err := tp.MetricReader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	gotByType := make(map[string]int64)
+	for _, sm := range rm.ScopeMetrics {
+		for _, item := range sm.Metrics {
+			if item.Name != "stravin_node_aux_index_refresh_failures_total" {
+				continue
+			}
+			sum, ok := item.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("data type = %T, want metricdata.Sum[int64]", item.Data)
+			}
+			for _, dp := range sum.DataPoints {
+				if v, ok := dp.Attributes.Value("index_type"); ok {
+					gotByType[v.AsString()] += dp.Value
+				}
+			}
+		}
+	}
+	if gotByType["midx"] != 1 || gotByType["commit_graph"] != 1 {
+		t.Fatalf("aux index failure counts = %+v, want midx=1 commit_graph=1", gotByType)
+	}
+}
+
+func TestMaterializer_RefreshAuxIndexesZeroCommitFallbackStaysQuiet(t *testing.T) {
+	ctx := context.Background()
+	rk, err := tenant.NewRepoKey("acme", "aux-zero-commit")
+	if err != nil {
+		t.Fatalf("NewRepoKey: %v", err)
+	}
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	tp, err := telemetry.NewInMemoryProvider("stravin-node")
+	if err != nil {
+		t.Fatalf("NewInMemoryProvider: %v", err)
+	}
+	t.Cleanup(func() { _ = tp.Shutdown(ctx) })
+
+	repoPath := t.TempDir()
+	packDir := filepath.Join(repoPath, "objects", "pack")
+	if err := os.MkdirAll(packDir, 0o750); err != nil {
+		t.Fatalf("mkdir packDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(packDir, "pack-dummy.pack"), []byte("PACK"), 0o600); err != nil {
+		t.Fatalf("write dummy pack: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	metrics := NewMetrics(tp, "us-east-1")
+
+	execStub := &stubRepackExecutor{
+		SubprocessExecutor: gitexec.NewSubprocessExecutor(gitexec.Config{}),
+		onRepack: func(_ context.Context, req gitexec.RepackRequest) error {
+			if req.WriteMIDX && req.WriteBitmap {
+				return errors.New("no commits for bitmap")
+			}
+			return nil
+		},
+	}
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:        newFakeMetadataStore(),
+		Packs:       newFakePackFetcher(),
+		Cache:       c,
+		GitExecutor: execStub,
+		Telemetry:   tp,
+		Metrics:     metrics,
+		Logger:      logger,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+
+	mat.refreshAuxIndexes(ctx, rk, repoPath, true, true)
+
+	if strings.Contains(logBuf.String(), `"level":"WARN"`) {
+		t.Fatalf("expected no WARN log on zero-commit bitmap fallback, got: %s", logBuf.String())
+	}
+	if got := metrics.promAuxIndexRefreshFailures.Load(); got != 0 {
+		t.Fatalf("promAuxIndexRefreshFailures = %d, want 0", got)
 	}
 }

@@ -18,20 +18,22 @@ import (
 type Metrics struct {
 	region string
 
-	requestsTotal   metric.Int64Counter
-	requestDuration metric.Float64Histogram
-	cacheHits       metric.Int64Counter
-	cacheMisses     metric.Int64Counter
-	cacheBytesUsed  metric.Int64Gauge
-	s3PackFetches   metric.Int64Counter
+	requestsTotal           metric.Int64Counter
+	requestDuration         metric.Float64Histogram
+	cacheHits               metric.Int64Counter
+	cacheMisses             metric.Int64Counter
+	cacheBytesUsed          metric.Int64Gauge
+	s3PackFetches           metric.Int64Counter
+	auxIndexRefreshFailures metric.Int64Counter
 
-	promRequestsOK   atomic.Int64
-	promRequestsErr  atomic.Int64
-	promCacheHits    atomic.Int64
-	promCacheMisses  atomic.Int64
-	promCacheBytes   atomic.Int64
-	promS3FetchesOK  atomic.Int64
-	promS3FetchesErr atomic.Int64
+	promRequestsOK              atomic.Int64
+	promRequestsErr             atomic.Int64
+	promCacheHits               atomic.Int64
+	promCacheMisses             atomic.Int64
+	promCacheBytes              atomic.Int64
+	promS3FetchesOK             atomic.Int64
+	promS3FetchesErr            atomic.Int64
+	promAuxIndexRefreshFailures atomic.Int64
 }
 
 // NewMetrics initializes bounded-cardinality OTel instruments via GuardedMeter.
@@ -64,15 +66,19 @@ func NewMetrics(tp *telemetry.Provider, region string) *Metrics {
 	s3Fetches, _ := meter.Int64Counter("stravin_node_s3_pack_fetches_total",
 		metric.WithDescription("S3 pack fetch operations by result"),
 	)
+	auxIndexFailures, _ := meter.Int64Counter("stravin_node_aux_index_refresh_failures_total",
+		metric.WithDescription("Failed auxiliary index (multi-pack-index and commit-graph) refresh attempts"),
+	)
 
 	return &Metrics{
-		region:          region,
-		requestsTotal:   reqTotal,
-		requestDuration: reqDur,
-		cacheHits:       hits,
-		cacheMisses:     misses,
-		cacheBytesUsed:  bytesUsed,
-		s3PackFetches:   s3Fetches,
+		region:                  region,
+		requestsTotal:           reqTotal,
+		requestDuration:         reqDur,
+		cacheHits:               hits,
+		cacheMisses:             misses,
+		cacheBytesUsed:          bytesUsed,
+		s3PackFetches:           s3Fetches,
+		auxIndexRefreshFailures: auxIndexFailures,
 	}
 }
 
@@ -147,6 +153,21 @@ func (m *Metrics) RecordS3PackFetch(ctx context.Context, statusCode string) {
 	}
 }
 
+// RecordAuxIndexRefreshFailure records a failed auxiliary index refresh attempt
+// with bounded labels (region and index_type).
+func (m *Metrics) RecordAuxIndexRefreshFailure(ctx context.Context, indexType string) {
+	if m == nil {
+		return
+	}
+	m.promAuxIndexRefreshFailures.Add(1)
+	if m.auxIndexRefreshFailures != nil {
+		m.auxIndexRefreshFailures.Add(ctx, 1, metric.WithAttributes(
+			telemetry.AttrRegion.String(m.region),
+			attribute.String("index_type", indexType),
+		))
+	}
+}
+
 // ServeHTTP exposes bounded-cardinality Prometheus metrics at /metrics.
 func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -167,7 +188,10 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 			"# HELP stravin_node_s3_pack_fetches_total S3 pack fetch operations.\n"+
 			"# TYPE stravin_node_s3_pack_fetches_total counter\n"+
 			"stravin_node_s3_pack_fetches_total{region=%q,status_code=\"ok\"} %d\n"+
-			"stravin_node_s3_pack_fetches_total{region=%q,status_code=\"error\"} %d\n",
+			"stravin_node_s3_pack_fetches_total{region=%q,status_code=\"error\"} %d\n"+
+			"# HELP stravin_node_aux_index_refresh_failures_total Failed auxiliary index refresh attempts.\n"+
+			"# TYPE stravin_node_aux_index_refresh_failures_total counter\n"+
+			"stravin_node_aux_index_refresh_failures_total{region=%q} %d\n",
 		m.region, m.promRequestsOK.Load(),
 		m.region, m.promRequestsErr.Load(),
 		m.region, m.promCacheHits.Load(),
@@ -175,5 +199,6 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 		m.region, m.promCacheBytes.Load(),
 		m.region, m.promS3FetchesOK.Load(),
 		m.region, m.promS3FetchesErr.Load(),
+		m.region, m.promAuxIndexRefreshFailures.Load(),
 	)
 }
