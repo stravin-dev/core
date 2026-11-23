@@ -1,3 +1,12 @@
+## [1.7.1](https://github.com/stravin-dev/core/compare/v1.7.0...v1.7.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* **loadgen:** prevent SSH hangs, enforce per-command git timeout, and skip SSH scenarios without --ssh-key ([6448fe5](https://github.com/stravin-dev/core/commit/6448fe58a27087d1ae365f5a82ed532c90680efd))
+* **loadgen:** prevent SSH hangs, enforce per-command git timeout, and skip SSH scenarios without --ssh-key ([#130](https://github.com/stravin-dev/core/issues/130)) ([12ef4d4](https://github.com/stravin-dev/core/commit/12ef4d426ef6ae5034354b90ba3de876c07be3d6))
+* **node,cache:** eliminate stale/missing ref race in SyncAndPin and singleflight coalescing ([4b4b809](https://github.com/stravin-dev/core/commit/4b4b809d2b28cfc36eca328ddb5808ff62522262))
+
 # [1.7.0](https://github.com/stravin-dev/core/compare/v1.6.0...v1.7.0) (2026-11-23)
 
 
