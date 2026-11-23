@@ -353,6 +353,126 @@ func TestGrafanaDashboards_StravinCoreAndLoadTester(t *testing.T) {
 		"stravin_loadgen_unexpected_errors_total",
 		"stravin_loadgen_fsck_failures_total",
 	}, `{service_name=~"stravin-loadgen|stravin-chaos"}`)
+	assertLoadgenDashboardRowsAndPanels(t, loadgenDash)
+}
+
+func assertLoadgenDashboardRowsAndPanels(t *testing.T, dash grafanaDashboard) {
+	t.Helper()
+
+	assertNoGridOverlaps(t, dash.Panels, "stravin-loadgen top-level")
+
+	hasCoreLink := false
+	for _, link := range dash.Links {
+		if strings.Contains(link.URL, "stravin-core") {
+			hasCoreLink = true
+			break
+		}
+	}
+	if !hasCoreLink {
+		t.Error("stravin-loadgen dashboard missing cross-link to stravin-core")
+	}
+
+	sections := extractSections(dash.Panels)
+	wantRows := []string{
+		"Overview",
+		"Scenario Distribution",
+		"Developer Experience",
+		"AI Agent Experience",
+		"Traces & Logs",
+	}
+	if len(sections) < len(wantRows) {
+		t.Fatalf("stravin-loadgen has %d collapsible row sections, want at least %d", len(sections), len(wantRows))
+	}
+
+	foundRows := make(map[string]dashboardSection, len(sections))
+	for _, sec := range sections {
+		if sec.row.GridPos.W != 24 || sec.row.GridPos.X != 0 || sec.row.GridPos.H != 1 {
+			t.Errorf("row %q gridPos = %+v, want w=24 x=0 h=1", sec.row.Title, sec.row.GridPos)
+		}
+		if len(sec.row.Panels) > 0 {
+			assertNoGridOverlaps(t, sec.row.Panels, "row "+sec.row.Title)
+		}
+		for _, wantPrefix := range wantRows {
+			if strings.Contains(sec.row.Title, wantPrefix) {
+				foundRows[wantPrefix] = sec
+			}
+		}
+	}
+	for _, wantRow := range wantRows {
+		if _, ok := foundRows[wantRow]; !ok {
+			t.Errorf("stravin-loadgen missing collapsible row section matching %q", wantRow)
+		}
+	}
+
+	// Verify separate Dev & AI Agent scenario distribution pie charts.
+	if distSec, ok := foundRows["Scenario Distribution"]; ok {
+		var hasDevPie, hasAgentPie bool
+		for _, p := range distSec.panels {
+			if p.Type != "piechart" {
+				continue
+			}
+			for _, tgt := range p.Targets {
+				if strings.Contains(tgt.Expr, `persona="dev"`) && strings.Contains(tgt.Expr, "scenario") {
+					hasDevPie = true
+				}
+				if strings.Contains(tgt.Expr, `persona="agent"`) && strings.Contains(tgt.Expr, "scenario") {
+					hasAgentPie = true
+				}
+			}
+		}
+		if !hasDevPie {
+			t.Error("Scenario Distribution row missing Developer (persona=\"dev\") piechart panel")
+		}
+		if !hasAgentPie {
+			t.Error("Scenario Distribution row missing AI Agent (persona=\"agent\") piechart panel")
+		}
+	}
+
+	// Verify Developer and AI Agent sections contain persona-filtered ops, latency, retries, errors, and fsck.
+	personaChecks := []struct {
+		rowKey        string
+		personaFilter string
+		fsckFilter    string
+	}{
+		{"Developer Experience", `persona="dev"`, `dev_.*`},
+		{"AI Agent Experience", `persona="agent"`, `agent_.*`},
+	}
+	for _, tc := range personaChecks {
+		sec, ok := foundRows[tc.rowKey]
+		if !ok {
+			continue
+		}
+		var exprs []string
+		hasExemplar := false
+		for _, p := range sec.panels {
+			for _, tgt := range p.Targets {
+				exprs = append(exprs, tgt.Expr)
+				if tgt.Exemplar {
+					hasExemplar = true
+				}
+			}
+		}
+		joined := strings.Join(exprs, "\n")
+		for _, tok := range []string{
+			tc.personaFilter,
+			"stravin_loadgen_ops_total",
+			"stravin_loadgen_op_duration_seconds_bucket",
+			"histogram_quantile(0.50",
+			"histogram_quantile(0.95",
+			"histogram_quantile(0.99",
+			"stravin_loadgen_retries_total",
+			"stravin_loadgen_unexpected_errors_total",
+			"stravin_loadgen_fsck_failures_total",
+			tc.fsckFilter,
+		} {
+			if !strings.Contains(joined, tok) {
+				t.Errorf("row %q missing expected PromQL token %q", tc.rowKey, tok)
+			}
+		}
+		if !hasExemplar {
+			t.Errorf("row %q missing exemplar: true on latency targets", tc.rowKey)
+		}
+	}
 }
 
 func TestGrafanaProvisioning_DatasourcesAndDashboards(t *testing.T) {
