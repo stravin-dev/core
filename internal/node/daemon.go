@@ -189,8 +189,9 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 	}
 
 	nvmeCache, err := cache.New(cache.Config{
-		Root:     cfg.CacheDir,
-		MaxBytes: cfg.CacheMaxBytes,
+		Root:      cfg.CacheDir,
+		MaxBytes:  cfg.CacheMaxBytes,
+		Telemetry: tp,
 	})
 	if err != nil {
 		return fmt.Errorf("node: init nvme cache: %w", err)

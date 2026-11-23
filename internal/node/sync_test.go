@@ -609,6 +609,88 @@ func TestMaterializer_PrunesSupersededPacksAfterCompaction(t *testing.T) {
 	}
 }
 
+func TestMaterializer_PrunesSupersededPacksWhileNewerReadersPinned(t *testing.T) {
+	ctx := context.Background()
+	rk, _ := tenant.NewRepoKey("acme", "sustained-prune")
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	metaStore := newFakeMetadataStore()
+	packStore := newFakePackFetcher()
+
+	pack1 := strings.Repeat("a", 64)
+	pack2 := strings.Repeat("b", 64)
+	packMerged := strings.Repeat("c", 64)
+
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1, RefShards: 1, ManifestShards: 1, WriteState: lease.ModeActive,
+	})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FD1", PackID: pack1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FD2", PackID: pack2, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	packStore.Put(pack1, []byte("PACK-1"), []byte("IDX-1"))
+	packStore.Put(pack2, []byte("PACK-2"), []byte("IDX-2"))
+	packStore.Put(packMerged, []byte("PACK-MERGED"), []byte("IDX-MERGED"))
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:  metaStore,
+		Packs: packStore,
+		Cache: c,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+
+	// Reader 1 holds a pre-compaction lease.
+	res1, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(1): %v", err)
+	}
+
+	// Compaction supersedes pack1 & pack2 with packMerged.
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FD3", PackID: packMerged, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	metaStore.SetManifestStatus(rk, 0, "01ARZ3NDEKTSV4RRFFQ69G5FD1", ddb.PackStatusCompacted)
+	metaStore.SetManifestStatus(rk, 0, "01ARZ3NDEKTSV4RRFFQ69G5FD2", ddb.PackStatusCompacted)
+
+	// Reader 2 triggers sync & PrunePacks while Reader 1 is still pinned.
+	res2, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		res1.Handle.Release()
+		t.Fatalf("SyncAndPin(2): %v", err)
+	}
+
+	// Reader 3 acquires a post-prune lease so pins never drop to 0.
+	res3, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		res1.Handle.Release()
+		res2.Handle.Release()
+		t.Fatalf("SyncAndPin(3): %v", err)
+	}
+	defer res3.Handle.Release()
+
+	pack1Path := filepath.Join(res1.Handle.Path(), "objects", "pack", "pack-"+pack1+".pack")
+	if _, statErr := os.Stat(pack1Path); statErr != nil {
+		t.Fatalf("expected pack1 on disk while prior-gen readers are pinned, err=%v", statErr)
+	}
+
+	// Release prior-generation readers while res3 remains pinned (pins == 1).
+	res1.Handle.Release()
+	res2.Handle.Release()
+
+	if _, statErr := os.Stat(pack1Path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("expected superseded pack1 to be unlinked while res3 remains pinned, err=%v", statErr)
+	}
+	if got := c.CachedPackIDs(rk); len(got) != 1 || got[0] != packMerged {
+		t.Fatalf("CachedPackIDs = %v, want [%s]", got, packMerged)
+	}
+}
+
 func TestMaterializer_PrunesSupersededPacksOnPeriodicReconcile(t *testing.T) {
 	ctx := context.Background()
 	rk, _ := tenant.NewRepoKey("acme", "reconcile")
