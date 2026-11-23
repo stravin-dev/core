@@ -74,6 +74,12 @@ func TestGitClientFsckDetectsCorruption(t *testing.T) {
 	if _, err := g.Run(ctx, "init", "-b", "main"); err != nil {
 		t.Fatalf("git init: %v", err)
 	}
+	if _, err := g.Run(ctx, "config", "maintenance.auto", "false"); err != nil {
+		t.Fatalf("disable maintenance.auto: %v", err)
+	}
+	if _, err := g.Run(ctx, "config", "gc.auto", "0"); err != nil {
+		t.Fatalf("disable gc.auto: %v", err)
+	}
 	if err := g.ConfigUser(ctx, "Loadgen", "loadgen@local"); err != nil {
 		t.Fatal(err)
 	}
@@ -91,11 +97,17 @@ func TestGitClientFsckDetectsCorruption(t *testing.T) {
 	corrupted := false
 	objectsDir := filepath.Join(workDir, ".git", "objects")
 	err := filepath.Walk(objectsDir, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil || info.IsDir() || corrupted {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
 			return walkErr
 		}
+		if info.IsDir() || corrupted || strings.HasSuffix(info.Name(), ".lock") {
+			return nil
+		}
 		parent := filepath.Base(filepath.Dir(path))
-		if len(parent) == 2 && parent != "in" && parent != "pa" {
+		if isHexFanoutDir(parent) {
 			if chmodErr := os.Chmod(path, 0o600); chmodErr != nil {
 				return chmodErr
 			}
@@ -103,6 +115,7 @@ func TestGitClientFsckDetectsCorruption(t *testing.T) {
 				return writeErr
 			}
 			corrupted = true
+			return filepath.SkipAll
 		}
 		return nil
 	})
@@ -117,6 +130,21 @@ func TestGitClientFsckDetectsCorruption(t *testing.T) {
 	if got := ClassifyError(fsckErr, ClassifyOptions{}); got != ErrorUnexpected {
 		t.Errorf("ClassifyError(fsckErr) = %q, want %q", got, ErrorUnexpected)
 	}
+}
+
+func isHexFanoutDir(name string) bool {
+	if len(name) != 2 {
+		return false
+	}
+	for i := 0; i < 2; i++ {
+		c := name[i]
+		isDigit := c >= '0' && c <= '9'
+		isHexLower := c >= 'a' && c <= 'f'
+		if !isDigit && !isHexLower {
+			return false
+		}
+	}
+	return true
 }
 
 func TestExtractHTTPStatusAndRedactToken(t *testing.T) {

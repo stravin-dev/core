@@ -202,6 +202,8 @@ jobs:
     name: Semantic Release Dry Run
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
     outputs:
       has_release: ${{ steps.dry_run.outputs.has_release }}
       next_version: ${{ steps.dry_run.outputs.next_version }}

@@ -127,6 +127,17 @@ func TestCIAndReleaseWorkflows(t *testing.T) {
 		}
 	}
 
+	// Verify semver-dry-run explicitly requests contents: write (needed by semantic-release --dry-run git push check).
+	dryRunStart := strings.Index(ciText, "\n  semver-dry-run:")
+	releaseStart := strings.Index(ciText, "\n  release:")
+	if dryRunStart == -1 || releaseStart == -1 || releaseStart <= dryRunStart {
+		t.Fatalf("could not locate semver-dry-run job block in ci.yml")
+	}
+	dryRunBlock := ciText[dryRunStart:releaseStart]
+	if !strings.Contains(dryRunBlock, "contents: write") {
+		t.Errorf("semver-dry-run job in ci.yml missing 'contents: write' permission")
+	}
+
 	for _, want := range []string{
 		"release:",
 		"types: [published]",
