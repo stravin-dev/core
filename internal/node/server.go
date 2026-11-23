@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	otelcodes "go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -134,39 +135,45 @@ func (s *Server) HandleGitWire(ctx context.Context, meta rpc.RequestMeta, stream
 	))
 	defer rootSpan.End()
 
-	var err error
+	var (
+		err     error
+		execErr error
+	)
 	switch meta.Operation {
 	case rpc.OpUploadPack:
-		err = s.handleUploadPack(ctx, meta, stream)
+		execErr, err = s.handleUploadPack(ctx, meta, stream)
 	case rpc.OpReceivePack:
 		err = s.writeHandler.HandleReceivePack(ctx, meta, stream)
 	default:
 		err = status.Errorf(codes.InvalidArgument, "node: unsupported operation %q", meta.Operation)
 	}
 
+	obsErr := err
+	if obsErr == nil {
+		obsErr = execErr
+	}
 	statusLabel := "ok"
-	if err != nil {
+	if obsErr != nil {
 		statusLabel = "error"
-		rootSpan.RecordError(err)
-		rootSpan.SetStatus(otelcodes.Error, err.Error())
+		recordSpanError(rootSpan, obsErr)
 	}
 	s.metrics.RecordRequest(ctx, gitOp, statusLabel, time.Since(start))
 	return err
 }
 
-func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, stream rpc.GitWireStream) error {
+func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, stream rpc.GitWireStream) (error, error) {
 	repo := meta.RepoKey()
 
 	if boolHeader(ctx, HeaderAdvertiseRefs) {
-		return s.serveAdvertiseRefs(ctx, repo, stream)
+		return nil, s.serveAdvertiseRefs(ctx, repo, stream)
 	}
 
 	syncRes, err := s.materializer.SyncAndPin(ctx, repo)
 	if err != nil {
 		if errors.Is(err, ddb.ErrNotFound) {
-			return status.Errorf(codes.NotFound, "repository %s not found", repo)
+			return nil, status.Errorf(codes.NotFound, "repository %s not found", repo)
 		}
-		return status.Errorf(codes.Internal, "sync repository %s: %v", repo, err)
+		return nil, status.Errorf(codes.Internal, "sync repository %s: %v", repo, err)
 	}
 	defer syncRes.Handle.Release()
 
@@ -230,14 +237,12 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 	pumpWG.Wait()
 
 	if stdoutW.writeErr != nil {
-		execSpan.RecordError(stdoutW.writeErr)
-		execSpan.SetStatus(otelcodes.Error, stdoutW.writeErr.Error())
-		return stdoutW.writeErr
+		recordSpanError(execSpan, stdoutW.writeErr)
+		return nil, stdoutW.writeErr
 	}
 
 	if execErr != nil {
-		execSpan.RecordError(execErr)
-		execSpan.SetStatus(otelcodes.Error, execErr.Error())
+		recordSpanError(execSpan, execErr)
 
 		exitCode := int32(1)
 		errMsg := strings.TrimSpace(stderrBuf.String())
@@ -253,11 +258,14 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 		if errMsg == "" {
 			errMsg = execErr.Error()
 		}
-		return stream.Send(&rpc.Frame{
+		if sendErr := stream.Send(&rpc.Frame{
 			EOF:        true,
 			ExitCode:   exitCode,
-			ErrMessage: errMsg,
-		})
+			ErrMessage: sanitizeUTF8(errMsg),
+		}); sendErr != nil {
+			return nil, sendErr
+		}
+		return execErr, nil
 	}
 
 	s.logger.DebugContext(execCtx, "node: git-upload-pack completed",
@@ -266,7 +274,7 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 		"packs_fetched", syncRes.PacksFetched,
 		"packs_cached", syncRes.PacksCached,
 	)
-	return stream.Send(&rpc.Frame{EOF: true, ExitCode: 0})
+	return nil, stream.Send(&rpc.Frame{EOF: true, ExitCode: 0})
 }
 
 func (s *Server) serveAdvertiseRefs(ctx context.Context, repoKey tenant.RepoKey, stream rpc.GitWireStream) error {
@@ -348,4 +356,28 @@ func metricOpFor(op rpc.Operation) string {
 	default:
 		return "unknown"
 	}
+}
+
+func sanitizeUTF8(s string) string {
+	return strings.ToValidUTF8(s, "\uFFFD")
+}
+
+func sanitizeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if utf8.ValidString(msg) {
+		return err
+	}
+	return errors.New(sanitizeUTF8(msg))
+}
+
+func recordSpanError(span trace.Span, err error) {
+	if err == nil {
+		return
+	}
+	safeErr := sanitizeError(err)
+	span.RecordError(safeErr)
+	span.SetStatus(otelcodes.Error, safeErr.Error())
 }
