@@ -338,6 +338,7 @@ func (e *Engine) CompactShard(ctx context.Context, target ShardTarget) (JobResul
 		BytesReclaimed: reclaimed,
 		AuxMIDXKey:     stratRes.AuxMIDXKey,
 		AuxGraphKey:    stratRes.AuxGraphKey,
+		BundleKey:      stratRes.BundleKey,
 	}, nil
 }
 

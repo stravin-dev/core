@@ -17,18 +17,20 @@ import (
 )
 
 type memPackObjectStore struct {
-	packs  map[string][]byte
-	idxs   map[string][]byte
-	midxs  map[string][]byte
-	graphs map[string][]byte
+	packs   map[string][]byte
+	idxs    map[string][]byte
+	midxs   map[string][]byte
+	graphs  map[string][]byte
+	bundles map[string][]byte
 }
 
 func newMemPackObjectStore() *memPackObjectStore {
 	return &memPackObjectStore{
-		packs:  make(map[string][]byte),
-		idxs:   make(map[string][]byte),
-		midxs:  make(map[string][]byte),
-		graphs: make(map[string][]byte),
+		packs:   make(map[string][]byte),
+		idxs:    make(map[string][]byte),
+		midxs:   make(map[string][]byte),
+		graphs:  make(map[string][]byte),
+		bundles: make(map[string][]byte),
 	}
 }
 
@@ -61,6 +63,11 @@ func (m *memPackObjectStore) PutAuxMIDX(_ context.Context, _ tenant.RepoKey, _, 
 
 func (m *memPackObjectStore) PutAuxGraph(_ context.Context, _ tenant.RepoKey, _, epoch string, data []byte) error {
 	m.graphs[epoch] = append([]byte(nil), data...)
+	return nil
+}
+
+func (m *memPackObjectStore) PutBundle(_ context.Context, repo tenant.RepoKey, data []byte) error {
+	m.bundles[repo.String()] = append([]byte(nil), data...)
 	return nil
 }
 

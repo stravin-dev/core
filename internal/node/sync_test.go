@@ -1,8 +1,12 @@
 package node
 
 import (
+	"bytes"
+	"compress/zlib"
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,7 +16,9 @@ import (
 	"time"
 
 	"stravin.dev/core/internal/cache"
+	"stravin.dev/core/internal/gitexec"
 	"stravin.dev/core/internal/lease"
+	"stravin.dev/core/internal/pack"
 	"stravin.dev/core/internal/storage/ddb"
 	"stravin.dev/core/internal/storage/s3"
 	"stravin.dev/core/internal/telemetry"
@@ -172,6 +178,71 @@ func (f *fakePackFetcher) FetchCount(packID string) int {
 	return f.fetches[packID]
 }
 
+func buildSyntheticCommitPackForSync(t *testing.T, algo pack.HashAlgorithm, blobContent, commitMsg string) (commitOID string, packBytes, idxBytes []byte) {
+	t.Helper()
+	blobData := []byte(blobContent)
+	blobOID := pack.ComputeOIDWith(algo, pack.ObjBlob, blobData)
+
+	var treeBuf bytes.Buffer
+	fmt.Fprintf(&treeBuf, "100644 file.txt\x00")
+	treeBuf.Write(blobOID.Bytes())
+	treeData := treeBuf.Bytes()
+	treeOID := pack.ComputeOIDWith(algo, pack.ObjTree, treeData)
+
+	var commitBuf bytes.Buffer
+	fmt.Fprintf(&commitBuf, "tree %s\n", treeOID.String())
+	commitBuf.WriteString("author Stravin Test <test@stravin.dev> 1700000000 +0000\n")
+	commitBuf.WriteString("committer Stravin Test <test@stravin.dev> 1700000000 +0000\n\n")
+	commitBuf.WriteString(commitMsg)
+	commitData := commitBuf.Bytes()
+	cOID := pack.ComputeOIDWith(algo, pack.ObjCommit, commitData)
+
+	entries := []struct {
+		typ  pack.ObjectType
+		data []byte
+	}{
+		{pack.ObjBlob, blobData},
+		{pack.ObjTree, treeData},
+		{pack.ObjCommit, commitData},
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString("PACK")
+	_ = binary.Write(&buf, binary.BigEndian, uint32(2))
+	_ = binary.Write(&buf, binary.BigEndian, uint32(len(entries)))
+	for _, e := range entries {
+		size := uint64(len(e.data))
+		b := ((uint8(e.typ) & 0x07) << 4) | byte(size&0x0f)
+		size >>= 4
+		for size > 0 {
+			buf.WriteByte(b | 0x80)
+			b = byte(size & 0x7f)
+			size >>= 7
+		}
+		buf.WriteByte(b)
+		zw := zlib.NewWriter(&buf)
+		if _, err := zw.Write(e.data); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sum := algo.Sum(buf.Bytes())
+	buf.Write(sum.Bytes())
+	packBytes = buf.Bytes()
+
+	parsed, err := pack.Parse(bytes.NewReader(packBytes), pack.ParseOptions{HashAlgorithm: algo})
+	if err != nil {
+		t.Fatalf("pack.Parse: %v", err)
+	}
+	idxBytes, err = pack.BuildIdx(parsed)
+	if err != nil {
+		t.Fatalf("pack.BuildIdx: %v", err)
+	}
+	return cOID.String(), packBytes, idxBytes
+}
+
 func TestMaterializer_ColdCacheAndIncrementalWatermarkSync(t *testing.T) {
 	ctx := context.Background()
 	rk, err := tenant.NewRepoKey("acme", "core")
@@ -191,8 +262,9 @@ func TestMaterializer_ColdCacheAndIncrementalWatermarkSync(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
 
-	oid1 := strings.Repeat("1", 40)
-	oid2 := strings.Repeat("2", 40)
+	oid1, pack1Bytes, idx1Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "hello-1\n", "commit 1\n")
+	oid2, pack2Bytes, idx2Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "hello-2\n", "commit 2\n")
+	_, pack3Bytes, idx3Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "hello-3\n", "commit 3\n")
 	pack1 := strings.Repeat("a", 64)
 	pack2 := strings.Repeat("b", 64)
 	packOld := strings.Repeat("c", 64)
@@ -220,22 +292,24 @@ func TestMaterializer_ColdCacheAndIncrementalWatermarkSync(t *testing.T) {
 		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FA2", PackID: pack2, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
 	})
 
-	packStore.Put(pack1, []byte("PACK-1"), []byte("IDX-1"))
-	packStore.Put(pack2, []byte("PACK-2"), []byte("IDX-2"))
+	packStore.Put(pack1, pack1Bytes, idx1Bytes)
+	packStore.Put(pack2, pack2Bytes, idx2Bytes)
 	packStore.Put(packOld, []byte("PACK-OLD"), []byte("IDX-OLD"))
-	packStore.Put(pack3, []byte("PACK-3"), []byte("IDX-3"))
+	packStore.Put(pack3, pack3Bytes, idx3Bytes)
 
+	gitExec := gitexec.NewSubprocessExecutor(gitexec.Config{})
 	mat, err := NewMaterializer(MaterializerConfig{
-		Meta:      metaStore,
-		Packs:     packStore,
-		Cache:     c,
-		Telemetry: tp,
+		Meta:        metaStore,
+		Packs:       packStore,
+		Cache:       c,
+		GitExecutor: gitExec,
+		Telemetry:   tp,
 	})
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
 
-	// 1. Cold-cache sync pulls pack1 and pack2, skips COMPACTED packOld, and materializes disk refs.
+	// 1. Cold-cache sync pulls pack1 and pack2, skips COMPACTED packOld, and materializes reftable refs.
 	res1, err := mat.SyncAndPin(ctx, rk)
 	if err != nil {
 		t.Fatalf("SyncAndPin (cold): %v", err)
@@ -256,16 +330,21 @@ func TestMaterializer_ColdCacheAndIncrementalWatermarkSync(t *testing.T) {
 		t.Fatalf("shard 1 watermark = %q, want 01ARZ3NDEKTSV4RRFFQ69G5FA2", got)
 	}
 
-	// Verify disposable disk ref matches DDB.
-	refBytes, err := os.ReadFile(filepath.Join(res1.Handle.Path(), "refs", "heads", "main"))
-	if err != nil || strings.TrimSpace(string(refBytes)) != oid1 {
-		t.Fatalf("disk refs/heads/main = %q (err=%v), want %s", string(refBytes), err, oid1)
+	// Verify reftable storage and authoritative ref via git for-each-ref.
+	if _, err := os.Stat(filepath.Join(res1.Handle.Path(), "reftable", "tables.list")); err != nil {
+		t.Fatalf("expected reftable/tables.list in NVMe bare repo: %v", err)
+	}
+	gotRefs1, err := gitExec.ExecForEachRef(ctx, gitexec.ForEachRefRequest{RepoDir: res1.Handle.Path()})
+	if err != nil || gotRefs1["refs/heads/main"] != oid1 {
+		t.Fatalf("reftable refs/heads/main = %q (err=%v), want %s", gotRefs1["refs/heads/main"], err, oid1)
 	}
 
-	// Plant a stale disk-only ref that must be purged on the next sync.
-	stalePath := filepath.Join(res1.Handle.Path(), "refs", "heads", "stale")
-	if err := os.WriteFile(stalePath, []byte(oid1+"\n"), 0o600); err != nil {
-		t.Fatalf("write stale ref: %v", err)
+	// Plant a stale ref in reftable that must be purged on the next sync.
+	if err := gitExec.ExecUpdateRef(ctx, gitexec.UpdateRefRequest{
+		RepoDir: res1.Handle.Path(),
+		Updates: []gitexec.RefUpdateSpec{{RefName: "refs/heads/stale", NewOID: oid1}},
+	}); err != nil {
+		t.Fatalf("plant stale ref: %v", err)
 	}
 	res1.Handle.Release()
 
@@ -294,13 +373,16 @@ func TestMaterializer_ColdCacheAndIncrementalWatermarkSync(t *testing.T) {
 		t.Fatalf("shard 0 updated watermark = %q, want 01ARZ3NDEKTSV4RRFFQ69G5FA9", got)
 	}
 
-	// Stale disk ref must be gone; refs/heads/main must be updated to oid2.
-	if _, err := os.Stat(stalePath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected stale disk ref to be removed, stat err=%v", err)
+	// Stale ref must be gone; refs/heads/main must be updated to oid2.
+	gotRefs2, err := gitExec.ExecForEachRef(ctx, gitexec.ForEachRefRequest{RepoDir: res2.Handle.Path()})
+	if err != nil {
+		t.Fatalf("ExecForEachRef(2): %v", err)
 	}
-	refBytes, err = os.ReadFile(filepath.Join(res2.Handle.Path(), "refs", "heads", "main"))
-	if err != nil || strings.TrimSpace(string(refBytes)) != oid2 {
-		t.Fatalf("updated disk refs/heads/main = %q (err=%v), want %s", string(refBytes), err, oid2)
+	if _, exists := gotRefs2["refs/heads/stale"]; exists {
+		t.Fatalf("expected stale ref to be removed from reftable, got %+v", gotRefs2)
+	}
+	if gotRefs2["refs/heads/main"] != oid2 {
+		t.Fatalf("updated reftable refs/heads/main = %q, want %s", gotRefs2["refs/heads/main"], oid2)
 	}
 }
 
@@ -393,27 +475,61 @@ func TestIsSafeRefName(t *testing.T) {
 	}
 }
 
-func TestMaterializeDisposableRefs_PrunesEmptyDirsOnRefReplacement(t *testing.T) {
-	repoPath := t.TempDir()
-	oid1 := strings.Repeat("1", 40)
-	oid2 := strings.Repeat("2", 40)
+func TestMaterializeReftableRefs_HandlesDirectoryFileRefReplacement(t *testing.T) {
+	ctx := context.Background()
+	rk, _ := tenant.NewRepoKey("acme", "df-refs")
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	metaStore := newFakeMetadataStore()
+	packStore := newFakePackFetcher()
 
-	if err := materializeDisposableRefs(repoPath, []ddb.RefState{
-		{RefName: "refs/heads/a/b", OID: oid1},
-	}, "refs/heads/main"); err != nil {
-		t.Fatalf("first materializeDisposableRefs: %v", err)
+	oid1, p1Bytes, i1Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "df-1\n", "commit 1\n")
+	oid2, p2Bytes, i2Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "df-2\n", "commit 2\n")
+	p1 := strings.Repeat("1", 64)
+	p2 := strings.Repeat("2", 64)
+
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1, RefShards: 1, ManifestShards: 1, WriteState: lease.ModeActive, DefaultBranch: "refs/heads/main",
+	})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FE1", PackID: p1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1"})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FE2", PackID: p2, Status: ddb.PackStatusActive, OriginRegion: "us-east-1"})
+	packStore.Put(p1, p1Bytes, i1Bytes)
+	packStore.Put(p2, p2Bytes, i2Bytes)
+
+	gitExec := gitexec.NewSubprocessExecutor(gitexec.Config{})
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:        metaStore,
+		Packs:       packStore,
+		Cache:       c,
+		GitExecutor: gitExec,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
 	}
 
-	// Replace refs/heads/a/b with refs/heads/a (requires pruning empty dir refs/heads/a).
-	if err := materializeDisposableRefs(repoPath, []ddb.RefState{
-		{RefName: "refs/heads/a", OID: oid2},
-	}, "refs/heads/main"); err != nil {
-		t.Fatalf("second materializeDisposableRefs (replace dir with file): %v", err)
+	metaStore.SetRefs(rk, []ddb.RefState{{Repo: rk, RefName: "refs/heads/a/b", OID: oid1}})
+	res1, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("first SyncAndPin: %v", err)
 	}
+	res1.Handle.Release()
 
-	got, err := os.ReadFile(filepath.Join(repoPath, "refs", "heads", "a"))
-	if err != nil || strings.TrimSpace(string(got)) != oid2 {
-		t.Fatalf("refs/heads/a = %q (err=%v), want %s", string(got), err, oid2)
+	// Replace refs/heads/a/b with refs/heads/a in reftable.
+	metaStore.SetRefs(rk, []ddb.RefState{{Repo: rk, RefName: "refs/heads/a", OID: oid2}})
+	res2, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("second SyncAndPin (replace a/b with a): %v", err)
+	}
+	defer res2.Handle.Release()
+
+	refs, err := gitExec.ExecForEachRef(ctx, gitexec.ForEachRefRequest{RepoDir: res2.Handle.Path()})
+	if err != nil {
+		t.Fatalf("ExecForEachRef: %v", err)
+	}
+	if refs["refs/heads/a"] != oid2 || refs["refs/heads/a/b"] != "" {
+		t.Fatalf("unexpected refs after D/F replacement: %+v", refs)
 	}
 }
 

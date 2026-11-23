@@ -9,12 +9,15 @@
 package gitexec
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -53,6 +56,20 @@ type GitExecutor interface {
 	ExecRepack(ctx context.Context, req RepackRequest) error
 }
 
+// BareRepoExecutor is the narrow interface for initializing and managing refs
+// on disposable bare NVMe repositories without touching .git/refs/* directly.
+type BareRepoExecutor interface {
+	ExecInitBare(ctx context.Context, req InitBareRequest) error
+	ExecForEachRef(ctx context.Context, req ForEachRefRequest) (map[string]string, error)
+	ExecUpdateRef(ctx context.Context, req UpdateRefRequest) error
+	ExecSymbolicRef(ctx context.Context, req SymbolicRefRequest) error
+}
+
+// BundleExecutor is the narrow interface for generating Git bundles for S3 offload.
+type BundleExecutor interface {
+	ExecBundleCreate(ctx context.Context, req BundleCreateRequest) error
+}
+
 // UploadPackRequest configures a read-only git-upload-pack subprocess.
 type UploadPackRequest struct {
 	Repo          tenant.RepoKey
@@ -60,10 +77,60 @@ type UploadPackRequest struct {
 	AdvertiseRefs bool
 	StatelessRPC  bool
 	GitProtocol   string
+	BundleURI     string
 	Stdin         io.Reader
 	Stdout        io.Writer
 	Stderr        io.Writer
 	Timeout       time.Duration
+}
+
+// InitBareRequest configures `git init --bare` with explicit ref and object formats.
+type InitBareRequest struct {
+	Repo          tenant.RepoKey
+	RepoDir       string
+	ObjectFormat  string
+	RefFormat     string
+	DefaultBranch string
+	Timeout       time.Duration
+}
+
+// ForEachRefRequest configures `git for-each-ref` against a bare repository.
+type ForEachRefRequest struct {
+	Repo    tenant.RepoKey
+	RepoDir string
+	Timeout time.Duration
+}
+
+// RefUpdateSpec describes a single ref update or deletion for `git update-ref --stdin`.
+type RefUpdateSpec struct {
+	RefName string
+	NewOID  string
+	Delete  bool
+}
+
+// UpdateRefRequest configures an atomic `git update-ref --stdin` transaction.
+type UpdateRefRequest struct {
+	Repo    tenant.RepoKey
+	RepoDir string
+	Updates []RefUpdateSpec
+	Timeout time.Duration
+}
+
+// SymbolicRefRequest configures `git symbolic-ref <Name> <Target>`.
+type SymbolicRefRequest struct {
+	Repo    tenant.RepoKey
+	RepoDir string
+	Name    string
+	Target  string
+	Timeout time.Duration
+}
+
+// BundleCreateRequest configures `git bundle create <OutputPath> --all`.
+type BundleCreateRequest struct {
+	Repo       tenant.RepoKey
+	RepoDir    string
+	OutputPath string
+	Timeout    time.Duration
 }
 
 // IndexPackRequest configures a git index-pack subprocess with an optional
@@ -205,8 +272,19 @@ func (e *SubprocessExecutor) ExecUploadPack(ctx context.Context, req UploadPackR
 		"-c", "uploadpack.allowReachableSHA1InWant=true",
 		"-c", "uploadpack.allowAnySHA1InWant=true",
 		"-c", "uploadpack.allowFilter=true",
-		"upload-pack",
 	}
+	if req.BundleURI != "" {
+		if err := ValidateBundleURI(req.BundleURI); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		}
+		args = append(args,
+			"-c", "uploadpack.advertiseBundleURIs=true",
+			"-c", "bundle.version=1",
+			"-c", "bundle.mode=all",
+			"-c", "bundle.stravin.uri="+req.BundleURI,
+		)
+	}
+	args = append(args, "upload-pack")
 	if req.StatelessRPC {
 		args = append(args, "--stateless-rpc")
 	}
@@ -284,7 +362,7 @@ func (e *SubprocessExecutor) ExecRepack(ctx context.Context, req RepackRequest) 
 		if req.Geometric > 0 {
 			args = append(args, "--geometric="+strconv.Itoa(req.Geometric))
 		}
-		if req.WriteBitmap {
+		if req.WriteBitmap && !req.WriteMIDX {
 			args = append(args, "-b")
 		}
 		if req.Quiet {
@@ -314,6 +392,220 @@ func (e *SubprocessExecutor) ExecRepack(ctx context.Context, req RepackRequest) 
 
 	return nil
 }
+
+// ExecInitBare initializes a bare repository with explicit --ref-format and
+// --object-format flags (defaulting to reftable and sha1).
+func (e *SubprocessExecutor) ExecInitBare(ctx context.Context, req InitBareRequest) error {
+	if strings.TrimSpace(req.RepoDir) == "" {
+		return ErrEmptyRepoDir
+	}
+	objFmt := strings.ToLower(strings.TrimSpace(req.ObjectFormat))
+	if objFmt == "" {
+		objFmt = "sha1"
+	}
+	if objFmt != "sha1" && objFmt != "sha256" {
+		return fmt.Errorf("%w: unsupported object format %q", ErrInvalidRequest, req.ObjectFormat)
+	}
+	refFmt := strings.ToLower(strings.TrimSpace(req.RefFormat))
+	if refFmt == "" {
+		refFmt = "reftable"
+	}
+	if refFmt != "reftable" && refFmt != "files" {
+		return fmt.Errorf("%w: unsupported ref format %q", ErrInvalidRequest, req.RefFormat)
+	}
+
+	if err := os.MkdirAll(req.RepoDir, 0o750); err != nil {
+		return fmt.Errorf("gitexec: mkdir bare repo %s: %w", req.RepoDir, err)
+	}
+
+	args := []string{
+		"init",
+		"--bare",
+		"--quiet",
+		"--ref-format=" + refFmt,
+		"--object-format=" + objFmt,
+	}
+	if branch := strings.TrimSpace(req.DefaultBranch); branch != "" {
+		branch = strings.TrimPrefix(branch, "refs/heads/")
+		if !isSafeGitToken(branch) || strings.HasPrefix(branch, "-") {
+			return fmt.Errorf("%w: invalid default branch %q", ErrInvalidRequest, req.DefaultBranch)
+		}
+		args = append(args, "--initial-branch="+branch)
+	}
+	args = append(args, req.RepoDir)
+
+	spec := SandboxSpec{
+		Repo:     req.Repo,
+		RepoDir:  req.RepoDir,
+		ReadOnly: false,
+	}
+	return e.run(ctx, "init", spec, req.RepoDir, args, nil, nil, nil, nil, req.Timeout)
+}
+
+// ExecForEachRef lists all refs in req.RepoDir via `git for-each-ref`, working
+// identically across files and reftable storage backends.
+func (e *SubprocessExecutor) ExecForEachRef(ctx context.Context, req ForEachRefRequest) (map[string]string, error) {
+	if strings.TrimSpace(req.RepoDir) == "" {
+		return nil, ErrEmptyRepoDir
+	}
+	var out bytes.Buffer
+	args := []string{"--git-dir", req.RepoDir, "for-each-ref", "--format=%(objectname) %(refname)"}
+	spec := SandboxSpec{
+		Repo:     req.Repo,
+		RepoDir:  req.RepoDir,
+		ReadOnly: true,
+	}
+	if err := e.run(ctx, "for-each-ref", spec, req.RepoDir, args, nil, nil, &out, nil, req.Timeout); err != nil {
+		return nil, err
+	}
+
+	refs := make(map[string]string)
+	scanner := bufio.NewScanner(&out)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		oid, refName, ok := strings.Cut(line, " ")
+		if !ok || oid == "" || refName == "" {
+			continue
+		}
+		refs[refName] = oid
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("gitexec: parse for-each-ref output: %w", err)
+	}
+	return refs, nil
+}
+
+// ExecUpdateRef applies ref deletions and updates via
+// `git update-ref --stdin --no-deref`. Deletions are committed before updates
+// so directory/file ref transitions (e.g. refs/heads/a/b -> refs/heads/a)
+// succeed cleanly on both reftable and files backends.
+func (e *SubprocessExecutor) ExecUpdateRef(ctx context.Context, req UpdateRefRequest) error {
+	if strings.TrimSpace(req.RepoDir) == "" {
+		return ErrEmptyRepoDir
+	}
+	if len(req.Updates) == 0 {
+		return nil
+	}
+
+	var deleteBuf, updateBuf bytes.Buffer
+	for _, u := range req.Updates {
+		if !isSafeGitToken(u.RefName) {
+			return fmt.Errorf("%w: invalid ref name %q", ErrInvalidRequest, u.RefName)
+		}
+		if u.Delete {
+			fmt.Fprintf(&deleteBuf, "delete %s\n", u.RefName)
+			continue
+		}
+		if !isSafeGitToken(u.NewOID) {
+			return fmt.Errorf("%w: invalid oid %q for %s", ErrInvalidRequest, u.NewOID, u.RefName)
+		}
+		fmt.Fprintf(&updateBuf, "update %s %s\n", u.RefName, u.NewOID)
+	}
+
+	args := []string{"--git-dir", req.RepoDir, "update-ref", "--stdin", "--no-deref"}
+	spec := SandboxSpec{
+		Repo:     req.Repo,
+		RepoDir:  req.RepoDir,
+		ReadOnly: false,
+	}
+	if deleteBuf.Len() > 0 {
+		if err := e.run(ctx, "update-ref", spec, req.RepoDir, args, nil, &deleteBuf, nil, nil, req.Timeout); err != nil {
+			return err
+		}
+	}
+	if updateBuf.Len() > 0 {
+		if err := e.run(ctx, "update-ref", spec, req.RepoDir, args, nil, &updateBuf, nil, nil, req.Timeout); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ExecSymbolicRef updates a symbolic ref (such as HEAD) via `git symbolic-ref`.
+func (e *SubprocessExecutor) ExecSymbolicRef(ctx context.Context, req SymbolicRefRequest) error {
+	if strings.TrimSpace(req.RepoDir) == "" {
+		return ErrEmptyRepoDir
+	}
+	if !isSafeGitToken(req.Name) || !isSafeGitToken(req.Target) || strings.HasPrefix(req.Name, "-") || strings.HasPrefix(req.Target, "-") {
+		return fmt.Errorf("%w: invalid symbolic-ref %q -> %q", ErrInvalidRequest, req.Name, req.Target)
+	}
+	args := []string{"--git-dir", req.RepoDir, "symbolic-ref", req.Name, req.Target}
+	spec := SandboxSpec{
+		Repo:     req.Repo,
+		RepoDir:  req.RepoDir,
+		ReadOnly: false,
+	}
+	return e.run(ctx, "symbolic-ref", spec, req.RepoDir, args, nil, nil, nil, nil, req.Timeout)
+}
+
+// ExecBundleCreate creates a complete Git bundle at req.OutputPath via
+// `git bundle create <OutputPath> --all`.
+func (e *SubprocessExecutor) ExecBundleCreate(ctx context.Context, req BundleCreateRequest) error {
+	if strings.TrimSpace(req.RepoDir) == "" {
+		return ErrEmptyRepoDir
+	}
+	outPath := strings.TrimSpace(req.OutputPath)
+	if outPath == "" || strings.HasPrefix(outPath, "-") {
+		return fmt.Errorf("%w: invalid bundle output path %q", ErrInvalidRequest, req.OutputPath)
+	}
+	args := []string{"--git-dir", req.RepoDir, "bundle", "create", outPath, "--all"}
+	spec := SandboxSpec{
+		Repo:     req.Repo,
+		RepoDir:  req.RepoDir,
+		ReadOnly: false,
+	}
+	return e.run(ctx, "bundle", spec, req.RepoDir, args, nil, nil, nil, nil, req.Timeout)
+}
+
+// ValidateBundleURI strictly validates a bundle-uri value before passing it to
+// `git -c bundle.*.uri=...` flags: must be an http:// or https:// URL with a
+// non-empty host and no control characters, whitespace, or userinfo.
+func ValidateBundleURI(raw string) error {
+	if raw == "" || len(raw) > 2048 {
+		return errors.New("bundle URI must be between 1 and 2048 characters")
+	}
+	for i := 0; i < len(raw); i++ {
+		b := raw[i]
+		if b <= 0x20 || b == 0x7f {
+			return errors.New("bundle URI contains control or whitespace character")
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid bundle URI: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("unsupported bundle URI scheme %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return errors.New("bundle URI missing host")
+	}
+	if u.User != nil {
+		return errors.New("bundle URI must not include userinfo")
+	}
+	return nil
+}
+
+func isSafeGitToken(v string) bool {
+	if v == "" || len(v) > 1024 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] <= 0x20 || v[i] == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+var (
+	_ GitExecutor      = (*SubprocessExecutor)(nil)
+	_ BareRepoExecutor = (*SubprocessExecutor)(nil)
+	_ BundleExecutor   = (*SubprocessExecutor)(nil)
+)
 
 func (e *SubprocessExecutor) run(
 	ctx context.Context,

@@ -5,6 +5,7 @@ package s3
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"stravin.dev/core/internal/crypto"
@@ -49,6 +51,17 @@ type API interface {
 }
 
 var _ API = (*awss3.Client)(nil)
+
+// PresignAPI is the narrow AWS SDK v2 S3 presign client interface used for
+// generating time-bounded presigned GET URLs (e.g. Git Protocol v2 bundle-uri).
+// *awss3.PresignClient satisfies this interface directly.
+type PresignAPI interface {
+	PresignGetObject(ctx context.Context, params *awss3.GetObjectInput, optFns ...func(*awss3.PresignOptions)) (*v4.PresignedHTTPRequest, error)
+}
+
+var _ PresignAPI = (*awss3.PresignClient)(nil)
+
+const defaultBundlePresignExpiry = 15 * time.Minute
 
 // ObjectMeta describes metadata returned by HeadObject.
 type ObjectMeta struct {
@@ -96,6 +109,13 @@ func WithEnvelopeCipher(c crypto.EnvelopeCipher) Option {
 	}
 }
 
+// WithPresignClient overrides the S3 presign client used by PresignBundleURL.
+func WithPresignClient(p PresignAPI) Option {
+	return func(s *Store) {
+		s.presigner = p
+	}
+}
+
 // WithKMSEnvelopeCipher constructs a KMS envelope cipher when kmsKeyID is
 // non-empty and returns a Store Option wiring it into NewStore. It returns
 // (nil, nil) when kmsKeyID is empty, and returns an error when kmsKeyID is
@@ -140,9 +160,10 @@ func NewAWSClient(cfg aws.Config, endpoint string, forcePathStyle bool) *awss3.C
 
 // Store is the AWS SDK v2 S3 adapter implementing ObjectStore.
 type Store struct {
-	client API
-	bucket string
-	cipher crypto.EnvelopeCipher
+	client    API
+	presigner PresignAPI
+	bucket    string
+	cipher    crypto.EnvelopeCipher
 }
 
 var _ ObjectStore = (*Store)(nil)
@@ -159,6 +180,9 @@ func NewStore(client API, bucket string, opts ...Option) (*Store, error) {
 	s := &Store{
 		client: client,
 		bucket: bucket,
+	}
+	if awsClient, ok := client.(*awss3.Client); ok {
+		s.presigner = awss3.NewPresignClient(awsClient)
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -300,6 +324,68 @@ func (s *Store) GetWasmHook(ctx context.Context, wasmSHA256 string) ([]byte, err
 		return nil, err
 	}
 	return s.GetObject(ctx, key)
+}
+
+// PutBundle uploads a pre-built Git bundle for Protocol v2 bundle-uri cold-clone
+// offload. Bundles are stored as raw Git bundle bytes so clients can fetch them
+// directly over a presigned S3 GET URL.
+func (s *Store) PutBundle(ctx context.Context, repo tenant.RepoKey, data []byte) error {
+	key, err := BundleKey(repo)
+	if err != nil {
+		return err
+	}
+	return s.PutObject(ctx, key, data, contentTypeOctetStream)
+}
+
+// GetBundle downloads the latest Git bundle for repo.
+func (s *Store) GetBundle(ctx context.Context, repo tenant.RepoKey) ([]byte, error) {
+	key, err := BundleKey(repo)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetObject(ctx, key)
+}
+
+// HasBundle reports whether a Git bundle exists in S3 for repo.
+func (s *Store) HasBundle(ctx context.Context, repo tenant.RepoKey) (bool, error) {
+	key, err := BundleKey(repo)
+	if err != nil {
+		return false, err
+	}
+	_, err = s.HeadObject(ctx, key)
+	if err != nil {
+		if isNotFoundError(err) || errors.Is(err, ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// PresignBundleURL returns a time-bounded presigned S3 GET URL for repo's
+// latest Git bundle, or ErrNotFound if no bundle has been published.
+func (s *Store) PresignBundleURL(ctx context.Context, repo tenant.RepoKey, expiry time.Duration) (string, error) {
+	if s.presigner == nil {
+		return "", fmt.Errorf("%w: s3 presign client not configured", ErrInvalidInput)
+	}
+	key, err := BundleKey(repo)
+	if err != nil {
+		return "", err
+	}
+	if _, err := s.HeadObject(ctx, key); err != nil {
+		return "", err
+	}
+	if expiry <= 0 {
+		expiry = defaultBundlePresignExpiry
+	}
+	presigned, err := s.presigner.PresignGetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	}, awss3.WithPresignExpires(expiry))
+	if err != nil {
+		return "", fmt.Errorf("s3: presign bundle %s: %w", key, err)
+	}
+	return presigned.URL, nil
 }
 
 // PutObject uploads raw bytes to key and returns nil only after S3 confirms HTTP 200 OK.

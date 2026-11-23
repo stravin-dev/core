@@ -650,6 +650,14 @@ func (c *Cache) recoverRepo(key tenant.RepoKey, repoPath string) {
 }
 
 func initBareRepoLayout(repoPath string) error {
+	// If the bare repository is already initialized with Git's reftable backend,
+	// refs/heads is a regular stub file (not a directory); only ensure objects/pack.
+	if _, err := os.Stat(filepath.Join(repoPath, "reftable", "tables.list")); err == nil {
+		if err := os.MkdirAll(filepath.Join(repoPath, "objects", "pack"), dirPerm); err != nil {
+			return fmt.Errorf("create bare repo dir objects/pack: %w", err)
+		}
+		return nil
+	}
 	for _, rel := range []string{"objects/pack", "refs/heads", "refs/tags"} {
 		if err := os.MkdirAll(filepath.Join(repoPath, rel), dirPerm); err != nil {
 			return fmt.Errorf("create bare repo dir %s: %w", rel, err)
