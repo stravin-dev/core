@@ -65,6 +65,11 @@ type SyncResult struct {
 	Handle       *cache.RepoHandle
 }
 
+type repoSyncSnapshot struct {
+	meta ddb.RepoMeta
+	refs []ddb.RefState
+}
+
 // Materializer implements the GoF Facade / Template Method pipeline for
 // synchronizing DynamoDB metadata and S3 packfiles into the warm NVMe cache.
 type Materializer struct {
@@ -81,6 +86,9 @@ type Materializer struct {
 
 	reconcileMu   sync.Mutex
 	lastReconcile map[tenant.RepoKey]time.Time
+
+	lastSyncMu sync.Mutex
+	lastSync   map[tenant.RepoKey]repoSyncSnapshot
 }
 
 // NewMaterializer constructs a Materializer with validated dependencies.
@@ -130,6 +138,7 @@ func NewMaterializer(cfg MaterializerConfig) (*Materializer, error) {
 		maxConcurrency:         maxConc,
 		pruneReconcileInterval: reconcileInterval,
 		lastReconcile:          make(map[tenant.RepoKey]time.Time),
+		lastSync:               make(map[tenant.RepoKey]repoSyncSnapshot),
 	}, nil
 }
 
@@ -165,41 +174,58 @@ func (m *Materializer) LoadAuthoritativeRefs(ctx context.Context, repo tenant.Re
 	return meta, refs, nil
 }
 
-// SyncAndPin runs the full read-path synchronization pipeline:
-//  1. Load authoritative META + RS#{s} refs from DynamoDB.
-//  2. Under singleflight cache.Materialize (returning a pinned RepoHandle), query
-//     manifest shards MS#{m} incrementally using per-shard last_seen_ulid watermarks.
+// SyncAndPin runs the full read-path synchronization pipeline under linearizable
+// singleflight cache.Materialize (returning a pinned RepoHandle):
+//  1. Load authoritative META + RS#{s} refs from DynamoDB inside the serialized
+//     flight so a prior snapshot can never overwrite newer refs.
+//  2. Query manifest shards MS#{m} incrementally using per-shard last_seen_ulid watermarks.
 //  3. Concurrently fetch any missing ACTIVE .pack/.idx objects from S3 and install
 //     them into the warm NVMe cache.
 //  4. Advance manifest watermarks only after all missing packs are installed.
 //  5. Materialize disposable local bare-repo refs strictly from DynamoDB.
 func (m *Materializer) SyncAndPin(ctx context.Context, repo tenant.RepoKey) (SyncResult, error) {
-	meta, refs, err := m.LoadAuthoritativeRefs(ctx, repo)
-	if err != nil {
-		return SyncResult{}, err
-	}
+	var (
+		meta         ddb.RepoMeta
+		refs         []ddb.RefState
+		fetchedCount int
+		cachedCount  int
+		ranSync      bool
+	)
 
-	var fetchedCount, cachedCount int
 	handle, err := m.cache.Materialize(ctx, repo, func(syncCtx context.Context, repoPath string) error {
-		fetched, cached, pruned, syncErr := m.syncManifestPacks(syncCtx, repo, meta)
+		loadedMeta, loadedRefs, loadErr := m.LoadAuthoritativeRefs(syncCtx, repo)
+		if loadErr != nil {
+			return loadErr
+		}
+
+		fetched, cached, pruned, syncErr := m.syncManifestPacks(syncCtx, repo, loadedMeta)
 		if syncErr != nil {
 			return syncErr
 		}
-		fetchedCount = fetched
-		cachedCount = cached
 
-		if err := m.ensureReftableBareRepo(syncCtx, repo, repoPath, meta); err != nil {
+		if err := m.ensureReftableBareRepo(syncCtx, repo, repoPath, loadedMeta); err != nil {
 			return fmt.Errorf("node: configure reftable bare repo %s: %w", repo, err)
 		}
-		refsChanged, err := m.materializeReftableRefs(syncCtx, repo, repoPath, refs, meta.DefaultBranch)
+		refsChanged, err := m.materializeReftableRefs(syncCtx, repo, repoPath, loadedRefs, loadedMeta.DefaultBranch)
 		if err != nil {
 			return fmt.Errorf("node: materialize reftable refs %s: %w", repo, err)
 		}
-		m.refreshAuxIndexes(syncCtx, repo, repoPath, fetched > 0 || pruned > 0 || refsChanged, len(refs) > 0)
+		m.refreshAuxIndexes(syncCtx, repo, repoPath, fetched > 0 || pruned > 0 || refsChanged, len(loadedRefs) > 0)
+
+		m.recordLastSync(repo, loadedMeta, loadedRefs)
+		meta = loadedMeta
+		refs = loadedRefs
+		fetchedCount = fetched
+		cachedCount = cached
+		ranSync = true
 		return nil
 	})
 	if err != nil {
 		return SyncResult{}, err
+	}
+
+	if !ranSync {
+		meta, refs = m.loadLastSync(repo)
 	}
 
 	if m.metrics != nil {
@@ -213,6 +239,23 @@ func (m *Materializer) SyncAndPin(ctx context.Context, repo tenant.RepoKey) (Syn
 		PacksCached:  cachedCount,
 		Handle:       handle,
 	}, nil
+}
+
+func (m *Materializer) recordLastSync(repo tenant.RepoKey, meta ddb.RepoMeta, refs []ddb.RefState) {
+	cp := make([]ddb.RefState, len(refs))
+	copy(cp, refs)
+	m.lastSyncMu.Lock()
+	m.lastSync[repo] = repoSyncSnapshot{meta: meta, refs: cp}
+	m.lastSyncMu.Unlock()
+}
+
+func (m *Materializer) loadLastSync(repo tenant.RepoKey) (ddb.RepoMeta, []ddb.RefState) {
+	m.lastSyncMu.Lock()
+	snap := m.lastSync[repo]
+	m.lastSyncMu.Unlock()
+	cp := make([]ddb.RefState, len(snap.refs))
+	copy(cp, snap.refs)
+	return snap.meta, cp
 }
 
 func (m *Materializer) syncManifestPacks(ctx context.Context, repo tenant.RepoKey, meta ddb.RepoMeta) (fetched, cached, pruned int, err error) {

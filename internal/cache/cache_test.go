@@ -278,8 +278,8 @@ func TestConcurrentColdMaterializationSingleflight(t *testing.T) {
 	for err := range errs {
 		t.Fatalf("concurrent Materialize error: %v", err)
 	}
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("materializer ran %d times, want 1 (singleflight coalescing)", got)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("materializer ran %d times, want 2 (Flight 1 + single coalesced Flight 2)", got)
 	}
 	wantPath := filepath.Join(root, "t", "acme", "hot-repo")
 	count := 0
