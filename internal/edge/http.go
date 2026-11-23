@@ -13,7 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	"stravin.dev/core/internal/health"
 	"stravin.dev/core/internal/rpc"
@@ -27,6 +29,10 @@ const (
 
 	headerAdvertiseRefs = "x-stravin-advertise-refs"
 	headerStatelessRPC  = "x-stravin-stateless-rpc"
+
+	// httpStatusClientClosedRequest is the non-standard HTTP status code (499)
+	// recorded when a client disconnects or cancels the request mid-stream.
+	httpStatusClientClosedRequest = 499
 
 	// DefaultMaxDecompressedBodyBytes bounds decompressed Smart HTTP POST bodies (256 MiB)
 	// to mitigate gzip-bomb resource exhaustion.
@@ -302,12 +308,28 @@ func (h *HTTPHandler) handleProxyError(w http.ResponseWriter, ctx context.Contex
 		if !sw.wroteHeader {
 			http.Error(w, "invalid gzip request body", http.StatusBadRequest)
 		}
+	case isClientCanceled(ctx, err):
+		h.metrics.RecordRequest(ctx, "http", metricOp, strconv.Itoa(httpStatusClientClosedRequest), "client_canceled", time.Since(start))
+		if !sw.wroteHeader {
+			w.WriteHeader(httpStatusClientClosedRequest)
+		}
 	default:
 		h.metrics.RecordRequest(ctx, "http", metricOp, strconv.Itoa(http.StatusBadGateway), "upstream", time.Since(start))
 		if !sw.wroteHeader {
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 		}
 	}
+}
+
+func isClientCanceled(ctx context.Context, err error) bool {
+	if errors.Is(err, context.Canceled) || (ctx != nil && errors.Is(ctx.Err(), context.Canceled)) {
+		return true
+	}
+	if status.Code(err) == codes.Canceled {
+		return true
+	}
+	var grpcErr interface{ GRPCStatus() *status.Status }
+	return errors.As(err, &grpcErr) && grpcErr.GRPCStatus().Code() == codes.Canceled
 }
 
 func parseContentEncoding(headers []string) (string, bool) {
