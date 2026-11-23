@@ -94,6 +94,68 @@ func (e *Entropy) TextPayload(lines int) []byte {
 	return []byte(b.String())
 }
 
+const (
+	weightedMinBytes       = 256
+	weightedSmallMaxBytes  = 4 * 1024
+	weightedMediumMaxBytes = 32 * 1024
+	weightedLargeMaxBytes  = 128 * 1024
+	weightedMaxBytes       = 512 * 1024
+)
+
+// WeightedFileSize returns a deterministic byte size in [256, 512 KiB],
+// skewed heavily toward small deltas so large files occur infrequently:
+//   - 70% small:        256 B –   4 KiB
+//   - 20% medium:       4 KiB –  32 KiB
+//   - 7% large:       32 KiB – 128 KiB
+//   - 3% extra-large: 128 KiB – 512 KiB
+func (e *Entropy) WeightedFileSize() int {
+	roll := e.rng.IntN(100)
+	switch {
+	case roll < 70:
+		return e.IntRange(weightedMinBytes, weightedSmallMaxBytes)
+	case roll < 90:
+		return e.IntRange(weightedSmallMaxBytes+1, weightedMediumMaxBytes)
+	case roll < 97:
+		return e.IntRange(weightedMediumMaxBytes+1, weightedLargeMaxBytes)
+	default:
+		return e.IntRange(weightedLargeMaxBytes+1, weightedMaxBytes)
+	}
+}
+
+// WeightedPayload generates deterministic file content of WeightedFileSize() bytes.
+// Small and medium tiers produce structured text lines; larger tiers mix structured
+// text with incompressible bytes (or pure incompressible bytes for extra-large blobs).
+func (e *Entropy) WeightedPayload() []byte {
+	size := e.WeightedFileSize()
+	switch {
+	case size <= weightedMediumMaxBytes:
+		return e.textPayloadExact(size)
+	case size <= weightedLargeMaxBytes:
+		textHalf := size / 2
+		out := make([]byte, 0, size)
+		out = append(out, e.textPayloadExact(textHalf)...)
+		out = append(out, e.IncompressibleBlob(size-textHalf)...)
+		return out
+	default:
+		return e.IncompressibleBlob(size)
+	}
+}
+
+func (e *Entropy) textPayloadExact(sizeBytes int) []byte {
+	if sizeBytes <= 0 {
+		return nil
+	}
+	var b strings.Builder
+	b.Grow(sizeBytes + 64)
+	for line := 0; b.Len() < sizeBytes; line++ {
+		topic := entropyTopics[e.rng.IntN(len(entropyTopics))]
+		fmt.Fprintf(&b, "line=%04d topic=%s val=%016x\n", line, topic, e.rng.Uint64())
+	}
+	out := []byte(b.String()[:sizeBytes])
+	out[sizeBytes-1] = '\n'
+	return out
+}
+
 // SmallDelta appends a small deterministic delta block to base so Git pack
 // generation can produce a thin delta against the previous blob.
 func (e *Entropy) SmallDelta(base []byte) []byte {

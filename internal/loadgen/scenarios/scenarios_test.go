@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -136,8 +137,76 @@ func TestEntropyDeterministicUnderSeed(t *testing.T) {
 	if e1.InvalidRefName() != e2.InvalidRefName() {
 		t.Fatal("InvalidRefName not deterministic")
 	}
+	if e1.WeightedFileSize() != e2.WeightedFileSize() {
+		t.Fatal("WeightedFileSize not deterministic")
+	}
+	wp1, wp2 := e1.WeightedPayload(), e2.WeightedPayload()
+	if !bytes.Equal(wp1, wp2) {
+		t.Fatal("WeightedPayload not deterministic")
+	}
 	if e1.BranchName("feat") == e3.BranchName("feat") {
 		t.Fatal("different seeds unexpectedly produced identical branch name")
+	}
+}
+
+func TestWeightedFileSizeAndPayloadDistribution(t *testing.T) {
+	const (
+		samples      = 2000
+		minBytes     = 256
+		smallMax     = 4 * 1024
+		largeMin     = 128 * 1024
+		maxBytes     = 512 * 1024
+		sampleSeed   = 1337
+		sampleStream = 42
+	)
+
+	ent := NewEntropy(rand.New(rand.NewPCG(sampleSeed, sampleStream)))
+	sizes := make([]int, samples)
+	var sum int64
+	var smallCount, extraLargeCount int
+
+	for i := 0; i < samples; i++ {
+		sz := ent.WeightedFileSize()
+		if sz < minBytes || sz > maxBytes {
+			t.Fatalf("sample %d: WeightedFileSize() = %d, want [%d, %d]", i, sz, minBytes, maxBytes)
+		}
+		sizes[i] = sz
+		sum += int64(sz)
+		if sz <= smallMax {
+			smallCount++
+		}
+		if sz > largeMin {
+			extraLargeCount++
+		}
+	}
+
+	slices.Sort(sizes)
+	median := float64(sizes[samples/2])
+	mean := float64(sum) / float64(samples)
+
+	smallRatio := float64(smallCount) / float64(samples)
+	extraLargeRatio := float64(extraLargeCount) / float64(samples)
+
+	if smallRatio <= 0.60 {
+		t.Fatalf("small tier (<=4KiB) ratio = %.3f, want > 0.60", smallRatio)
+	}
+	if extraLargeCount == 0 || extraLargeRatio >= 0.10 {
+		t.Fatalf("extra-large tier (>128KiB) count=%d ratio=%.3f, want >0 and <0.10", extraLargeCount, extraLargeRatio)
+	}
+	if median >= mean {
+		t.Fatalf("expected skewed distribution with median < mean, got median=%.1f mean=%.1f", median, mean)
+	}
+
+	// Verify WeightedPayload length matches WeightedFileSize for identical seeds.
+	for i := 0; i < 64; i++ {
+		seed := uint64(777 + i)
+		eSize := NewEntropy(rand.New(rand.NewPCG(seed, 1)))
+		ePayload := NewEntropy(rand.New(rand.NewPCG(seed, 1)))
+		wantLen := eSize.WeightedFileSize()
+		payload := ePayload.WeightedPayload()
+		if len(payload) != wantLen {
+			t.Fatalf("iter %d: len(WeightedPayload()) = %d, want %d", i, len(payload), wantLen)
+		}
 	}
 }
 

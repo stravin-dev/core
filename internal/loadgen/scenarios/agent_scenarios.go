@@ -45,7 +45,7 @@ func (s *agentRapidCheckpointBurst) Run(ctx context.Context, env *loadgen.Scenar
 			return ctx.Err()
 		}
 		relPath := fmt.Sprintf("checkpoints/%s/step-%02d.txt", ent.HexID(), i)
-		headSHA, err = commitFile(ctx, g, relPath, ent.TextPayload(ent.IntRange(2, 8)), ent.CommitMessage("checkpoint"))
+		headSHA, err = commitFile(ctx, g, relPath, ent.WeightedPayload(), ent.CommitMessage("checkpoint"))
 		if err != nil {
 			return err
 		}
@@ -95,7 +95,7 @@ func (s *agentParallelBranchFanout) Run(ctx context.Context, env *loadgen.Scenar
 		if err := g.CheckoutNewBranch(ctx, branch); err != nil {
 			return err
 		}
-		sha, commitErr := commitFile(ctx, g, fmt.Sprintf("fanout/%s.txt", ent.HexID()), ent.TextPayload(5), ent.CommitMessage("fanout"))
+		sha, commitErr := commitFile(ctx, g, fmt.Sprintf("fanout/%s.txt", ent.HexID()), ent.WeightedPayload(), ent.CommitMessage("fanout"))
 		if commitErr != nil {
 			return commitErr
 		}
@@ -148,7 +148,7 @@ func (s *agentSharedBranchRace) Run(ctx context.Context, env *loadgen.ScenarioEn
 	}
 
 	relPath := fmt.Sprintf("shared-race/agent-%d-%s.txt", env.WorkerID, ent.HexID())
-	if _, err := commitFile(ctx, g, relPath, ent.TextPayload(4), ent.CommitMessage("race")); err != nil {
+	if _, err := commitFile(ctx, g, relPath, ent.WeightedPayload(), ent.CommitMessage("race")); err != nil {
 		return err
 	}
 
@@ -186,8 +186,16 @@ func (s *agentDeepTreeRefactor) Run(ctx context.Context, env *loadgen.ScenarioEn
 	}
 
 	paths := ent.DeepTreePaths(ent.IntRange(4, 6), ent.IntRange(6, 10))
-	for _, p := range paths {
-		if err := g.WriteFile(p, ent.TextPayload(ent.IntRange(3, 8))); err != nil {
+	for i, p := range paths {
+		// Use a weighted payload on the primary file and small text on the rest
+		// to exercise weighted sizes while keeping multi-file refactors bounded.
+		var payload []byte
+		if i == 0 {
+			payload = ent.WeightedPayload()
+		} else {
+			payload = ent.TextPayload(ent.IntRange(3, 8))
+		}
+		if err := g.WriteFile(p, payload); err != nil {
 			return err
 		}
 	}
@@ -284,7 +292,7 @@ func (s *agentOrphanBranchArtifact) Run(ctx context.Context, env *loadgen.Scenar
 	}
 	_, _ = g.Run(ctx, "rm", "-rf", "--ignore-unmatch", ".")
 
-	artifactSHA, err := commitFile(ctx, g, fmt.Sprintf("artifacts/%s.json", ent.HexID()), ent.TextPayload(8), ent.CommitMessage("orphan"))
+	artifactSHA, err := commitFile(ctx, g, fmt.Sprintf("artifacts/%s.json", ent.HexID()), ent.WeightedPayload(), ent.CommitMessage("orphan"))
 	if err != nil {
 		return err
 	}
@@ -360,7 +368,7 @@ func (s *agentMergeCommitDiamond) Run(ctx context.Context, env *loadgen.Scenario
 	if err := g.CheckoutNewBranch(ctx, leftBranch); err != nil {
 		return err
 	}
-	leftSHA, err := commitFile(ctx, g, fmt.Sprintf("diamond/left-%s.txt", ent.HexID()), ent.TextPayload(4), ent.CommitMessage("diamond-left"))
+	leftSHA, err := commitFile(ctx, g, fmt.Sprintf("diamond/left-%s.txt", ent.HexID()), ent.WeightedPayload(), ent.CommitMessage("diamond-left"))
 	if err != nil {
 		return err
 	}
@@ -372,7 +380,7 @@ func (s *agentMergeCommitDiamond) Run(ctx context.Context, env *loadgen.Scenario
 	if err := g.CheckoutNewBranch(ctx, rightBranch); err != nil {
 		return err
 	}
-	rightSHA, err := commitFile(ctx, g, fmt.Sprintf("diamond/right-%s.txt", ent.HexID()), ent.TextPayload(4), ent.CommitMessage("diamond-right"))
+	rightSHA, err := commitFile(ctx, g, fmt.Sprintf("diamond/right-%s.txt", ent.HexID()), ent.WeightedPayload(), ent.CommitMessage("diamond-right"))
 	if err != nil {
 		return err
 	}
@@ -437,7 +445,7 @@ func (s *agentCherryPickBackport) Run(ctx context.Context, env *loadgen.Scenario
 	if err := g.CheckoutNewBranch(ctx, releaseBranch); err != nil {
 		return err
 	}
-	if _, err := commitFile(ctx, g, fmt.Sprintf("backport/rel-%s.txt", ent.HexID()), ent.TextPayload(4), ent.CommitMessage("release-base")); err != nil {
+	if _, err := commitFile(ctx, g, fmt.Sprintf("backport/rel-%s.txt", ent.HexID()), ent.WeightedPayload(), ent.CommitMessage("release-base")); err != nil {
 		return err
 	}
 
@@ -448,11 +456,11 @@ func (s *agentCherryPickBackport) Run(ctx context.Context, env *loadgen.Scenario
 	if err := g.CheckoutNewBranch(ctx, featBranch); err != nil {
 		return err
 	}
-	if _, err := commitFile(ctx, g, fmt.Sprintf("backport/feat1-%s.txt", ent.HexID()), ent.TextPayload(4), ent.CommitMessage("feat-1")); err != nil {
+	if _, err := commitFile(ctx, g, fmt.Sprintf("backport/feat1-%s.txt", ent.HexID()), ent.WeightedPayload(), ent.CommitMessage("feat-1")); err != nil {
 		return err
 	}
 	pickFile := fmt.Sprintf("backport/fix-%s.txt", ent.HexID())
-	pickSHA, err := commitFile(ctx, g, pickFile, ent.TextPayload(6), ent.CommitMessage("feat-fix"))
+	pickSHA, err := commitFile(ctx, g, pickFile, ent.WeightedPayload(), ent.CommitMessage("feat-fix"))
 	if err != nil {
 		return err
 	}
@@ -510,7 +518,7 @@ func (s *agentWasmHookAllowAndReject) Run(ctx context.Context, env *loadgen.Scen
 	if err := g.CheckoutNewBranch(ctx, allowedBranch); err != nil {
 		return err
 	}
-	allowedSHA, err := commitFile(ctx, g, fmt.Sprintf("hooks/ok-%s.txt", ent.HexID()), ent.TextPayload(4), ent.CommitMessage("hook-allow"))
+	allowedSHA, err := commitFile(ctx, g, fmt.Sprintf("hooks/ok-%s.txt", ent.HexID()), ent.WeightedPayload(), ent.CommitMessage("hook-allow"))
 	if err != nil {
 		return err
 	}
@@ -594,7 +602,7 @@ func (s *agentHighChurnCompactionTrigger) Run(ctx context.Context, env *loadgen.
 			wg.Wait()
 			return ctx.Err()
 		}
-		headSHA, err = commitFile(ctx, g, fmt.Sprintf("churn/%s/p-%02d.txt", ent.HexID(), i), ent.TextPayload(2), ent.CommitMessage("churn"))
+		headSHA, err = commitFile(ctx, g, fmt.Sprintf("churn/%s/p-%02d.txt", ent.HexID(), i), ent.WeightedPayload(), ent.CommitMessage("churn"))
 		if err != nil {
 			stopReader()
 			wg.Wait()
@@ -649,7 +657,7 @@ func (s *agentProtocolSwitchHTTPSSH) Run(ctx context.Context, env *loadgen.Scena
 	if err := httpGit.CheckoutNewBranch(ctx, httpBranch); err != nil {
 		return err
 	}
-	httpSHA, err := commitFile(ctx, httpGit, fmt.Sprintf("proto/http-%s.txt", ent.HexID()), ent.TextPayload(4), ent.CommitMessage("http-push"))
+	httpSHA, err := commitFile(ctx, httpGit, fmt.Sprintf("proto/http-%s.txt", ent.HexID()), ent.WeightedPayload(), ent.CommitMessage("http-push"))
 	if err != nil {
 		return err
 	}
@@ -675,7 +683,7 @@ func (s *agentProtocolSwitchHTTPSSH) Run(ctx context.Context, env *loadgen.Scena
 	if err := sshGit.CheckoutNewBranch(ctx, sshBranch); err != nil {
 		return err
 	}
-	sshSHA, err := commitFile(ctx, sshGit, fmt.Sprintf("proto/ssh-%s.txt", ent.HexID()), ent.TextPayload(4), ent.CommitMessage("ssh-push"))
+	sshSHA, err := commitFile(ctx, sshGit, fmt.Sprintf("proto/ssh-%s.txt", ent.HexID()), ent.WeightedPayload(), ent.CommitMessage("ssh-push"))
 	if err != nil {
 		return err
 	}

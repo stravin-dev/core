@@ -70,7 +70,7 @@ func (s *devFeatureBranchPR) Run(ctx context.Context, env *loadgen.ScenarioEnv) 
 	var headSHA string
 	for i := 0; i < commits; i++ {
 		relPath := fmt.Sprintf("features/%s/part-%d.txt", ent.HexID(), i)
-		headSHA, err = commitFile(ctx, g, relPath, ent.TextPayload(ent.IntRange(4, 16)), ent.CommitMessage("feat"))
+		headSHA, err = commitFile(ctx, g, relPath, ent.WeightedPayload(), ent.CommitMessage("feat"))
 		if err != nil {
 			return err
 		}
@@ -110,7 +110,7 @@ func (s *devIncrementalThinPack) Run(ctx context.Context, env *loadgen.ScenarioE
 	}
 
 	relPath := fmt.Sprintf("thin/%s.txt", ent.Slug("base"))
-	basePayload := ent.TextPayload(ent.IntRange(80, 160))
+	basePayload := ent.WeightedPayload()
 	if _, err := commitFile(ctx, g, relPath, basePayload, ent.CommitMessage("thin-base")); err != nil {
 		return err
 	}
@@ -167,10 +167,10 @@ func (s *devRebaseAndForcePush) Run(ctx context.Context, env *loadgen.ScenarioEn
 	}
 
 	relPath := fmt.Sprintf("rebase/%s.txt", ent.Slug("wip"))
-	if _, err := commitFile(ctx, g, relPath, ent.TextPayload(6), ent.CommitMessage("wip-1")); err != nil {
+	if _, err := commitFile(ctx, g, relPath, ent.WeightedPayload(), ent.CommitMessage("wip-1")); err != nil {
 		return err
 	}
-	if _, err := commitFile(ctx, g, relPath, ent.TextPayload(8), ent.CommitMessage("wip-2")); err != nil {
+	if _, err := commitFile(ctx, g, relPath, ent.WeightedPayload(), ent.CommitMessage("wip-2")); err != nil {
 		return err
 	}
 	if err := env.RunOp(ctx, s.Name(), "push", loadgen.ClassifyOptions{ExclusiveBranch: true}, func(opCtx context.Context) error {
@@ -185,7 +185,7 @@ func (s *devRebaseAndForcePush) Run(ctx context.Context, env *loadgen.ScenarioEn
 	}
 
 	// Amend the tip commit to rewrite history, then push with --force-with-lease.
-	if err := g.WriteFile(relPath, ent.TextPayload(10)); err != nil {
+	if err := g.WriteFile(relPath, ent.WeightedPayload()); err != nil {
 		return err
 	}
 	if err := g.AddAll(ctx); err != nil {
@@ -231,7 +231,7 @@ func (s *devConcurrentMainPushRetry) Run(ctx context.Context, env *loadgen.Scena
 	}
 
 	relPath := fmt.Sprintf("main-updates/w%d-%s.txt", env.WorkerID, ent.HexID())
-	if _, err := commitFile(ctx, g, relPath, ent.TextPayload(5), ent.CommitMessage("main")); err != nil {
+	if _, err := commitFile(ctx, g, relPath, ent.WeightedPayload(), ent.CommitMessage("main")); err != nil {
 		return err
 	}
 
@@ -266,7 +266,7 @@ func (s *devTagAndRelease) Run(ctx context.Context, env *loadgen.ScenarioEnv) er
 	if err := g.CheckoutNewBranch(ctx, branch); err != nil {
 		return err
 	}
-	targetSHA, err := commitFile(ctx, g, fmt.Sprintf("releases/%s.txt", ent.HexID()), ent.TextPayload(5), ent.CommitMessage("release"))
+	targetSHA, err := commitFile(ctx, g, fmt.Sprintf("releases/%s.txt", ent.HexID()), ent.WeightedPayload(), ent.CommitMessage("release"))
 	if err != nil {
 		return err
 	}
@@ -398,7 +398,7 @@ func (s *devBranchCleanupCycle) Run(ctx context.Context, env *loadgen.ScenarioEn
 	if err := g.CheckoutNewBranch(ctx, branch); err != nil {
 		return err
 	}
-	firstSHA, err := commitFile(ctx, g, fmt.Sprintf("cleanup/%s-v1.txt", ent.HexID()), ent.TextPayload(4), ent.CommitMessage("create"))
+	firstSHA, err := commitFile(ctx, g, fmt.Sprintf("cleanup/%s-v1.txt", ent.HexID()), ent.WeightedPayload(), ent.CommitMessage("create"))
 	if err != nil {
 		return err
 	}
@@ -434,7 +434,7 @@ func (s *devBranchCleanupCycle) Run(ctx context.Context, env *loadgen.ScenarioEn
 	}
 
 	// Recreate branch with a fresh commit and verify.
-	secondSHA, err := commitFile(ctx, g, fmt.Sprintf("cleanup/%s-v2.txt", ent.HexID()), ent.TextPayload(6), ent.CommitMessage("recreate"))
+	secondSHA, err := commitFile(ctx, g, fmt.Sprintf("cleanup/%s-v2.txt", ent.HexID()), ent.WeightedPayload(), ent.CommitMessage("recreate"))
 	if err != nil {
 		return err
 	}
@@ -512,7 +512,7 @@ func (s *devSSHFullLifecycle) Run(ctx context.Context, env *loadgen.ScenarioEnv)
 	if err := g.CheckoutNewBranch(ctx, branch); err != nil {
 		return err
 	}
-	headSHA, err := commitFile(ctx, g, fmt.Sprintf("ssh/%s.txt", ent.HexID()), ent.TextPayload(6), ent.CommitMessage("ssh"))
+	headSHA, err := commitFile(ctx, g, fmt.Sprintf("ssh/%s.txt", ent.HexID()), ent.WeightedPayload(), ent.CommitMessage("ssh"))
 	if err != nil {
 		return err
 	}
