@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Stravin Core metrics organized by layer (stravin-edge, stravin-node, stravin-pack, stravin-ctrl) with collapsible rows, Tempo trace exemplars, and correlated Loki logs.",
+  "description": "Stravin Core health overview and per-layer metrics (stravin-edge, stravin-node, stravin-pack, stravin-ctrl) with collapsible rows, Tempo trace exemplars, and correlated Loki logs.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -47,6 +47,308 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "panels": [],
+      "title": "Overview (System Health & Key KPIs)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Overall server error rate on stravin-edge excluding client_canceled (499) and rate_limited (429). Green < 1%, Yellow 1-5%, Red >= 5%.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.01 },
+              { "color": "red", "value": 0.05 }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "id": 101,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "((sum(rate(stravin_edge_requests_total{status_code!~\"2..|ok\",error_class!~\"client_canceled|rate_limited\"}[5m])) or vector(0)) / clamp_min(sum(rate(stravin_edge_requests_total[5m])), 1e-9)) or vector(0)",
+          "legendFormat": "server error rate",
+          "refId": "A"
+        }
+      ],
+      "title": "System Health (Server Error Rate)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Cumulative non-client_canceled server errors across edge, node, S3 pack fetches, and compaction (must remain zero under healthy operation).",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 10 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
+      "id": 102,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "(sum(stravin_edge_requests_total{status_code!~\"2..|ok\",error_class!~\"client_canceled|rate_limited\"}) or vector(0)) + (sum(stravin_node_requests_total{status_code=\"error\"}) or vector(0)) + (sum(stravin_node_s3_pack_fetches_total{status_code=\"error\"}) or vector(0)) + (sum(stravin_pack_compaction_cycles_total{result=\"error\"}) or vector(0))",
+          "legendFormat": "server errors",
+          "refId": "A"
+        }
+      ],
+      "title": "Total Server Errors",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Expected client-side cancellations (HTTP 499 / client_canceled) and rate-limit rejections (HTTP 429 / rate_limited), separated from real server errors.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
+      "id": 103,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(stravin_edge_requests_total{error_class=\"client_canceled\"}) or vector(0)",
+          "legendFormat": "client_canceled (499)",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(stravin_edge_requests_total{error_class=\"rate_limited\"}) or vector(0)",
+          "legendFormat": "rate_limited (429)",
+          "refId": "B"
+        }
+      ],
+      "title": "Client Canceled (499) & Rate Limited (429)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Cumulative compaction cycle, lease renewal, integrity scrub, and recovery errors across stravin-pack and stravin-ctrl.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "id": 104,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "(sum(stravin_pack_compaction_cycles_total{result=\"error\"}) or vector(0)) + (sum(stravin_ctrl_lease_renewals_total{result=\"error\"}) or vector(0)) + (sum(stravin_ctrl_scrub_runs_total{result=\"error\"}) or vector(0)) + (sum(stravin_ctrl_recovery_runs_total{result=\"error\"}) or vector(0))",
+          "legendFormat": "pack + ctrl errors",
+          "refId": "A"
+        }
+      ],
+      "title": "Compaction & Control Errors",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Aggregate Git ingress request rate across all protocols and operations on stravin-edge.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 5 },
+      "id": 105,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(rate(stravin_edge_requests_total[5m])) or vector(0)",
+          "legendFormat": "edge req/s",
+          "refId": "A"
+        }
+      ],
+      "title": "Total Throughput (Edge req/s)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Overall Git ingress P99 latency on stravin-edge. Green < 0.5s, Yellow 0.5-2s, Red >= 2s.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "red", "value": 2 }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 5 },
+      "id": 106,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(stravin_edge_request_duration_seconds_bucket[5m]))) or vector(0)",
+          "legendFormat": "p99 latency",
+          "refId": "A"
+        }
+      ],
+      "title": "Overall P99 Latency",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Warm NVMe pack cache hit ratio on stravin-node. Red < 50%, Yellow 50-80%, Green >= 80%.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.8 }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 5 },
+      "id": 107,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "(sum(rate(stravin_node_cache_hits_total[5m])) / clamp_min(sum(rate(stravin_node_cache_hits_total[5m])) + sum(rate(stravin_node_cache_misses_total[5m])), 1e-9)) or vector(0)",
+          "legendFormat": "cache hit ratio",
+          "refId": "A"
+        }
+      ],
+      "title": "NVMe Cache Hit Ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Total active uncompacted packs observed across manifest shards on stravin-pack.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 200 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 5 },
+      "id": 108,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(stravin_pack_uncompacted_packs) or vector(0)",
+          "legendFormat": "uncompacted packs",
+          "refId": "A"
+        }
+      ],
+      "title": "Uncompacted Packs Backlog",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
       "id": 1,
       "panels": [],
       "title": "Edge Layer (stravin-edge)",
@@ -73,7 +375,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 1 },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 10 },
       "id": 2,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -106,7 +408,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 1 },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 10 },
       "id": 3,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -147,7 +449,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 1 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 10 },
       "id": 4,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -185,7 +487,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 1 },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 10 },
       "id": 5,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -204,7 +506,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
       "id": 6,
       "panels": [],
       "title": "Node & Cache Layer (stravin-node)",
@@ -231,7 +533,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 10 },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 19 },
       "id": 7,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -257,7 +559,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 10 },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 19 },
       "id": 8,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -306,7 +608,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 10 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 19 },
       "id": 9,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -352,7 +654,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 10 },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 19 },
       "id": 10,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -377,7 +679,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
       "id": 11,
       "panels": [],
       "title": "Compaction & GC Layer (stravin-pack)",
@@ -412,7 +714,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 19 },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 28 },
       "id": 12,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -445,7 +747,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 19 },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 28 },
       "id": 13,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -485,7 +787,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 19 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 28 },
       "id": 14,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -525,7 +827,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 19 },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 28 },
       "id": 15,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -556,7 +858,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 },
       "id": 16,
       "panels": [],
       "title": "Control Plane & Recovery Layer (stravin-ctrl)",
@@ -583,7 +885,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 28 },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 37 },
       "id": 17,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -615,7 +917,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 28 },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 37 },
       "id": 18,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -649,7 +951,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 28 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 37 },
       "id": 19,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -694,7 +996,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 28 },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 37 },
       "id": 20,
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom" },
@@ -719,7 +1021,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 45 },
       "id": 21,
       "panels": [],
       "title": "Logs & Trace Correlation (Loki + Tempo)",
@@ -728,7 +1030,7 @@
     {
       "datasource": { "type": "loki", "uid": "loki" },
       "description": "Live structured OTLP logs from all Stravin Core daemons with direct trace_id links to Tempo.",
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 37 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 46 },
       "id": 22,
       "options": {
         "dedupStrategy": "none",
@@ -765,5 +1067,5 @@
   "timezone": "browser",
   "title": "Stravin Core",
   "uid": "stravin-core",
-  "version": 2
+  "version": 3
 }

@@ -32,6 +32,16 @@ type grafanaGridPos struct {
 	Y int `json:"y"`
 }
 
+type grafanaThresholdStep struct {
+	Color string   `json:"color"`
+	Value *float64 `json:"value"`
+}
+
+type grafanaThresholds struct {
+	Mode  string                 `json:"mode"`
+	Steps []grafanaThresholdStep `json:"steps"`
+}
+
 type grafanaPanel struct {
 	ID          int                  `json:"id"`
 	Title       string               `json:"title"`
@@ -43,7 +53,8 @@ type grafanaPanel struct {
 	Panels      []grafanaPanel       `json:"panels"`
 	FieldConfig struct {
 		Defaults struct {
-			Links []grafanaDataLink `json:"links"`
+			Links      []grafanaDataLink `json:"links"`
+			Thresholds grafanaThresholds `json:"thresholds"`
 		} `json:"defaults"`
 	} `json:"fieldConfig"`
 }
@@ -244,10 +255,20 @@ func assertCoreDashboardRowsAndGrid(t *testing.T, dash grafanaDashboard) {
 		"Compaction & GC Layer",
 		"Control Plane & Recovery Layer",
 	}
-	wantAllRows := append(append([]string{}, wantMetricRows...), "Logs & Trace Correlation")
+	wantAllRows := append([]string{"Overview"}, append(append([]string{}, wantMetricRows...), "Logs & Trace Correlation")...)
 
 	if len(sections) < len(wantAllRows) {
 		t.Fatalf("stravin-core has %d collapsible row sections, want at least %d", len(sections), len(wantAllRows))
+	}
+
+	if !strings.Contains(sections[0].row.Title, "Overview") {
+		t.Errorf("stravin-core first row = %q, want Overview row at top", sections[0].row.Title)
+	}
+	if sections[0].row.Collapsed {
+		t.Errorf("stravin-core Overview row must be expanded (collapsed=false)")
+	}
+	if sections[0].row.GridPos.Y != 0 {
+		t.Errorf("stravin-core Overview row gridPos.y = %d, want 0", sections[0].row.GridPos.Y)
 	}
 
 	foundRows := make(map[string]dashboardSection, len(sections))
@@ -270,6 +291,8 @@ func assertCoreDashboardRowsAndGrid(t *testing.T, dash grafanaDashboard) {
 			t.Errorf("stravin-core missing collapsible row section matching %q", wantRow)
 		}
 	}
+
+	assertCoreOverviewSection(t, foundRows["Overview"])
 
 	validFourUpX := map[int]bool{0: true, 6: true, 12: true, 18: true}
 	for _, metricRow := range wantMetricRows {
@@ -300,6 +323,65 @@ func assertCoreDashboardRowsAndGrid(t *testing.T, dash grafanaDashboard) {
 			if len(xs) != 4 {
 				t.Errorf("row %q line y=%d has %d panels across, want 4 (x in {0, 6, 12, 18})", sec.row.Title, y, len(xs))
 			}
+		}
+	}
+}
+
+func assertCoreOverviewSection(t *testing.T, sec dashboardSection) {
+	t.Helper()
+	if len(sec.panels) < 6 {
+		t.Fatalf("stravin-core Overview row has %d panels, want at least 6 KPI stat panels", len(sec.panels))
+	}
+
+	var exprs []string
+	statCount := 0
+	thresholdedHealthPanels := 0
+	for _, p := range sec.panels {
+		if p.Type == "stat" {
+			statCount++
+		}
+		hasGreen, hasRed := false, false
+		for _, step := range p.FieldConfig.Defaults.Thresholds.Steps {
+			if step.Color == "green" {
+				hasGreen = true
+			}
+			if step.Color == "red" {
+				hasRed = true
+			}
+		}
+		if hasGreen && hasRed {
+			thresholdedHealthPanels++
+		}
+		for _, tgt := range p.Targets {
+			exprs = append(exprs, tgt.Expr)
+		}
+	}
+	if statCount < 6 {
+		t.Errorf("stravin-core Overview row has %d stat panels, want at least 6", statCount)
+	}
+	if thresholdedHealthPanels < 4 {
+		t.Errorf("stravin-core Overview row has %d panels with green/red health thresholds, want at least 4", thresholdedHealthPanels)
+	}
+
+	joined := strings.Join(exprs, "\n")
+	for _, tok := range []string{
+		"stravin_edge_requests_total",
+		"stravin_edge_request_duration_seconds_bucket",
+		"histogram_quantile(0.99",
+		"client_canceled",
+		"rate_limited",
+		"stravin_node_requests_total",
+		"stravin_node_s3_pack_fetches_total",
+		"stravin_node_cache_hits_total",
+		"stravin_node_cache_misses_total",
+		"stravin_pack_compaction_cycles_total",
+		"stravin_pack_uncompacted_packs",
+		"stravin_ctrl_lease_renewals_total",
+		"stravin_ctrl_scrub_runs_total",
+		"stravin_ctrl_recovery_runs_total",
+	} {
+		if !strings.Contains(joined, tok) {
+			t.Errorf("stravin-core Overview row missing expected PromQL token %q", tok)
 		}
 	}
 }
