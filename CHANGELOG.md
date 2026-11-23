@@ -1,3 +1,11 @@
+## [1.1.1](https://github.com/stravin-dev/core/compare/v1.1.0...v1.1.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* prune superseded NVMe cache packs and cap Tier-0 compaction ([e034d37](https://github.com/stravin-dev/core/commit/e034d372cc96cd13c5126dee195285995203a8d3)), closes [#104](https://github.com/stravin-dev/core/issues/104) [#105](https://github.com/stravin-dev/core/issues/105)
+* prune superseded NVMe cache packs and cap Tier-0 compaction ([#107](https://github.com/stravin-dev/core/issues/107)) ([cae3bc9](https://github.com/stravin-dev/core/commit/cae3bc90e0538571221990ea6becc5ef728ea8d4))
+
 # [1.1.0](https://github.com/stravin-dev/core/compare/v1.0.0...v1.1.0) (2026-11-23)
 
 
