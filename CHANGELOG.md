@@ -1,3 +1,11 @@
+# [1.7.0](https://github.com/stravin-dev/core/compare/v1.6.0...v1.7.0) (2026-11-23)
+
+
+### Features
+
+* **observability:** add high-level Overview health section to stravin-core Grafana dashboard ([c052be1](https://github.com/stravin-dev/core/commit/c052be1f869b9c4707e8f13044bc50afce5e2094)), closes [hi#level](https://github.com/hi/issues/level)
+* **observability:** add high-level Overview health section to stravin-core Grafana dashboard ([#126](https://github.com/stravin-dev/core/issues/126)) ([dc7b251](https://github.com/stravin-dev/core/commit/dc7b251a93712fa50923173ed74e4366ff55c359)), closes [hi#level](https://github.com/hi/issues/level)
+
 # [1.6.0](https://github.com/stravin-dev/core/compare/v1.5.0...v1.6.0) (2026-11-23)
 
 
