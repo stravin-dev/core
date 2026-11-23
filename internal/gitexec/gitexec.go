@@ -192,7 +192,7 @@ func (e *SubprocessExecutor) ExecUploadPack(ctx context.Context, req UploadPackR
 		return ErrEmptyRepoDir
 	}
 
-	args := []string{"upload-pack"}
+	args := []string{"-c", "uploadpack.allowReachableSHA1InWant=true", "upload-pack"}
 	if req.StatelessRPC {
 		args = append(args, "--stateless-rpc")
 	}
