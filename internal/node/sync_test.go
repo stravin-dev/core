@@ -663,3 +663,176 @@ func TestMaterializer_PrunesSupersededPacksOnPeriodicReconcile(t *testing.T) {
 		t.Fatalf("expected pack2 to remain cached, cached=%v", c.CachedPackIDs(rk))
 	}
 }
+
+type hookMetadataStore struct {
+	*fakeMetadataStore
+	onListRefs func(callNum int)
+	listCalls  int
+	hookMu     sync.Mutex
+}
+
+func (h *hookMetadataStore) ListRefs(ctx context.Context, repo tenant.RepoKey, refShards int) ([]ddb.RefState, error) {
+	h.hookMu.Lock()
+	h.listCalls++
+	n := h.listCalls
+	cb := h.onListRefs
+	h.hookMu.Unlock()
+	if cb != nil {
+		cb(n)
+	}
+	return h.fakeMetadataStore.ListRefs(ctx, repo, refShards)
+}
+
+func TestMaterializer_SyncAndPinPreventsStaleRefOverwriteAndCoalescesLinearizably(t *testing.T) {
+	ctx := context.Background()
+	rk, err := tenant.NewRepoKey("acme", "linearizable-sync")
+	if err != nil {
+		t.Fatalf("NewRepoKey: %v", err)
+	}
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	baseMeta := newFakeMetadataStore()
+	packStore := newFakePackFetcher()
+
+	oid1, p1Bytes, i1Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "v1\n", "commit 1\n")
+	oid2, p2Bytes, i2Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "v2\n", "commit 2\n")
+	p1 := strings.Repeat("a", 64)
+	p2 := strings.Repeat("b", 64)
+
+	baseMeta.PutMeta(ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	})
+	baseMeta.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: oid1},
+	})
+	baseMeta.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FZ1", PackID: p1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	packStore.Put(p1, p1Bytes, i1Bytes)
+	packStore.Put(p2, p2Bytes, i2Bytes)
+
+	flight1InListRefs := make(chan struct{})
+	releaseFlight1 := make(chan struct{})
+
+	metaStore := &hookMetadataStore{
+		fakeMetadataStore: baseMeta,
+		onListRefs: func(callNum int) {
+			if callNum == 1 {
+				close(flight1InListRefs)
+				<-releaseFlight1
+			}
+		},
+	}
+
+	gitExec := gitexec.NewSubprocessExecutor(gitexec.Config{})
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:        metaStore,
+		Packs:       packStore,
+		Cache:       c,
+		GitExecutor: gitExec,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+
+	// Start Sync 1 (reads v1 refs).
+	type syncOutcome struct {
+		res SyncResult
+		err error
+	}
+	sync1Ch := make(chan syncOutcome, 1)
+	go func() {
+		res, err := mat.SyncAndPin(ctx, rk)
+		sync1Ch <- syncOutcome{res: res, err: err}
+	}()
+
+	<-flight1InListRefs
+
+	// Commit a push to DynamoDB (pack2 + oid2 + new branch) while Sync 1 is in flight.
+	baseMeta.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FZ2", PackID: p2, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	baseMeta.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: oid2},
+		{Repo: rk, RefName: "refs/heads/agent/shared-race", OID: oid2},
+	})
+
+	// Launch two concurrent fetches (Sync 2 & Sync 3) after the push committed.
+	// Neither may join Sync 1's stale flight, and neither may read stale refs outside Materialize.
+	sync2Ch := make(chan syncOutcome, 1)
+	sync3Ch := make(chan syncOutcome, 1)
+	go func() {
+		res, err := mat.SyncAndPin(ctx, rk)
+		sync2Ch <- syncOutcome{res: res, err: err}
+	}()
+	go func() {
+		res, err := mat.SyncAndPin(ctx, rk)
+		sync3Ch <- syncOutcome{res: res, err: err}
+	}()
+
+	// Give Sync 2 & Sync 3 time to enter SyncAndPin and block behind Flight 1.
+	time.Sleep(30 * time.Millisecond)
+
+	// Because LoadAuthoritativeRefs runs inside Materialize, ListRefs must still
+	// have been called only once (by Flight 1) while Flight 1 is in progress.
+	metaStore.hookMu.Lock()
+	callsDuringFlight1 := metaStore.listCalls
+	metaStore.hookMu.Unlock()
+	if callsDuringFlight1 != 1 {
+		close(releaseFlight1)
+		t.Fatalf("ListRefs called %d times while Flight 1 active, want 1 (must run inside Materialize)", callsDuringFlight1)
+	}
+
+	close(releaseFlight1)
+
+	out1 := <-sync1Ch
+	out2 := <-sync2Ch
+	out3 := <-sync3Ch
+	if out1.err != nil {
+		t.Fatalf("sync 1 error: %v", out1.err)
+	}
+	defer out1.res.Handle.Release()
+	if out2.err != nil {
+		t.Fatalf("sync 2 error: %v", out2.err)
+	}
+	defer out2.res.Handle.Release()
+	if out3.err != nil {
+		t.Fatalf("sync 3 error: %v", out3.err)
+	}
+	defer out3.res.Handle.Release()
+
+	// Both post-push callers (including any coalesced follower) must receive valid Meta & updated Refs.
+	for idx, out := range []syncOutcome{out2, out3} {
+		if out.res.Meta.HomeRegion != "us-east-1" || out.res.Meta.FailoverEpoch != 1 {
+			t.Fatalf("sync %d Meta = %+v, want HomeRegion=us-east-1 FailoverEpoch=1", idx+2, out.res.Meta)
+		}
+		gotByName := make(map[string]string, len(out.res.Refs))
+		for _, r := range out.res.Refs {
+			gotByName[r.RefName] = r.OID
+		}
+		if gotByName["refs/heads/main"] != oid2 || gotByName["refs/heads/agent/shared-race"] != oid2 {
+			t.Fatalf("sync %d Refs = %+v, want main=%s and agent/shared-race=%s", idx+2, gotByName, oid2, oid2)
+		}
+	}
+
+	// Reftable on disk must reflect the newer v2 refs (never overwritten by Flight 1's v1 snapshot).
+	diskRefs, err := gitExec.ExecForEachRef(ctx, gitexec.ForEachRefRequest{RepoDir: out2.res.Handle.Path()})
+	if err != nil {
+		t.Fatalf("ExecForEachRef: %v", err)
+	}
+	if diskRefs["refs/heads/main"] != oid2 {
+		t.Fatalf("disk refs/heads/main = %q, want %s", diskRefs["refs/heads/main"], oid2)
+	}
+	if diskRefs["refs/heads/agent/shared-race"] != oid2 {
+		t.Fatalf("disk refs/heads/agent/shared-race = %q, want %s", diskRefs["refs/heads/agent/shared-race"], oid2)
+	}
+}
