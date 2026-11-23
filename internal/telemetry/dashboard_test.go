@@ -25,12 +25,22 @@ type grafanaTarget struct {
 	RefID      string               `json:"refId"`
 }
 
+type grafanaGridPos struct {
+	H int `json:"h"`
+	W int `json:"w"`
+	X int `json:"x"`
+	Y int `json:"y"`
+}
+
 type grafanaPanel struct {
 	ID          int                  `json:"id"`
 	Title       string               `json:"title"`
 	Type        string               `json:"type"`
+	Collapsed   bool                 `json:"collapsed"`
+	GridPos     grafanaGridPos       `json:"gridPos"`
 	Datasource  grafanaDatasourceRef `json:"datasource"`
 	Targets     []grafanaTarget      `json:"targets"`
+	Panels      []grafanaPanel       `json:"panels"`
 	FieldConfig struct {
 		Defaults struct {
 			Links []grafanaDataLink `json:"links"`
@@ -72,6 +82,37 @@ func loadDashboard(t *testing.T, filename string) grafanaDashboard {
 	return dash
 }
 
+func flattenPanels(panels []grafanaPanel) []grafanaPanel {
+	var out []grafanaPanel
+	for _, p := range panels {
+		out = append(out, p)
+		if len(p.Panels) > 0 {
+			out = append(out, flattenPanels(p.Panels)...)
+		}
+	}
+	return out
+}
+
+func gridsOverlap(a, b grafanaGridPos) bool {
+	return a.X < b.X+b.W && b.X < a.X+a.W && a.Y < b.Y+b.H && b.Y < a.Y+a.H
+}
+
+func assertNoGridOverlaps(t *testing.T, panels []grafanaPanel, scope string) {
+	t.Helper()
+	for i := 0; i < len(panels); i++ {
+		gp := panels[i].GridPos
+		if gp.W <= 0 || gp.H <= 0 || gp.X < 0 || gp.Y < 0 || gp.X+gp.W > 24 {
+			t.Errorf("%s panel %q has invalid gridPos %+v", scope, panels[i].Title, gp)
+		}
+		for j := i + 1; j < len(panels); j++ {
+			if gridsOverlap(gp, panels[j].GridPos) {
+				t.Errorf("%s panels %q (%+v) and %q (%+v) overlap",
+					scope, panels[i].Title, gp, panels[j].Title, panels[j].GridPos)
+			}
+		}
+	}
+}
+
 func assertDashboardBasics(t *testing.T, dash grafanaDashboard, wantUID string, requiredMetrics []string, wantLogExpr string) {
 	t.Helper()
 
@@ -88,7 +129,8 @@ func assertDashboardBasics(t *testing.T, dash grafanaDashboard, wantUID string, 
 		t.Fatal("expected at least one panel")
 	}
 
-	seenIDs := make(map[int]bool, len(dash.Panels))
+	allPanels := flattenPanels(dash.Panels)
+	seenIDs := make(map[int]bool, len(allPanels))
 	var allExprs []string
 	var allLinks []string
 	for _, link := range dash.Links {
@@ -98,7 +140,7 @@ func assertDashboardBasics(t *testing.T, dash grafanaDashboard, wantUID string, 
 	hasExemplar := false
 	hasLogsPanel := false
 
-	for _, p := range dash.Panels {
+	for _, p := range allPanels {
 		if p.ID <= 0 {
 			t.Errorf("panel %q has invalid id %d", p.Title, p.ID)
 		}
@@ -109,6 +151,9 @@ func assertDashboardBasics(t *testing.T, dash grafanaDashboard, wantUID string, 
 
 		if strings.TrimSpace(p.Title) == "" || strings.TrimSpace(p.Type) == "" {
 			t.Errorf("panel id=%d must have non-empty title and type", p.ID)
+		}
+		if p.Type == "row" {
+			continue
 		}
 		if p.Datasource.UID != "" && !allowedDatasourceUIDs[p.Datasource.UID] {
 			t.Errorf("panel %q references unknown datasource uid %q", p.Title, p.Datasource.UID)
@@ -153,6 +198,112 @@ func assertDashboardBasics(t *testing.T, dash grafanaDashboard, wantUID string, 
 	}
 }
 
+type dashboardSection struct {
+	row    grafanaPanel
+	panels []grafanaPanel
+}
+
+func extractSections(panels []grafanaPanel) []dashboardSection {
+	var sections []dashboardSection
+	for _, p := range panels {
+		if p.Type == "row" {
+			sec := dashboardSection{row: p}
+			if len(p.Panels) > 0 {
+				sec.panels = append(sec.panels, p.Panels...)
+			}
+			sections = append(sections, sec)
+			continue
+		}
+		if len(sections) > 0 {
+			sections[len(sections)-1].panels = append(sections[len(sections)-1].panels, p)
+		}
+	}
+	return sections
+}
+
+func assertCoreDashboardRowsAndGrid(t *testing.T, dash grafanaDashboard) {
+	t.Helper()
+
+	assertNoGridOverlaps(t, dash.Panels, "stravin-core top-level")
+
+	hasLoadgenLink := false
+	for _, link := range dash.Links {
+		if strings.Contains(link.URL, "stravin-loadgen") {
+			hasLoadgenLink = true
+			break
+		}
+	}
+	if !hasLoadgenLink {
+		t.Error("stravin-core dashboard missing cross-link to stravin-loadgen")
+	}
+
+	sections := extractSections(dash.Panels)
+	wantMetricRows := []string{
+		"Edge Layer",
+		"Node & Cache Layer",
+		"Compaction & GC Layer",
+		"Control Plane & Recovery Layer",
+	}
+	wantAllRows := append(append([]string{}, wantMetricRows...), "Logs & Trace Correlation")
+
+	if len(sections) < len(wantAllRows) {
+		t.Fatalf("stravin-core has %d collapsible row sections, want at least %d", len(sections), len(wantAllRows))
+	}
+
+	foundRows := make(map[string]dashboardSection, len(sections))
+	for _, sec := range sections {
+		if sec.row.GridPos.W != 24 || sec.row.GridPos.X != 0 || sec.row.GridPos.H != 1 {
+			t.Errorf("row %q gridPos = %+v, want w=24 x=0 h=1", sec.row.Title, sec.row.GridPos)
+		}
+		if len(sec.row.Panels) > 0 {
+			assertNoGridOverlaps(t, sec.row.Panels, "row "+sec.row.Title)
+		}
+		for _, wantPrefix := range wantAllRows {
+			if strings.Contains(sec.row.Title, wantPrefix) {
+				foundRows[wantPrefix] = sec
+			}
+		}
+	}
+
+	for _, wantRow := range wantAllRows {
+		if _, ok := foundRows[wantRow]; !ok {
+			t.Errorf("stravin-core missing collapsible row section matching %q", wantRow)
+		}
+	}
+
+	validFourUpX := map[int]bool{0: true, 6: true, 12: true, 18: true}
+	for _, metricRow := range wantMetricRows {
+		sec, ok := foundRows[metricRow]
+		if !ok {
+			continue
+		}
+		if len(sec.panels) == 0 || len(sec.panels)%4 != 0 {
+			t.Errorf("row %q has %d metric panels, want a non-zero multiple of 4", sec.row.Title, len(sec.panels))
+		}
+		byY := make(map[int]map[int]bool)
+		for _, p := range sec.panels {
+			if p.GridPos.W != 6 {
+				t.Errorf("row %q panel %q gridPos.w = %d, want 6 (4 panels per line)", sec.row.Title, p.Title, p.GridPos.W)
+			}
+			if !validFourUpX[p.GridPos.X] {
+				t.Errorf("row %q panel %q gridPos.x = %d, want one of {0, 6, 12, 18}", sec.row.Title, p.Title, p.GridPos.X)
+			}
+			if p.GridPos.H != 8 {
+				t.Errorf("row %q panel %q gridPos.h = %d, want uniform height 8", sec.row.Title, p.Title, p.GridPos.H)
+			}
+			if byY[p.GridPos.Y] == nil {
+				byY[p.GridPos.Y] = make(map[int]bool)
+			}
+			byY[p.GridPos.Y][p.GridPos.X] = true
+		}
+		for y, xs := range byY {
+			if len(xs) != 4 {
+				t.Errorf("row %q line y=%d has %d panels across, want 4 (x in {0, 6, 12, 18})", sec.row.Title, y, len(xs))
+			}
+		}
+	}
+}
+
 func TestGrafanaDashboards_StravinCoreAndLoadTester(t *testing.T) {
 	legacyPath := deployLocalPath("grafana", "provisioning", "dashboards", "stravin-golden-signals.json")
 	if _, err := os.Stat(legacyPath); err == nil {
@@ -161,30 +312,37 @@ func TestGrafanaDashboards_StravinCoreAndLoadTester(t *testing.T) {
 
 	coreDash := loadDashboard(t, "stravin-core.json")
 	assertDashboardBasics(t, coreDash, "stravin-core", []string{
+		// Edge Layer (stravin-edge)
 		"stravin_edge_requests_total",
-		"stravin_edge_request_duration_seconds",
+		"stravin_edge_request_duration_seconds_bucket",
+		// Node & Cache Layer (stravin-node)
 		"stravin_node_requests_total",
-		"stravin_node_request_duration_seconds",
+		"stravin_node_request_duration_seconds_bucket",
 		"stravin_node_cache_hits_total",
 		"stravin_node_cache_misses_total",
 		"stravin_node_cache_bytes_used",
 		"stravin_node_s3_pack_fetches_total",
-		"stravin_ddb_transact_total",
-		"stravin_ddb_cas_retries_total",
-		"stravin_s3_ops_total",
-		"stravin_s3_origin_fallback_total",
-		"stravin_hook_wasm_duration_seconds",
-		"stravin_hook_wasm_verdicts_total",
-		"stravin_pack_uncompacted_packs",
-		"stravin_pack_compaction_lag_seconds",
+		// Compaction & GC Layer (stravin-pack)
 		"stravin_pack_compaction_cycles_total",
+		"stravin_pack_compaction_duration_seconds_bucket",
+		"stravin_pack_uncompacted_packs",
+		"stravin_pack_bytes_reclaimed_total",
 		"stravin_pack_gc_reaped_total",
+		"stravin_pack_lease_contention_total",
+		"stravin_pack_gc_crr_blocked_total",
+		"stravin_pack_gc_crr_breaker_open",
+		// Control Plane & Recovery Layer (stravin-ctrl)
 		"stravin_ctrl_lease_renewals_total",
+		"stravin_ctrl_epoch_transitions_total",
+		"stravin_ctrl_promotion_guard_total",
 		"stravin_ctrl_scrub_runs_total",
+		"stravin_ctrl_scrub_head_checks_total",
+		"stravin_ctrl_scrub_rewound_refs_total",
+		"stravin_ctrl_scrub_duration_seconds_bucket",
 		"stravin_ctrl_recovery_runs_total",
-		"otelcol_exporter_enqueue_failed_spans",
-		"stravin_otel_dropped_items_total",
+		"stravin_ctrl_recovery_refs_published_total",
 	}, `{service_name=~"stravin-.*"}`)
+	assertCoreDashboardRowsAndGrid(t, coreDash)
 
 	loadgenDash := loadDashboard(t, "stravin-loadgen.json")
 	assertDashboardBasics(t, loadgenDash, "stravin-loadgen", []string{
