@@ -1,3 +1,11 @@
+# [1.5.0](https://github.com/stravin-dev/core/compare/v1.4.0...v1.5.0) (2026-11-23)
+
+
+### Features
+
+* **edge,node:** support Git Wire Protocol v2 and end-to-end SHA-256 transport ([8483dbf](https://github.com/stravin-dev/core/commit/8483dbfb3963b43621a1cb2b14345c06a8888d19))
+* **edge,node:** support Git Wire Protocol v2 and end-to-end SHA-256 transport ([#123](https://github.com/stravin-dev/core/issues/123)) ([b033a29](https://github.com/stravin-dev/core/commit/b033a29e117d03f3a61e992ac93970edab7c52a5))
+
 # [1.4.0](https://github.com/stravin-dev/core/compare/v1.3.0...v1.4.0) (2026-11-23)
 
 
