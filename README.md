@@ -104,6 +104,8 @@ make chaos-down
 make chaos-e2e
 ```
 
+Both `docker-compose.yml` and `docker-compose.chaos.yml` raise `stravin-edge` local rate limits by default (`STRAVIN_RATE_LIMIT_RPS=2000`, `STRAVIN_MAX_CONCURRENT_CLONES=256`, vs. production defaults `100` / `32`) so stress tests exercise backend daemons. Override either variable before starting Compose (e.g., `STRAVIN_RATE_LIMIT_RPS=100 STRAVIN_MAX_CONCURRENT_CLONES=32 make chaos-up`).
+
 ### `stravin-loadgen` CLI & 22 Dev/Agent Scenarios
 
 `stravin-loadgen` simulates parallel developer (`--devs`) and AI agent (`--agents`) Git workers using deterministic seeded entropy (`--seed`), client-side `git fsck --full --strict` and SHA verification, and guaranteed OpenTelemetry flush on `SIGINT` / Ctrl+C (`--flush-timeout`, default `10s`):
