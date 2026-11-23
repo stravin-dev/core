@@ -1,10 +1,12 @@
 package edge
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -25,18 +27,32 @@ const (
 
 	headerAdvertiseRefs = "x-stravin-advertise-refs"
 	headerStatelessRPC  = "x-stravin-stateless-rpc"
+
+	// DefaultMaxDecompressedBodyBytes bounds decompressed Smart HTTP POST bodies (256 MiB)
+	// to mitigate gzip-bomb resource exhaustion.
+	DefaultMaxDecompressedBodyBytes int64 = 256 << 20
+)
+
+var (
+	// ErrInvalidGzipBody is returned when a Content-Encoding: gzip request body is corrupt or truncated.
+	ErrInvalidGzipBody = errors.New("edge: invalid gzip request body")
+	// ErrDecompressedBodyTooLarge is returned when a decompressed request body exceeds the configured byte limit.
+	ErrDecompressedBodyTooLarge = errors.New("edge: decompressed request body too large")
+
+	errUnsupportedContentEncoding = errors.New("edge: unsupported content-encoding")
 )
 
 // HTTPHandler serves Git Smart HTTP endpoints alongside Kubernetes health probes.
 type HTTPHandler struct {
-	auth     Authenticator
-	limiter  Limiter
-	resolver *Resolver
-	router   NodeSelector
-	proxy    *WireProxy
-	metrics  *Metrics
-	logger   *slog.Logger
-	probes   *health.Registry
+	auth                     Authenticator
+	limiter                  Limiter
+	resolver                 *Resolver
+	router                   NodeSelector
+	proxy                    *WireProxy
+	metrics                  *Metrics
+	logger                   *slog.Logger
+	probes                   *health.Registry
+	maxDecompressedBodyBytes int64
 }
 
 // NewHTTPHandler constructs a Smart HTTP handler with all required collaborators.
@@ -75,14 +91,15 @@ func NewHTTPHandler(
 	probes.MarkStarted()
 	probes.MarkReady()
 	return &HTTPHandler{
-		auth:     auth,
-		limiter:  limiter,
-		resolver: resolver,
-		router:   router,
-		proxy:    proxy,
-		metrics:  metrics,
-		logger:   logger,
-		probes:   probes,
+		auth:                     auth,
+		limiter:                  limiter,
+		resolver:                 resolver,
+		router:                   router,
+		proxy:                    proxy,
+		metrics:                  metrics,
+		logger:                   logger,
+		probes:                   probes,
+		maxDecompressedBodyBytes: DefaultMaxDecompressedBodyBytes,
 	}, nil
 }
 
@@ -90,6 +107,14 @@ func NewHTTPHandler(
 func (h *HTTPHandler) SetProbes(probes *health.Registry) {
 	if probes != nil {
 		h.probes = probes
+	}
+}
+
+// SetMaxDecompressedBodyBytes overrides the maximum allowed decompressed size for
+// gzip-encoded Smart HTTP POST request bodies. Non-positive values are ignored.
+func (h *HTTPHandler) SetMaxDecompressedBodyBytes(limit int64) {
+	if limit > 0 {
+		h.maxDecompressedBodyBytes = limit
 	}
 }
 
@@ -189,13 +214,19 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		prefix:      route.responsePrefix,
 	}
 
-	var stdin = NewByteLimitingReader(ctx, r.Body, h.limiter, route.repo.TenantID)
+	var stdin io.Reader
 	proxyCtx := ctx
 	switch route.kind {
 	case routeInfoRefs:
-		stdin = nil
 		proxyCtx = metadata.AppendToOutgoingContext(ctx, headerAdvertiseRefs, "true")
 	case routeUploadPack, routeReceivePack:
+		body, closeBody, bodyErr := openRequestBody(r.Header.Values("Content-Encoding"), r.Body, h.maxDecompressedBodyBytes)
+		if bodyErr != nil {
+			h.handleBodyError(w, ctx, route.metricOp, bodyErr, start)
+			return
+		}
+		defer closeBody()
+		stdin = NewByteLimitingReader(ctx, body, h.limiter, route.repo.TenantID)
 		proxyCtx = metadata.AppendToOutgoingContext(ctx, headerStatelessRPC, "true")
 	}
 
@@ -244,18 +275,120 @@ func (h *HTTPHandler) handleResolveError(w http.ResponseWriter, ctx context.Cont
 	}
 }
 
+func (h *HTTPHandler) handleBodyError(w http.ResponseWriter, ctx context.Context, metricOp string, err error, start time.Time) {
+	if errors.Is(err, errUnsupportedContentEncoding) {
+		h.metrics.RecordRequest(ctx, "http", metricOp, strconv.Itoa(http.StatusUnsupportedMediaType), "invalid_request", time.Since(start))
+		http.Error(w, "unsupported content-encoding", http.StatusUnsupportedMediaType)
+		return
+	}
+	h.metrics.RecordRequest(ctx, "http", metricOp, strconv.Itoa(http.StatusBadRequest), "invalid_request", time.Since(start))
+	http.Error(w, "invalid gzip request body", http.StatusBadRequest)
+}
+
 func (h *HTTPHandler) handleProxyError(w http.ResponseWriter, ctx context.Context, sw *smartHTTPStreamWriter, metricOp string, err error, start time.Time) {
-	if errors.Is(err, ErrRateLimited) {
+	switch {
+	case errors.Is(err, ErrRateLimited):
 		h.metrics.RecordRequest(ctx, "http", metricOp, strconv.Itoa(http.StatusTooManyRequests), "rate_limited", time.Since(start))
 		if !sw.wroteHeader {
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		}
-		return
+	case errors.Is(err, ErrDecompressedBodyTooLarge):
+		h.metrics.RecordRequest(ctx, "http", metricOp, strconv.Itoa(http.StatusRequestEntityTooLarge), "payload_too_large", time.Since(start))
+		if !sw.wroteHeader {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		}
+	case errors.Is(err, ErrInvalidGzipBody):
+		h.metrics.RecordRequest(ctx, "http", metricOp, strconv.Itoa(http.StatusBadRequest), "invalid_request", time.Since(start))
+		if !sw.wroteHeader {
+			http.Error(w, "invalid gzip request body", http.StatusBadRequest)
+		}
+	default:
+		h.metrics.RecordRequest(ctx, "http", metricOp, strconv.Itoa(http.StatusBadGateway), "upstream", time.Since(start))
+		if !sw.wroteHeader {
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		}
 	}
-	h.metrics.RecordRequest(ctx, "http", metricOp, strconv.Itoa(http.StatusBadGateway), "upstream", time.Since(start))
-	if !sw.wroteHeader {
-		http.Error(w, "bad gateway", http.StatusBadGateway)
+}
+
+func parseContentEncoding(headers []string) (string, bool) {
+	var encodings []string
+	for _, h := range headers {
+		for _, part := range strings.Split(h, ",") {
+			if v := strings.ToLower(strings.TrimSpace(part)); v != "" {
+				encodings = append(encodings, v)
+			}
+		}
 	}
+	if len(encodings) == 0 {
+		return "", true
+	}
+	if len(encodings) > 1 {
+		return "", false
+	}
+	return encodings[0], true
+}
+
+func openRequestBody(headers []string, raw io.Reader, maxDecompressed int64) (io.Reader, func(), error) {
+	enc, ok := parseContentEncoding(headers)
+	if !ok {
+		return nil, nil, errUnsupportedContentEncoding
+	}
+	switch enc {
+	case "", "identity":
+		return raw, func() {}, nil
+	case "gzip", "x-gzip":
+		gz, err := gzip.NewReader(raw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: %w", ErrInvalidGzipBody, err)
+		}
+		if maxDecompressed <= 0 {
+			maxDecompressed = DefaultMaxDecompressedBodyBytes
+		}
+		return &boundedGzipReader{r: gz, remaining: maxDecompressed}, func() { _ = gz.Close() }, nil
+	default:
+		return nil, nil, errUnsupportedContentEncoding
+	}
+}
+
+type boundedGzipReader struct {
+	r         *gzip.Reader
+	remaining int64
+}
+
+func (b *boundedGzipReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if b.remaining <= 0 {
+		var probe [1]byte
+		n, err := b.r.Read(probe[:])
+		if n > 0 {
+			return 0, ErrDecompressedBodyTooLarge
+		}
+		if err == nil {
+			return 0, nil
+		}
+		if errors.Is(err, io.EOF) {
+			return 0, io.EOF
+		}
+		return 0, wrapGzipReadError(err)
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.r.Read(p)
+	b.remaining -= int64(n)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return n, wrapGzipReadError(err)
+	}
+	return n, err
+}
+
+func wrapGzipReadError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrInvalidGzipBody, err)
 }
 
 type routeKind int

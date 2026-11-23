@@ -2,6 +2,7 @@ package edge
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"io"
@@ -498,4 +499,248 @@ func TestHTTPHandler_SetsSmartHTTPGRPCMetadataHeaders(t *testing.T) {
 	if len(advVals) != 0 {
 		t.Fatalf("receive-pack %s = %v, want empty", headerAdvertiseRefs, advVals)
 	}
+}
+
+func gzipCompress(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(raw); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestHTTPHandler_GzipRequestBodyDecompression(t *testing.T) {
+	env := newTestEdgeEnv(t, LimiterConfig{})
+	defer env.close()
+
+	cases := []struct {
+		name     string
+		path     string
+		encoding string
+		payload  string
+		wantCT   string
+		wantOp   rpc.Operation
+		compress bool
+	}{
+		{
+			name:     "gzip git-upload-pack",
+			path:     "/acme/core.git/git-upload-pack",
+			encoding: "gzip",
+			payload:  "0032want 0123456789abcdef0123456789abcdef01234567\n00000009done\n",
+			wantCT:   "application/x-git-upload-pack-result",
+			wantOp:   rpc.OpUploadPack,
+			compress: true,
+		},
+		{
+			name:     "gzip case and whitespace git-upload-pack",
+			path:     "/acme/core.git/git-upload-pack",
+			encoding: "  GZip  ",
+			payload:  "want-mixed-case-payload",
+			wantCT:   "application/x-git-upload-pack-result",
+			wantOp:   rpc.OpUploadPack,
+			compress: true,
+		},
+		{
+			name:     "x-gzip git-receive-pack",
+			path:     "/acme/core.git/git-receive-pack",
+			encoding: "x-gzip",
+			payload:  "PACK-decompressed-receive-pack-payload",
+			wantCT:   "application/x-git-receive-pack-result",
+			wantOp:   rpc.OpReceivePack,
+			compress: true,
+		},
+		{
+			name:     "gzip git-receive-pack",
+			path:     "/acme/core.git/git-receive-pack",
+			encoding: "gzip",
+			payload:  "0000PACK-data-from-gzip",
+			wantCT:   "application/x-git-receive-pack-result",
+			wantOp:   rpc.OpReceivePack,
+			compress: true,
+		},
+		{
+			name:     "identity encoding passthrough",
+			path:     "/acme/core.git/git-upload-pack",
+			encoding: "identity",
+			payload:  "plain-identity-payload",
+			wantCT:   "application/x-git-upload-pack-result",
+			wantOp:   rpc.OpUploadPack,
+			compress: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bodyBytes := []byte(tc.payload)
+			if tc.compress {
+				bodyBytes = gzipCompress(t, bodyBytes)
+			}
+			req := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader(bodyBytes))
+			req.Header.Set("Authorization", "Bearer tok-acme")
+			if tc.encoding != "" {
+				req.Header.Set("Content-Encoding", tc.encoding)
+			}
+			rec := httptest.NewRecorder()
+			env.handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body = %q", rec.Code, rec.Body.String())
+			}
+			if ct := rec.Header().Get("Content-Type"); ct != tc.wantCT {
+				t.Fatalf("Content-Type = %q, want %q", ct, tc.wantCT)
+			}
+			meta, gotPayload := env.node.snapshot()
+			if meta.Operation != tc.wantOp {
+				t.Fatalf("operation = %q, want %q", meta.Operation, tc.wantOp)
+			}
+			if string(gotPayload) != tc.payload {
+				t.Fatalf("upstream payload = %q, want %q", string(gotPayload), tc.payload)
+			}
+		})
+	}
+}
+
+func TestHTTPHandler_GzipCorruptAndUnsupportedEncodings(t *testing.T) {
+	env := newTestEdgeEnv(t, LimiterConfig{})
+	defer env.close()
+
+	// 1. Corrupt gzip header -> 400 Bad Request
+	t.Run("corrupt gzip header", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/acme/core.git/git-upload-pack", strings.NewReader("not-a-gzip-stream"))
+		req.Header.Set("Authorization", "Bearer tok-acme")
+		req.Header.Set("Content-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body = %q", rec.Code, rec.Body.String())
+		}
+	})
+
+	// 2. Truncated mid-stream gzip payload -> 400 Bad Request without panic or deadlock
+	t.Run("mid-stream truncated gzip", func(t *testing.T) {
+		validGzip := gzipCompress(t, bytes.Repeat([]byte("git-pack-object-data-"), 4096))
+		// Keep valid gzip header + partial deflate blocks, truncate the rest + CRC trailer.
+		truncated := validGzip[:len(validGzip)/2]
+
+		done := make(chan int, 1)
+		go func() {
+			req := httptest.NewRequest(http.MethodPost, "/acme/core.git/git-receive-pack", bytes.NewReader(truncated))
+			req.Header.Set("Authorization", "Bearer tok-acme")
+			req.Header.Set("Content-Encoding", "gzip")
+			rec := httptest.NewRecorder()
+			env.handler.ServeHTTP(rec, req)
+			done <- rec.Code
+		}()
+
+		select {
+		case code := <-done:
+			if code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", code)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("ServeHTTP deadlocked on mid-stream truncated gzip body")
+		}
+	})
+
+	// 3. Unsupported Content-Encoding values -> 415 Unsupported Media Type
+	for _, enc := range []string{"br", "deflate", "zstd", "gzip, deflate"} {
+		t.Run("unsupported_"+enc, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/acme/core.git/git-upload-pack", strings.NewReader("payload"))
+			req.Header.Set("Authorization", "Bearer tok-acme")
+			req.Header.Set("Content-Encoding", enc)
+			rec := httptest.NewRecorder()
+			env.handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnsupportedMediaType {
+				t.Fatalf("Content-Encoding %q: status = %d, want 415; body = %q", enc, rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	// 4. Multiple Content-Encoding header lines -> 415 Unsupported Media Type
+	t.Run("multiple Content-Encoding headers", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/acme/core.git/git-upload-pack", strings.NewReader("payload"))
+		req.Header.Set("Authorization", "Bearer tok-acme")
+		req.Header.Add("Content-Encoding", "gzip")
+		req.Header.Add("Content-Encoding", "br")
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnsupportedMediaType {
+			t.Fatalf("multiple headers: status = %d, want 415; body = %q", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+func TestHTTPHandler_GzipBombAndDecompressedByteLimit(t *testing.T) {
+	// 1. Bounded decompressed max size stops gzip bomb even when PackBytesPerMin is disabled.
+	t.Run("max decompressed body size enforced", func(t *testing.T) {
+		env := newTestEdgeEnv(t, LimiterConfig{})
+		defer env.close()
+		env.handler.SetMaxDecompressedBodyBytes(1024)
+
+		// Compress 128 KiB of zeroes into a tiny gzip payload (~200 bytes).
+		bomb := gzipCompress(t, bytes.Repeat([]byte{0}, 128*1024))
+		if len(bomb) >= 1024 {
+			t.Fatalf("expected compressed bomb < 1024 bytes, got %d", len(bomb))
+		}
+
+		done := make(chan int, 1)
+		go func() {
+			req := httptest.NewRequest(http.MethodPost, "/acme/core.git/git-receive-pack", bytes.NewReader(bomb))
+			req.Header.Set("Authorization", "Bearer tok-acme")
+			req.Header.Set("Content-Encoding", "gzip")
+			rec := httptest.NewRecorder()
+			env.handler.ServeHTTP(rec, req)
+			done <- rec.Code
+		}()
+
+		select {
+		case code := <-done:
+			if code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status = %d, want 413 Request Entity Too Large", code)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("ServeHTTP deadlocked on gzip bomb exceeding MaxDecompressedBodyBytes")
+		}
+	})
+
+	// 2. ByteLimitingReader enforces tenant PackBytesPerMin on decompressed bytes, not compressed wire bytes.
+	t.Run("tenant bandwidth limit enforced on decompressed stream", func(t *testing.T) {
+		// Compressed payload is ~60 bytes (< 1024), but decompressed payload is 4096 bytes (> 1024).
+		env := newTestEdgeEnv(t, LimiterConfig{
+			PackBytesPerMin: 1024,
+		})
+		defer env.close()
+
+		compressed := gzipCompress(t, bytes.Repeat([]byte("A"), 4096))
+		if len(compressed) >= 1024 {
+			t.Fatalf("expected compressed payload < 1024 bytes, got %d", len(compressed))
+		}
+
+		done := make(chan int, 1)
+		go func() {
+			req := httptest.NewRequest(http.MethodPost, "/acme/core.git/git-receive-pack", bytes.NewReader(compressed))
+			req.Header.Set("Authorization", "Bearer tok-acme")
+			req.Header.Set("Content-Encoding", "gzip")
+			rec := httptest.NewRecorder()
+			env.handler.ServeHTTP(rec, req)
+			done <- rec.Code
+		}()
+
+		select {
+		case code := <-done:
+			if code != http.StatusTooManyRequests {
+				t.Fatalf("status = %d, want 429 Too Many Requests", code)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("ServeHTTP deadlocked when decompressed stream exceeded PackBytesPerMin")
+		}
+	})
 }
