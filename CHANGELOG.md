@@ -1,3 +1,13 @@
+# [1.3.0](https://github.com/stravin-dev/core/compare/v1.2.1...v1.3.0) (2026-11-23)
+
+
+### Features
+
+* **gitexec:** enforce Git 3.0 explicit --git-dir guardrails and compatibility tests ([fe64013](https://github.com/stravin-dev/core/commit/fe6401374574984d35d15defbadb95df777b198d))
+* **gitexec:** enforce Git 3.0 explicit --git-dir guardrails and compatibility tests ([#120](https://github.com/stravin-dev/core/issues/120)) ([6d13b2e](https://github.com/stravin-dev/core/commit/6d13b2e080aac746dc6ca6c4f7c4bdcf26035014))
+* **observability:** add dev/agent granularity, scenario pie charts, and collapsible rows to loadgen dashboard ([362c82b](https://github.com/stravin-dev/core/commit/362c82b36a9bfea2bf578c87a4cedd5013c0c785))
+* **observability:** add dev/agent granularity, scenario pie charts, and collapsible rows to loadgen dashboard ([#121](https://github.com/stravin-dev/core/issues/121)) ([47864cf](https://github.com/stravin-dev/core/commit/47864cfbc2c9cd290b7ccb398027fa735aac00fc))
+
 ## [1.2.1](https://github.com/stravin-dev/core/compare/v1.2.0...v1.2.1) (2026-11-23)
 
 
