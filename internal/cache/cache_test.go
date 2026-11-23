@@ -384,15 +384,30 @@ func TestReaderLeasePinPreventsEvictionAndDefersPackPruning(t *testing.T) {
 	if err := c.PrunePacks(repo1, []string{"p1"}); err != nil {
 		t.Fatalf("PrunePacks while pinned: %v", err)
 	}
-	packPath := filepath.Join(root, "t", "tenant-a", "repo-1", "objects", "pack", "pack-p1.pack")
+	packDir := filepath.Join(root, "t", "tenant-a", "repo-1", "objects", "pack")
+	packPath := filepath.Join(packDir, "pack-p1.pack")
+	midxPath := filepath.Join(packDir, "multi-pack-index")
+	bitmapPath := filepath.Join(packDir, "multi-pack-index-deadbeef.bitmap")
+	if err := os.WriteFile(midxPath, []byte("MIDX"), 0o600); err != nil {
+		t.Fatalf("write midx: %v", err)
+	}
+	if err := os.WriteFile(bitmapPath, []byte("BITM"), 0o600); err != nil {
+		t.Fatalf("write bitmap: %v", err)
+	}
 	if _, err := os.Stat(packPath); err != nil {
 		t.Fatalf("pinned pack unlinked before lease release: %v", err)
 	}
 
-	// Release lease -> deferred pack prune executes immediately; explicit Evict can now reclaim repo1.
+	// Release lease -> deferred pack prune executes immediately and invalidates stale MIDX/bitmap.
 	lease.Release()
 	if _, err := os.Stat(packPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("deferred pack prune did not unlink pack after Release: err=%v", err)
+	}
+	if _, err := os.Stat(midxPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deferred pack prune did not invalidate stale multi-pack-index: err=%v", err)
+	}
+	if _, err := os.Stat(bitmapPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deferred pack prune did not invalidate stale midx bitmap: err=%v", err)
 	}
 
 	// Reinstall p1 while repo2 is pinned so both remain > quota, then unpin both and call Evict().

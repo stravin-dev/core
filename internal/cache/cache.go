@@ -521,6 +521,7 @@ func (c *Cache) evictLocked(exclude tenant.RepoKey) []tenant.RepoKey {
 
 func (c *Cache) unlinkPacksLocked(entry *repoEntry, packIDs []string) {
 	packDir := filepath.Join(entry.path, "objects", "pack")
+	removedAny := false
 	for _, id := range packIDs {
 		sz, exists := entry.packs[id]
 		if !exists {
@@ -536,9 +537,29 @@ func (c *Cache) unlinkPacksLocked(entry *repoEntry, packIDs []string) {
 		entry.sizeBytes -= sz
 		c.tenantBytes[entry.key.TenantID] -= sz
 		c.totalBytes -= sz
+		removedAny = true
+	}
+	if removedAny {
+		invalidatePackAuxIndexes(packDir)
 	}
 	if c.tenantBytes[entry.key.TenantID] <= 0 {
 		delete(c.tenantBytes, entry.key.TenantID)
+	}
+}
+
+// invalidatePackAuxIndexes removes multi-pack-index and associated bitmap/rev
+// files whenever any pack is unlinked so git upload-pack never reads a stale
+// MIDX referencing deleted packfiles.
+func invalidatePackAuxIndexes(packDir string) {
+	_ = os.Remove(filepath.Join(packDir, "multi-pack-index"))
+	for _, pattern := range []string{"multi-pack-index*.bitmap", "multi-pack-index*.rev"} {
+		matches, err := filepath.Glob(filepath.Join(packDir, pattern))
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
 	}
 }
 
