@@ -25,6 +25,7 @@ import (
 const (
 	defaultMaxConcurrentPackFetches = 8
 	defaultPruneReconcileInterval   = 30 * time.Second
+	defaultAuxIndexRefreshTimeout   = 30 * time.Second
 )
 
 // MetadataStore is the narrow DynamoDB read seam used by Materializer.
@@ -610,8 +611,10 @@ func (m *Materializer) materializeReftableRefs(ctx context.Context, repo tenant.
 
 // refreshAuxIndexes maintains multi-pack-index (+ reachability .bitmap) and
 // commit-graph on the warm NVMe bare repository when packs or refs change.
-// Failures on empty/zero-commit repositories are logged and skipped gracefully
-// because auxiliary indexes are pure read-path accelerators.
+// It runs inside the repo's serialized cache.Materialize flight with a detached
+// bounded timeout so client disconnects cannot abort writes mid-flight, removes
+// any stale lockfiles before and on failure, and surfaces unexpected failures
+// at Warn level + OTel counter while keeping zero-commit skips quiet.
 func (m *Materializer) refreshAuxIndexes(ctx context.Context, repo tenant.RepoKey, repoPath string, changed, hasRefs bool) {
 	packs, err := filepath.Glob(filepath.Join(repoPath, "objects", "pack", "*.pack"))
 	if err != nil || len(packs) == 0 {
@@ -624,37 +627,66 @@ func (m *Materializer) refreshAuxIndexes(ctx context.Context, repo tenant.RepoKe
 		return
 	}
 
-	if err := m.gitExec.ExecRepack(ctx, gitexec.RepackRequest{
+	// Detach from caller cancellation so a disconnected client does not abort
+	// MIDX/commit-graph writes mid-flight and strand .lock files.
+	auxCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultAuxIndexRefreshTimeout)
+	defer cancel()
+
+	midxLockPath := filepath.Join(repoPath, "objects", "pack", "multi-pack-index.lock")
+	cgLockPath := filepath.Join(repoPath, "objects", "info", "commit-graph.lock")
+
+	m.removeStaleAuxLock(auxCtx, midxLockPath)
+	if err := m.gitExec.ExecRepack(auxCtx, gitexec.RepackRequest{
 		Repo:        repo,
 		RepoDir:     repoPath,
 		WriteMIDX:   true,
 		WriteBitmap: hasRefs,
 	}); err != nil {
+		m.removeStaleAuxLock(auxCtx, midxLockPath)
 		if hasRefs {
 			// Gracefully fall back to MIDX without bitmap for zero-commit repos (e.g. blob/tag-only).
-			if fallbackErr := m.gitExec.ExecRepack(ctx, gitexec.RepackRequest{
+			if fallbackErr := m.gitExec.ExecRepack(auxCtx, gitexec.RepackRequest{
 				Repo:      repo,
 				RepoDir:   repoPath,
 				WriteMIDX: true,
 			}); fallbackErr != nil {
-				m.logger.DebugContext(ctx, "node: skipped multi-pack-index refresh",
+				m.removeStaleAuxLock(auxCtx, midxLockPath)
+				m.logger.WarnContext(auxCtx, "node: failed to refresh multi-pack-index",
 					"repo", repo.String(), "error", fallbackErr)
+				if m.metrics != nil {
+					m.metrics.RecordAuxIndexRefreshFailure(auxCtx, "midx")
+				}
 			}
 		} else {
-			m.logger.DebugContext(ctx, "node: skipped multi-pack-index refresh",
+			m.logger.WarnContext(auxCtx, "node: failed to refresh multi-pack-index",
 				"repo", repo.String(), "error", err)
+			if m.metrics != nil {
+				m.metrics.RecordAuxIndexRefreshFailure(auxCtx, "midx")
+			}
 		}
 	}
 
 	if hasRefs {
-		if err := m.gitExec.ExecRepack(ctx, gitexec.RepackRequest{
+		m.removeStaleAuxLock(auxCtx, cgLockPath)
+		if err := m.gitExec.ExecRepack(auxCtx, gitexec.RepackRequest{
 			Repo:             repo,
 			RepoDir:          repoPath,
 			WriteCommitGraph: true,
 		}); err != nil {
-			m.logger.DebugContext(ctx, "node: skipped commit-graph refresh",
+			m.removeStaleAuxLock(auxCtx, cgLockPath)
+			m.logger.WarnContext(auxCtx, "node: failed to refresh commit-graph",
 				"repo", repo.String(), "error", err)
+			if m.metrics != nil {
+				m.metrics.RecordAuxIndexRefreshFailure(auxCtx, "commit_graph")
+			}
 		}
+	}
+}
+
+func (m *Materializer) removeStaleAuxLock(ctx context.Context, path string) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		m.logger.WarnContext(ctx, "node: failed to remove stale aux index lock",
+			"path", path, "error", err)
 	}
 }
 

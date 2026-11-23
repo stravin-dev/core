@@ -2,7 +2,10 @@ package node
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -55,5 +58,26 @@ func TestRequestDurationHistogram_UsesSecondScaleBuckets(t *testing.T) {
 	}
 	if dp.BucketCounts[3] != 1 {
 		t.Errorf("bucket (0.01, 0.025] count = %d, want 1 (counts: %v)", dp.BucketCounts[3], dp.BucketCounts)
+	}
+}
+
+func TestRecordAuxIndexRefreshFailure_ExposesOTelAndPrometheusMetrics(t *testing.T) {
+	ctx := context.Background()
+	prov, err := telemetry.NewInMemoryProvider("stravin-node")
+	if err != nil {
+		t.Fatalf("NewInMemoryProvider: %v", err)
+	}
+	defer func() { _ = prov.Shutdown(ctx) }()
+
+	m := NewMetrics(prov, "us-east-1")
+	m.RecordAuxIndexRefreshFailure(ctx, "midx")
+	m.RecordAuxIndexRefreshFailure(ctx, "commit_graph")
+
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	wantProm := `stravin_node_aux_index_refresh_failures_total{region="us-east-1"} 2`
+	if !strings.Contains(body, wantProm) {
+		t.Fatalf("expected Prometheus body to contain %q, got:\n%s", wantProm, body)
 	}
 }
