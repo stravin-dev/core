@@ -149,6 +149,9 @@ func TestCIAndReleaseWorkflows(t *testing.T) {
 		"goarch: arm64",
 		"target: darwin-arm64",
 		"stravin.dev/core/internal/version.Version=",
+		"command -v zstd",
+		".tar.zst",
+		"zstd -T0 -19 --long=27",
 		"gh release upload",
 		"stravin-edge",
 		"stravin-node",
@@ -162,5 +165,8 @@ func TestCIAndReleaseWorkflows(t *testing.T) {
 		if !strings.Contains(releaseText, want) {
 			t.Errorf("release-artifacts.yml missing expected snippet %q", want)
 		}
+	}
+	if strings.Contains(releaseText, ".tar.gz") {
+		t.Errorf("release-artifacts.yml should not reference legacy .tar.gz archives")
 	}
 }
