@@ -326,6 +326,28 @@ func assertCoreDashboardRowsAndGrid(t *testing.T, dash grafanaDashboard) {
 			}
 		}
 	}
+
+	if nodeSec, ok := foundRows["Node & Cache Layer"]; ok {
+		var nodeExprs []string
+		for _, p := range nodeSec.panels {
+			for _, tgt := range p.Targets {
+				nodeExprs = append(nodeExprs, tgt.Expr)
+			}
+		}
+		joined := strings.Join(nodeExprs, "\n")
+		for _, tok := range []string{
+			"stravin_node_aux_index_refresh_failures_total",
+			"stravin_cache_active_packs",
+			"stravin_cache_pending_prune_packs",
+			"stravin_cache_repo_active_packs_max",
+			"stravin_cache_repo_pending_prune_packs_max",
+			"stravin_cache_packs_pruned_total",
+		} {
+			if !strings.Contains(joined, tok) {
+				t.Errorf("Node & Cache Layer row missing expected metric %q", tok)
+			}
+		}
+	}
 }
 
 var counterSelectorRe = regexp.MustCompile(`stravin_[a-z0-9_]+_total(?:\{[^}]*\})?`)
@@ -433,8 +455,10 @@ func assertCoreOverviewSection(t *testing.T, sec dashboardSection) {
 		"rate_limited",
 		"stravin_node_requests_total",
 		"stravin_node_s3_pack_fetches_total",
+		"stravin_node_aux_index_refresh_failures_total",
 		"stravin_node_cache_hits_total",
 		"stravin_node_cache_misses_total",
+		"stravin_cache_pending_prune_packs",
 		"stravin_pack_compaction_cycles_total",
 		"stravin_pack_uncompacted_packs",
 		"stravin_ctrl_lease_renewals_total",
@@ -465,6 +489,12 @@ func TestGrafanaDashboards_StravinCoreAndLoadTester(t *testing.T) {
 		"stravin_node_cache_misses_total",
 		"stravin_node_cache_bytes_used",
 		"stravin_node_s3_pack_fetches_total",
+		"stravin_node_aux_index_refresh_failures_total",
+		"stravin_cache_active_packs",
+		"stravin_cache_pending_prune_packs",
+		"stravin_cache_repo_active_packs_max",
+		"stravin_cache_repo_pending_prune_packs_max",
+		"stravin_cache_packs_pruned_total",
 		// Compaction & GC Layer (stravin-pack)
 		"stravin_pack_compaction_cycles_total",
 		"stravin_pack_compaction_duration_seconds_bucket",
