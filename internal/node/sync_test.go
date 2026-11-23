@@ -516,9 +516,9 @@ func TestMaterializer_PrunesSupersededPacksOnPeriodicReconcile(t *testing.T) {
 	packStore.Put(pack2, []byte("PACK-2"), []byte("IDX-2"))
 
 	mat, err := NewMaterializer(MaterializerConfig{
-		Meta:                  metaStore,
-		Packs:                 packStore,
-		Cache:                 c,
+		Meta:                   metaStore,
+		Packs:                  packStore,
+		Cache:                  c,
 		PruneReconcileInterval: time.Nanosecond,
 	})
 	if err != nil {
