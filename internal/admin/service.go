@@ -68,6 +68,7 @@ type RegisterRepoInput struct {
 	RefShards      int
 	ManifestShards int
 	DefaultBranch  string
+	ObjectFormat   ddb.ObjectFormat
 	Idempotent     bool
 }
 
@@ -80,6 +81,7 @@ type RegisterRepoResult struct {
 	RefShards      int    `json:"ref_shards"`
 	ManifestShards int    `json:"manifest_shards"`
 	DefaultBranch  string `json:"default_branch"`
+	ObjectFormat   string `json:"object_format"`
 	Created        bool   `json:"created"`
 }
 
@@ -109,6 +111,10 @@ func (s *Service) RegisterRepo(ctx context.Context, in RegisterRepoInput) (Regis
 	if defaultBranch == "" {
 		defaultBranch = "refs/heads/main"
 	}
+	if err := ddb.ValidateObjectFormat(in.ObjectFormat); err != nil {
+		return RegisterRepoResult{}, err
+	}
+	objectFormat := ddb.NormalizeObjectFormat(in.ObjectFormat)
 
 	meta := ddb.RepoMeta{
 		Repo:           rk,
@@ -118,6 +124,7 @@ func (s *Service) RegisterRepo(ctx context.Context, in RegisterRepoInput) (Regis
 		ManifestShards: manifestShards,
 		WriteState:     lease.ModeActive,
 		DefaultBranch:  defaultBranch,
+		ObjectFormat:   objectFormat,
 	}
 
 	created := true
@@ -137,6 +144,7 @@ func (s *Service) RegisterRepo(ctx context.Context, in RegisterRepoInput) (Regis
 		RefShards:      meta.RefShards,
 		ManifestShards: meta.ManifestShards,
 		DefaultBranch:  meta.DefaultBranch,
+		ObjectFormat:   string(meta.EffectiveObjectFormat()),
 		Created:        created,
 	}, nil
 }

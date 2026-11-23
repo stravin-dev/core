@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"compress/zlib"
-	"crypto/sha1" //nolint:gosec // Git packfile v2 requires SHA-1 checksums per Git specification
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,28 +13,29 @@ import (
 )
 
 const (
-	packHeaderSize  = 12
-	packTrailerSize = 20
-	packVersion2    = 2
+	packHeaderSize = 12
+	packVersion2   = 2
 )
 
 var packMagic = [4]byte{'P', 'A', 'C', 'K'}
 
 // ParseOptions configures packfile v2 parsing and validation.
 type ParseOptions struct {
-	Limits       Limits
-	BaseResolver BaseResolver
+	Limits        Limits
+	BaseResolver  BaseResolver
+	HashAlgorithm HashAlgorithm
 }
 
 // ParsedPack holds the validated entries, resolved objects, and trailer checksum of a packfile v2.
 type ParsedPack struct {
-	PackChecksum OID
-	Entries      []Entry
-	Objects      map[OID]*Object
+	HashAlgorithm HashAlgorithm
+	PackChecksum  OID
+	Entries       []Entry
+	Objects       map[OID]*Object
 }
 
 // packStreamReader tracks exact byte offsets, enforces MaxPackSize, updates the
-// pack-level SHA-1, and optionally updates a per-entry CRC32.
+// pack-level hash, and optionally updates a per-entry CRC32.
 type packStreamReader struct {
 	br       *bufio.Reader
 	packHash hash.Hash
@@ -44,10 +44,11 @@ type packStreamReader struct {
 	maxBytes int64
 }
 
-func newPackStreamReader(r io.Reader, maxBytes int64) *packStreamReader {
+func newPackStreamReader(r io.Reader, maxBytes int64, algo HashAlgorithm) *packStreamReader {
+	algo = DefaultHashAlgorithm(algo)
 	return &packStreamReader{
 		br:       bufio.NewReaderSize(r, 32*1024),
-		packHash: sha1.New(), //nolint:gosec // Git packfile v2 checksum requires SHA-1
+		packHash: algo.NewHash(),
 		maxBytes: maxBytes,
 	}
 }
@@ -119,18 +120,22 @@ type rawParsedEntry struct {
 
 // Parse streams, validates, and resolves a Git packfile v2 stream.
 // It validates the PACK header, version 2, object count, zlib payloads, delta chains,
-// bounded resource limits, and trailing SHA-1 checksum.
+// bounded resource limits, and trailing hash checksum (SHA-1 by default, or opts.HashAlgorithm).
 func Parse(r io.Reader, opts ParseOptions) (*ParsedPack, error) {
 	limits := opts.Limits.withDefaults()
-	rawEntries, packChecksum, err := parseRawEntries(r, limits)
+	algo := DefaultHashAlgorithm(opts.HashAlgorithm)
+	rawEntries, packChecksum, err := parseRawEntries(r, limits, algo)
 	if err != nil {
 		return nil, err
 	}
-	return resolveEntries(rawEntries, packChecksum, limits, opts.BaseResolver)
+	return resolveEntries(rawEntries, packChecksum, limits, algo, opts.BaseResolver)
 }
 
-func parseRawEntries(r io.Reader, limits Limits) ([]rawParsedEntry, OID, error) {
-	sr := newPackStreamReader(r, limits.MaxPackSize)
+func parseRawEntries(r io.Reader, limits Limits, algo HashAlgorithm) ([]rawParsedEntry, OID, error) {
+	algo = DefaultHashAlgorithm(algo)
+	sr := newPackStreamReader(r, limits.MaxPackSize, algo)
+	oidSize := algo.Size()
+	oidBuf := make([]byte, oidSize)
 
 	var hdr [packHeaderSize]byte
 	if err := sr.readFullHashed(hdr[:]); err != nil {
@@ -183,9 +188,14 @@ func parseRawEntries(r io.Reader, limits Limits) ([]rawParsedEntry, OID, error) 
 			}
 			re.baseOffset = entryOffset - dist
 		case ObjRefDelta:
-			if err := sr.readFullHashed(re.baseOID[:]); err != nil {
+			if err := sr.readFullHashed(oidBuf); err != nil {
 				return nil, OID{}, fmt.Errorf("entry %d ref_delta base oid: %w", i, ErrCorruptEntry)
 			}
+			baseOID, err := OIDFromBytes(oidBuf)
+			if err != nil {
+				return nil, OID{}, fmt.Errorf("entry %d ref_delta base oid: %w", i, err)
+			}
+			re.baseOID = baseOID
 		}
 
 		payload, err := readZlibPayload(sr, declaredSz, limits.MaxObjectSize)
@@ -202,18 +212,24 @@ func parseRawEntries(r io.Reader, limits Limits) ([]rawParsedEntry, OID, error) 
 		entries[i] = re
 	}
 
-	var computedChecksum OID
-	sr.packHash.Sum(computedChecksum[:0])
+	computedChecksum, err := OIDFromBytes(sr.packHash.Sum(nil))
+	if err != nil {
+		return nil, OID{}, fmt.Errorf("compute trailer checksum: %w", err)
+	}
 
-	var trailer OID
-	if _, err := io.ReadFull(sr.br, trailer[:]); err != nil {
+	trailerBuf := make([]byte, oidSize)
+	if _, err := io.ReadFull(sr.br, trailerBuf); err != nil {
 		return nil, OID{}, fmt.Errorf("read trailer checksum: %w", ErrChecksumMismatch)
+	}
+	trailer, err := OIDFromBytes(trailerBuf)
+	if err != nil {
+		return nil, OID{}, fmt.Errorf("decode trailer checksum: %w", ErrChecksumMismatch)
 	}
 	if trailer != computedChecksum {
 		return nil, OID{}, fmt.Errorf("trailer %s != computed %s: %w", trailer, computedChecksum, ErrChecksumMismatch)
 	}
 
-	// Ensure no trailing garbage follows the 20-byte SHA-1 trailer.
+	// Ensure no trailing garbage follows the hash trailer.
 	var extra [1]byte
 	n, err := sr.br.Read(extra[:])
 	if n > 0 || (err != nil && !errors.Is(err, io.EOF)) {
@@ -287,7 +303,8 @@ func readZlibPayload(sr *packStreamReader, declaredSz, maxObjSz int64) ([]byte, 
 	return data, nil
 }
 
-func resolveEntries(raw []rawParsedEntry, checksum OID, limits Limits, resolver BaseResolver) (*ParsedPack, error) {
+func resolveEntries(raw []rawParsedEntry, checksum OID, limits Limits, algo HashAlgorithm, resolver BaseResolver) (*ParsedPack, error) {
+	algo = DefaultHashAlgorithm(algo)
 	n := len(raw)
 	entries := make([]Entry, n)
 	objects := make(map[OID]*Object, n)
@@ -301,7 +318,7 @@ func resolveEntries(raw []rawParsedEntry, checksum OID, limits Limits, resolver 
 	for i := range raw {
 		offsetIndex[raw[i].offset] = i
 		if raw[i].typ.IsBase() {
-			oid := ComputeOID(raw[i].typ, raw[i].payload)
+			oid := ComputeOIDWith(algo, raw[i].typ, raw[i].payload)
 			obj := &Object{OID: oid, Type: raw[i].typ, Data: raw[i].payload}
 			objects[oid] = obj
 			entries[i] = Entry{
@@ -363,7 +380,7 @@ func resolveEntries(raw []rawParsedEntry, checksum OID, limits Limits, resolver 
 					if !bType.IsBase() {
 						return nil, fmt.Errorf("external base %s has non-base type %s: %w", re.baseOID, bType, ErrInvalidObjectType)
 					}
-					if ComputeOID(bType, bData) != re.baseOID {
+					if ComputeOIDWith(algo, bType, bData) != re.baseOID {
 						return nil, fmt.Errorf("external base %s checksum mismatch: %w", re.baseOID, ErrChecksumMismatch)
 					}
 					baseObj = &Object{OID: re.baseOID, Type: bType, Data: bData}
@@ -387,7 +404,7 @@ func resolveEntries(raw []rawParsedEntry, checksum OID, limits Limits, resolver 
 				return nil, fmt.Errorf("expanded pack bytes %d > max %d: %w", totalExpanded, limits.MaxTotalUncompressed, ErrLimitExceeded)
 			}
 
-			oid := ComputeOID(baseObj.Type, target)
+			oid := ComputeOIDWith(algo, baseObj.Type, target)
 			objects[oid] = &Object{OID: oid, Type: baseObj.Type, Data: target}
 			entries[i] = Entry{
 				OID:    oid,
@@ -414,9 +431,10 @@ func resolveEntries(raw []rawParsedEntry, checksum OID, limits Limits, resolver 
 	}
 
 	return &ParsedPack{
-		PackChecksum: checksum,
-		Entries:      entries,
-		Objects:      objects,
+		HashAlgorithm: algo,
+		PackChecksum:  checksum,
+		Entries:       entries,
+		Objects:       objects,
 	}, nil
 }
 

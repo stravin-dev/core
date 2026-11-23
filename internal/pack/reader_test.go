@@ -13,7 +13,7 @@ func buildTreePayload(entries []TreeEntry) []byte {
 	var buf bytes.Buffer
 	for _, e := range entries {
 		fmt.Fprintf(&buf, "%o %s\x00", e.Mode, e.Name)
-		buf.Write(e.OID[:])
+		buf.Write(e.OID.Bytes())
 	}
 	return buf.Bytes()
 }

@@ -126,7 +126,7 @@ func buildRawPack(t *testing.T, version uint32, entries []rawPackEntry) []byte {
 		case ObjOFSDelta:
 			buf.Write(encodeOFSDeltaOffset(e.ofsDist))
 		case ObjRefDelta:
-			buf.Write(e.refBase[:])
+			buf.Write(e.refBase.Bytes())
 		}
 		buf.Write(zlibCompress(t, e.data))
 	}
@@ -189,7 +189,7 @@ func TestParseOFSDeltaAndRefDelta(t *testing.T) {
 
 	oid1 := ComputeOID(ObjBlob, want1)
 	buf.Write(encodePackEntryHeader(ObjRefDelta, int64(len(delta2))))
-	buf.Write(oid1[:])
+	buf.Write(oid1.Bytes())
 	buf.Write(zlibCompress(t, delta2))
 
 	sum := sha1.Sum(buf.Bytes()) //nolint:gosec

@@ -31,9 +31,10 @@ func (r *RepoBaseResolver) ResolveBase(oid pack.OID) (pack.ObjectType, []byte, e
 
 	packIDs := r.cache.CachedPackIDs(r.repo)
 	packDir := filepath.Join(handle.Path(), "objects", "pack")
+	algo := oid.Algorithm()
 
 	for _, packID := range packIDs {
-		idx, err := r.loadIdx(packDir, packID)
+		idx, err := r.loadIdx(packDir, packID, algo)
 		if err != nil {
 			continue
 		}
@@ -51,8 +52,8 @@ func (r *RepoBaseResolver) ResolveBase(oid pack.OID) (pack.ObjectType, []byte, e
 	return 0, nil, fmt.Errorf("%s: %w", oid, pack.ErrObjectNotFound)
 }
 
-func (r *RepoBaseResolver) loadIdx(packDir, packID string) (*pack.Idx, error) {
-	if cached, ok := r.cache.getCachedIdx(r.repo, packID); ok {
+func (r *RepoBaseResolver) loadIdx(packDir, packID string, algo pack.HashAlgorithm) (*pack.Idx, error) {
+	if cached, ok := r.cache.getCachedIdx(r.repo, packID); ok && cached.Algorithm().Name() == algo.Name() {
 		return cached, nil
 	}
 
@@ -61,7 +62,7 @@ func (r *RepoBaseResolver) loadIdx(packDir, packID string) (*pack.Idx, error) {
 	if err != nil {
 		return nil, err
 	}
-	idx, err := pack.ParseIdx(data)
+	idx, err := pack.ParseIdxWithAlgorithm(data, algo)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +80,10 @@ func (r *RepoBaseResolver) readObjectFromPack(packDir, packID string, oid pack.O
 		_ = f.Close()
 	}()
 
-	parsed, err := pack.Parse(f, pack.ParseOptions{Limits: r.limits})
+	parsed, err := pack.Parse(f, pack.ParseOptions{
+		Limits:        r.limits,
+		HashAlgorithm: oid.Algorithm(),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("parse pack %s: %w", packID, err)
 	}

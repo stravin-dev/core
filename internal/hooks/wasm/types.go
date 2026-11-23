@@ -6,7 +6,14 @@ import (
 	"errors"
 	"log/slog"
 	"runtime"
+	"strings"
 	"time"
+)
+
+// Supported Git object hash formats for HookHostABI.
+const (
+	ObjectFormatSHA1   = "sha1"
+	ObjectFormatSHA256 = "sha256"
 )
 
 // Default resource guardrails for Tier 1 synchronous Wasm hooks.
@@ -61,6 +68,14 @@ type ContextDiffTreeReader interface {
 	DiffTreeContext(ctx context.Context, oldTreeOID, newTreeOID [20]byte, limit uint32) ([]TreeChange, error)
 }
 
+// DualHashObjectReader is an optional extension of ObjectReader supporting both
+// 40-hex SHA-1 and 64-hex SHA-256 object IDs for HookHostABI v2 calls.
+type DualHashObjectReader interface {
+	ListNewCommitsByHex(oldOIDHex, newOIDHex string, limit uint32) ([]CommitMeta, error)
+	DiffTreeByHex(ctx context.Context, oldTreeOIDHex, newTreeOIDHex string, limit uint32) ([]TreeChange, error)
+	ReadBlobChunkByHex(blobOIDHex string, offset uint64, maxBytes uint32) ([]byte, error)
+}
+
 // FailMode controls whether a hook runtime failure blocks or warns on a push.
 type FailMode string
 
@@ -80,19 +95,49 @@ type HookConfig struct {
 }
 
 // RefUpdate represents a single ref transition in an incoming Git push.
+// For SHA-256 repositories, OldOIDHex and NewOIDHex carry the 64-character hex OIDs.
 type RefUpdate struct {
-	Ref    string
-	OldOID [20]byte
-	NewOID [20]byte
+	Ref       string
+	OldOID    [20]byte
+	NewOID    [20]byte
+	OldOIDHex string
+	NewOIDHex string
+}
+
+// EffectiveOldOIDHex returns OldOIDHex when set, otherwise the 40-hex encoding of OldOID.
+func (u RefUpdate) EffectiveOldOIDHex() string {
+	if u.OldOIDHex != "" {
+		return u.OldOIDHex
+	}
+	return encodeOIDHex(u.OldOID)
+}
+
+// EffectiveNewOIDHex returns NewOIDHex when set, otherwise the 40-hex encoding of NewOID.
+func (u RefUpdate) EffectiveNewOIDHex() string {
+	if u.NewOIDHex != "" {
+		return u.NewOIDHex
+	}
+	return encodeOIDHex(u.NewOID)
 }
 
 // PushContext describes the incoming Git push evaluated by Tier 1 hooks.
 type PushContext struct {
-	TenantID string
-	RepoID   string
-	OrgID    string
-	ActorID  string
-	Updates  []RefUpdate
+	TenantID     string
+	RepoID       string
+	OrgID        string
+	ActorID      string
+	ObjectFormat string
+	Updates      []RefUpdate
+}
+
+// EffectiveObjectFormat returns the repository's object format, defaulting to "sha1".
+func (p PushContext) EffectiveObjectFormat() string {
+	switch strings.ToLower(strings.TrimSpace(p.ObjectFormat)) {
+	case ObjectFormatSHA256:
+		return ObjectFormatSHA256
+	default:
+		return ObjectFormatSHA1
+	}
 }
 
 // Signature represents a Git commit author or committer identity.
@@ -105,12 +150,46 @@ type Signature struct {
 
 // CommitMeta holds header fields and message parsed from a Git commit object.
 type CommitMeta struct {
-	OID       [20]byte
-	TreeOID   [20]byte
-	Parents   [][20]byte
-	Author    Signature
-	Committer Signature
-	Message   string
+	OID         [20]byte
+	TreeOID     [20]byte
+	Parents     [][20]byte
+	OIDHex      string
+	TreeOIDHex  string
+	ParentHexes []string
+	Author      Signature
+	Committer   Signature
+	Message     string
+}
+
+// EffectiveOIDHex returns OIDHex when set, otherwise the 40-hex encoding of OID.
+func (c CommitMeta) EffectiveOIDHex() string {
+	if c.OIDHex != "" {
+		return c.OIDHex
+	}
+	return encodeOIDHex(c.OID)
+}
+
+// EffectiveTreeOIDHex returns TreeOIDHex when set, otherwise the 40-hex encoding of TreeOID.
+func (c CommitMeta) EffectiveTreeOIDHex() string {
+	if c.TreeOIDHex != "" {
+		return c.TreeOIDHex
+	}
+	return encodeOIDHex(c.TreeOID)
+}
+
+// EffectiveParentHexes returns ParentHexes when set, otherwise the 40-hex encodings of Parents.
+func (c CommitMeta) EffectiveParentHexes() []string {
+	if len(c.ParentHexes) > 0 {
+		return c.ParentHexes
+	}
+	if len(c.Parents) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(c.Parents))
+	for _, p := range c.Parents {
+		out = append(out, encodeOIDHex(p))
+	}
+	return out
 }
 
 // ChangeKind classifies a file-level difference between two Git trees.
@@ -124,14 +203,32 @@ const (
 
 // TreeChange describes a single changed path between two Git trees.
 type TreeChange struct {
-	Path    string
-	Kind    ChangeKind
-	OldMode uint32
-	NewMode uint32
-	OldOID  [20]byte
-	NewOID  [20]byte
-	OldSize int64
-	NewSize int64
+	Path      string
+	Kind      ChangeKind
+	OldMode   uint32
+	NewMode   uint32
+	OldOID    [20]byte
+	NewOID    [20]byte
+	OldOIDHex string
+	NewOIDHex string
+	OldSize   int64
+	NewSize   int64
+}
+
+// EffectiveOldOIDHex returns OldOIDHex when set, otherwise the 40-hex encoding of OldOID.
+func (ch TreeChange) EffectiveOldOIDHex() string {
+	if ch.OldOIDHex != "" {
+		return ch.OldOIDHex
+	}
+	return encodeOIDHex(ch.OldOID)
+}
+
+// EffectiveNewOIDHex returns NewOIDHex when set, otherwise the 40-hex encoding of NewOID.
+func (ch TreeChange) EffectiveNewOIDHex() string {
+	if ch.NewOIDHex != "" {
+		return ch.NewOIDHex
+	}
+	return encodeOIDHex(ch.NewOID)
 }
 
 // VerdictDecision is the allow/reject decision emitted by a hook.

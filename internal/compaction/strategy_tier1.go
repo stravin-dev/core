@@ -19,9 +19,8 @@ import (
 )
 
 const (
-	packTrailerBytes = 20
-	bareDirPerm      = 0o700
-	bareFilePerm     = 0o600
+	bareDirPerm  = 0o700
+	bareFilePerm = 0o600
 )
 
 // Tier1Strategy implements deep LSM Tier-1 compaction strictly through the
@@ -80,7 +79,10 @@ func (s *Tier1Strategy) Compact(ctx context.Context, req StrategyRequest) (Strat
 		_ = os.RemoveAll(tmpDir)
 	}()
 
-	if err := initBareRepoLayout(tmpDir); err != nil {
+	algo := pack.DefaultHashAlgorithm(req.HashAlgorithm)
+	trailerBytes := algo.Size()
+
+	if err := initBareRepoLayout(tmpDir, algo); err != nil {
 		return StrategyResult{}, fmt.Errorf("compaction tier1: init bare repo: %w", err)
 	}
 
@@ -95,7 +97,7 @@ func (s *Tier1Strategy) Compact(ctx context.Context, req StrategyRequest) (Strat
 		if err != nil {
 			return StrategyResult{}, fmt.Errorf("compaction tier1: get pack %s: %w", in.PackID, err)
 		}
-		if len(packBytes) < 12+packTrailerBytes {
+		if len(packBytes) < 12+trailerBytes {
 			return StrategyResult{}, fmt.Errorf("compaction tier1: pack %s too short (%d bytes)", in.PackID, len(packBytes))
 		}
 		idxBytes, err := s.store.GetIndex(ctx, req.Repo, in.PackID)
@@ -105,7 +107,10 @@ func (s *Tier1Strategy) Compact(ctx context.Context, req StrategyRequest) (Strat
 
 		// Collect commit OIDs if caller did not supply refs so commit-graph --reachable has tips.
 		if len(req.Refs) == 0 {
-			if parsed, parseErr := pack.Parse(bytes.NewReader(packBytes), pack.ParseOptions{Limits: s.limits}); parseErr == nil {
+			if parsed, parseErr := pack.Parse(bytes.NewReader(packBytes), pack.ParseOptions{
+				Limits:        s.limits,
+				HashAlgorithm: algo,
+			}); parseErr == nil {
 				for oid, obj := range parsed.Objects {
 					if obj.Type == pack.ObjCommit {
 						discoveredCommits = append(discoveredCommits, oid)
@@ -114,7 +119,7 @@ func (s *Tier1Strategy) Compact(ctx context.Context, req StrategyRequest) (Strat
 			}
 		}
 
-		packHex := hex.EncodeToString(packBytes[len(packBytes)-packTrailerBytes:])
+		packHex := hex.EncodeToString(packBytes[len(packBytes)-trailerBytes:])
 		packPath := filepath.Join(packDir, "pack-"+packHex+".pack")
 		idxPath := filepath.Join(packDir, "pack-"+packHex+".idx")
 		if err := os.WriteFile(packPath, packBytes, bareFilePerm); err != nil {
@@ -192,7 +197,7 @@ func (s *Tier1Strategy) Compact(ctx context.Context, req StrategyRequest) (Strat
 	}, nil
 }
 
-func initBareRepoLayout(dir string) error {
+func initBareRepoLayout(dir string, algo pack.HashAlgorithm) error {
 	for _, sub := range []string{
 		filepath.Join(dir, "objects", "pack"),
 		filepath.Join(dir, "objects", "info"),
@@ -207,6 +212,9 @@ func initBareRepoLayout(dir string) error {
 		return err
 	}
 	cfg := "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n"
+	if pack.DefaultHashAlgorithm(algo).Name() == "sha256" {
+		cfg = "[core]\n\trepositoryformatversion = 1\n\tfilemode = true\n\tbare = true\n[extensions]\n\tobjectformat = sha256\n"
+	}
 	return os.WriteFile(filepath.Join(dir, "config"), []byte(cfg), bareFilePerm)
 }
 
@@ -220,7 +228,7 @@ func writePackedRefs(dir string, refs []ddb.RefState, fallbackCommits []pack.OID
 			return sorted[i].RefName < sorted[j].RefName
 		})
 		for _, r := range sorted {
-			if r.OID == "" || r.OID == ddb.ZeroOID || r.RefName == "" {
+			if r.OID == "" || ddb.IsZeroOID(r.OID) || r.RefName == "" {
 				continue
 			}
 			b.WriteString(r.OID)
@@ -230,7 +238,7 @@ func writePackedRefs(dir string, refs []ddb.RefState, fallbackCommits []pack.OID
 		}
 	} else if len(fallbackCommits) > 0 {
 		sort.Slice(fallbackCommits, func(i, j int) bool {
-			return bytes.Compare(fallbackCommits[i][:], fallbackCommits[j][:]) < 0
+			return fallbackCommits[i].Compare(fallbackCommits[j]) < 0
 		})
 		for i, oid := range fallbackCommits {
 			fmt.Fprintf(&b, "%s refs/heads/stravin-pack-%d\n", oid.String(), i)

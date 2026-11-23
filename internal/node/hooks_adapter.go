@@ -90,6 +90,7 @@ type packObjectReaderAdapter struct {
 var (
 	_ wasm.ObjectReader          = (*packObjectReaderAdapter)(nil)
 	_ wasm.ContextDiffTreeReader = (*packObjectReaderAdapter)(nil)
+	_ wasm.DualHashObjectReader  = (*packObjectReaderAdapter)(nil)
 )
 
 type packContextDiffTreeReader interface {
@@ -105,20 +106,92 @@ func NewPackObjectReaderAdapter(inner pack.ObjectReader) wasm.ObjectReader {
 }
 
 func (a *packObjectReaderAdapter) ListNewCommits(oldOID, newOID [20]byte, limit uint32) ([]wasm.CommitMeta, error) {
-	commits, err := a.inner.ListNewCommits(pack.OID(oldOID), pack.OID(newOID), limit)
+	commits, err := a.inner.ListNewCommits(pack.OIDFromSHA1(oldOID), pack.OIDFromSHA1(newOID), limit)
 	if err != nil {
 		return nil, err
 	}
+	return convertCommits(commits), nil
+}
+
+func (a *packObjectReaderAdapter) ListNewCommitsByHex(oldOIDHex, newOIDHex string, limit uint32) ([]wasm.CommitMeta, error) {
+	oldOID, err := pack.ParseOID(oldOIDHex)
+	if err != nil {
+		return nil, err
+	}
+	newOID, err := pack.ParseOID(newOIDHex)
+	if err != nil {
+		return nil, err
+	}
+	commits, err := a.inner.ListNewCommits(oldOID, newOID, limit)
+	if err != nil {
+		return nil, err
+	}
+	return convertCommits(commits), nil
+}
+
+func (a *packObjectReaderAdapter) DiffTree(oldTreeOID, newTreeOID [20]byte, limit uint32) ([]wasm.TreeChange, error) {
+	changes, err := a.inner.DiffTree(pack.OIDFromSHA1(oldTreeOID), pack.OIDFromSHA1(newTreeOID), limit)
+	if err != nil {
+		return nil, err
+	}
+	return convertTreeChanges(changes), nil
+}
+
+func (a *packObjectReaderAdapter) DiffTreeContext(ctx context.Context, oldTreeOID, newTreeOID [20]byte, limit uint32) ([]wasm.TreeChange, error) {
+	return a.diffTreeOIDs(ctx, pack.OIDFromSHA1(oldTreeOID), pack.OIDFromSHA1(newTreeOID), limit)
+}
+
+func (a *packObjectReaderAdapter) DiffTreeByHex(ctx context.Context, oldTreeOIDHex, newTreeOIDHex string, limit uint32) ([]wasm.TreeChange, error) {
+	oldOID, err := pack.ParseOID(oldTreeOIDHex)
+	if err != nil {
+		return nil, err
+	}
+	newOID, err := pack.ParseOID(newTreeOIDHex)
+	if err != nil {
+		return nil, err
+	}
+	return a.diffTreeOIDs(ctx, oldOID, newOID, limit)
+}
+
+func (a *packObjectReaderAdapter) diffTreeOIDs(ctx context.Context, oldTreeOID, newTreeOID pack.OID, limit uint32) ([]wasm.TreeChange, error) {
+	var (
+		changes []pack.TreeChange
+		err     error
+	)
+	if ctxReader, ok := a.inner.(packContextDiffTreeReader); ok {
+		changes, err = ctxReader.DiffTreeContext(ctx, oldTreeOID, newTreeOID, limit)
+	} else {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		changes, err = a.inner.DiffTree(oldTreeOID, newTreeOID, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return convertTreeChanges(changes), nil
+}
+
+func convertCommits(commits []pack.CommitMeta) []wasm.CommitMeta {
 	out := make([]wasm.CommitMeta, 0, len(commits))
 	for _, c := range commits {
-		parents := make([][20]byte, len(c.Parents))
-		for i, p := range c.Parents {
-			parents[i] = [20]byte(p)
+		parents := make([][20]byte, 0, len(c.Parents))
+		parentHexes := make([]string, 0, len(c.Parents))
+		for _, p := range c.Parents {
+			if raw, ok := p.SHA1Bytes(); ok {
+				parents = append(parents, raw)
+			}
+			parentHexes = append(parentHexes, p.String())
 		}
+		oidRaw, _ := c.OID.SHA1Bytes()
+		treeRaw, _ := c.TreeOID.SHA1Bytes()
 		out = append(out, wasm.CommitMeta{
-			OID:     [20]byte(c.OID),
-			TreeOID: [20]byte(c.TreeOID),
-			Parents: parents,
+			OID:         oidRaw,
+			TreeOID:     treeRaw,
+			Parents:     parents,
+			OIDHex:      c.OID.String(),
+			TreeOIDHex:  c.TreeOID.String(),
+			ParentHexes: parentHexes,
 			Author: wasm.Signature{
 				Name:  c.Author.Name,
 				Email: c.Author.Email,
@@ -134,53 +207,38 @@ func (a *packObjectReaderAdapter) ListNewCommits(oldOID, newOID [20]byte, limit 
 			Message: c.Message,
 		})
 	}
-	return out, nil
-}
-
-func (a *packObjectReaderAdapter) DiffTree(oldTreeOID, newTreeOID [20]byte, limit uint32) ([]wasm.TreeChange, error) {
-	changes, err := a.inner.DiffTree(pack.OID(oldTreeOID), pack.OID(newTreeOID), limit)
-	if err != nil {
-		return nil, err
-	}
-	return convertTreeChanges(changes), nil
-}
-
-func (a *packObjectReaderAdapter) DiffTreeContext(ctx context.Context, oldTreeOID, newTreeOID [20]byte, limit uint32) ([]wasm.TreeChange, error) {
-	var (
-		changes []pack.TreeChange
-		err     error
-	)
-	if ctxReader, ok := a.inner.(packContextDiffTreeReader); ok {
-		changes, err = ctxReader.DiffTreeContext(ctx, pack.OID(oldTreeOID), pack.OID(newTreeOID), limit)
-	} else {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		changes, err = a.inner.DiffTree(pack.OID(oldTreeOID), pack.OID(newTreeOID), limit)
-	}
-	if err != nil {
-		return nil, err
-	}
-	return convertTreeChanges(changes), nil
+	return out
 }
 
 func convertTreeChanges(changes []pack.TreeChange) []wasm.TreeChange {
 	out := make([]wasm.TreeChange, 0, len(changes))
 	for _, ch := range changes {
+		oldRaw, _ := ch.OldOID.SHA1Bytes()
+		newRaw, _ := ch.NewOID.SHA1Bytes()
 		out = append(out, wasm.TreeChange{
-			Path:    ch.Path,
-			Kind:    wasm.ChangeKind(ch.Kind),
-			OldMode: ch.OldMode,
-			NewMode: ch.NewMode,
-			OldOID:  [20]byte(ch.OldOID),
-			NewOID:  [20]byte(ch.NewOID),
-			OldSize: ch.OldSize,
-			NewSize: ch.NewSize,
+			Path:      ch.Path,
+			Kind:      wasm.ChangeKind(ch.Kind),
+			OldMode:   ch.OldMode,
+			NewMode:   ch.NewMode,
+			OldOID:    oldRaw,
+			NewOID:    newRaw,
+			OldOIDHex: ch.OldOID.String(),
+			NewOIDHex: ch.NewOID.String(),
+			OldSize:   ch.OldSize,
+			NewSize:   ch.NewSize,
 		})
 	}
 	return out
 }
 
 func (a *packObjectReaderAdapter) ReadBlobChunk(blobOID [20]byte, offset uint64, maxBytes uint32) ([]byte, error) {
-	return a.inner.ReadBlobChunk(pack.OID(blobOID), offset, maxBytes)
+	return a.inner.ReadBlobChunk(pack.OIDFromSHA1(blobOID), offset, maxBytes)
+}
+
+func (a *packObjectReaderAdapter) ReadBlobChunkByHex(blobOIDHex string, offset uint64, maxBytes uint32) ([]byte, error) {
+	oid, err := pack.ParseOID(blobOIDHex)
+	if err != nil {
+		return nil, err
+	}
+	return a.inner.ReadBlobChunk(oid, offset, maxBytes)
 }

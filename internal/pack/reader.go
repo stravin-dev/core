@@ -401,7 +401,7 @@ func (r *PackReader) loadTreeEntries(treeOID OID) ([]TreeEntry, error) {
 	if typ != ObjTree {
 		return nil, fmt.Errorf("object %s is %s, want tree: %w", treeOID, typ, ErrInvalidObjectType)
 	}
-	return ParseTree(raw)
+	return ParseTreeWithAlgorithm(raw, treeOID.Algorithm())
 }
 
 func (r *PackReader) blobSize(oid OID) int64 {
@@ -442,7 +442,9 @@ func (r *PackReader) ReadBlobChunk(blobOID OID, offset uint64, maxBytes uint32) 
 }
 
 // ParseCommit parses a raw Git commit object payload into CommitMeta.
+// Tree and parent OIDs are validated against oid's HashAlgorithm (SHA-1 or SHA-256).
 func ParseCommit(oid OID, raw []byte) (CommitMeta, error) {
+	algo := oid.Algorithm()
 	meta := CommitMeta{OID: oid}
 	sep := bytes.Index(raw, []byte("\n\n"))
 	var headerBlock []byte
@@ -463,13 +465,13 @@ func ParseCommit(oid OID, raw []byte) (CommitMeta, error) {
 		}
 		switch key {
 		case "tree":
-			tOID, err := ParseOID(strings.TrimSpace(val))
+			tOID, err := ParseOIDForAlgorithm(strings.TrimSpace(val), algo)
 			if err != nil {
 				return CommitMeta{}, fmt.Errorf("commit %s tree: %w", oid, err)
 			}
 			meta.TreeOID = tOID
 		case "parent":
-			pOID, err := ParseOID(strings.TrimSpace(val))
+			pOID, err := ParseOIDForAlgorithm(strings.TrimSpace(val), algo)
 			if err != nil {
 				return CommitMeta{}, fmt.Errorf("commit %s parent: %w", oid, err)
 			}
@@ -528,8 +530,14 @@ func parseTZOffset(s string) (*time.Location, bool) {
 	return time.FixedZone(s, sign*(hours*3600+mins*60)), true
 }
 
-// ParseTree parses a raw Git binary tree object payload into TreeEntry records.
+// ParseTree parses a raw Git SHA-1 binary tree object payload into TreeEntry records.
 func ParseTree(raw []byte) ([]TreeEntry, error) {
+	return ParseTreeWithAlgorithm(raw, SHA1)
+}
+
+// ParseTreeWithAlgorithm parses a raw Git binary tree object payload using algo (default SHA-1).
+func ParseTreeWithAlgorithm(raw []byte, algo HashAlgorithm) ([]TreeEntry, error) {
+	oidSize := DefaultHashAlgorithm(algo).Size()
 	var entries []TreeEntry
 	pos := 0
 	for pos < len(raw) {
@@ -550,12 +558,14 @@ func ParseTree(raw []byte) ([]TreeEntry, error) {
 		name := string(raw[pos : pos+nul])
 		pos += nul + 1
 
-		if pos+20 > len(raw) {
+		if pos+oidSize > len(raw) {
 			return nil, fmt.Errorf("tree entry truncated OID: %w", ErrCorruptEntry)
 		}
-		var oid OID
-		copy(oid[:], raw[pos:pos+20])
-		pos += 20
+		oid, err := OIDFromBytes(raw[pos : pos+oidSize])
+		if err != nil {
+			return nil, fmt.Errorf("tree entry invalid OID: %w", err)
+		}
+		pos += oidSize
 
 		entries = append(entries, TreeEntry{
 			Mode: uint32(modeVal),

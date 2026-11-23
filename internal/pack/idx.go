@@ -2,7 +2,6 @@ package pack
 
 import (
 	"bytes"
-	"crypto/sha1" //nolint:gosec // Git .idx v2 format requires SHA-1 checksums per Git specification
 	"encoding/binary"
 	"fmt"
 	"sort"
@@ -13,7 +12,6 @@ const (
 	idxFanoutEntries   = 256
 	idxHeaderSize      = 8
 	idxFanoutSize      = idxFanoutEntries * 4
-	idxMinSize         = idxHeaderSize + idxFanoutSize + 2*packTrailerSize
 	idxLargeOffsetFlag = uint32(0x80000000)
 )
 
@@ -25,15 +23,21 @@ type idxEntry struct {
 	crc32  uint32
 }
 
-// IdxBuilder constructs a Git packfile .idx v2 binary file (GoF Builder pattern).
+// IdxBuilder constructs a Git packfile .idx v2 binary file (GoF Builder pattern)
+// for either SHA-1 (20-byte) or SHA-256 (32-byte) packfiles.
 type IdxBuilder struct {
+	algo         HashAlgorithm
 	packChecksum OID
 	entries      []idxEntry
 }
 
-// NewIdxBuilder creates a new IdxBuilder for the given packfile SHA-1 checksum.
+// NewIdxBuilder creates a new IdxBuilder for the given packfile checksum.
+// The hash algorithm (SHA-1 or SHA-256) is inferred from packChecksum.
 func NewIdxBuilder(packChecksum OID) *IdxBuilder {
-	return &IdxBuilder{packChecksum: packChecksum}
+	return &IdxBuilder{
+		algo:         packChecksum.Algorithm(),
+		packChecksum: packChecksum,
+	}
 }
 
 // Add registers an object's OID, packfile byte offset, and raw entry CRC32.
@@ -48,10 +52,18 @@ func (b *IdxBuilder) Add(oid OID, offset uint64, crc32 uint32) *IdxBuilder {
 
 // Build validates, sorts, and serializes the .idx v2 byte representation.
 func (b *IdxBuilder) Build() ([]byte, error) {
+	algo := DefaultHashAlgorithm(b.algo)
+	oidSize := algo.Size()
+
 	sorted := make([]idxEntry, len(b.entries))
 	copy(sorted, b.entries)
+	for _, e := range sorted {
+		if e.oid.Len() != oidSize {
+			return nil, fmt.Errorf("oid %s length %d does not match %s (%d): %w", e.oid, e.oid.Len(), algo.Name(), oidSize, ErrInvalidIdx)
+		}
+	}
 	sort.Slice(sorted, func(i, j int) bool {
-		return bytes.Compare(sorted[i].oid[:], sorted[j].oid[:]) < 0
+		return sorted[i].oid.Compare(sorted[j].oid) < 0
 	})
 
 	for i := 1; i < len(sorted); i++ {
@@ -62,7 +74,7 @@ func (b *IdxBuilder) Build() ([]byte, error) {
 
 	var fanout [idxFanoutEntries]uint32
 	for _, e := range sorted {
-		fanout[e.oid[0]]++
+		fanout[e.oid.FirstByte()]++
 	}
 	var running uint32
 	for i := 0; i < idxFanoutEntries; i++ {
@@ -81,7 +93,7 @@ func (b *IdxBuilder) Build() ([]byte, error) {
 		}
 	}
 
-	totalSize := idxHeaderSize + idxFanoutSize + len(sorted)*(20+4+4) + len(largeOffsets)*8 + 2*packTrailerSize
+	totalSize := idxHeaderSize + idxFanoutSize + len(sorted)*(oidSize+4+4) + len(largeOffsets)*8 + 2*oidSize
 	buf := bytes.NewBuffer(make([]byte, 0, totalSize))
 
 	buf.Write(idxMagic[:])
@@ -91,7 +103,7 @@ func (b *IdxBuilder) Build() ([]byte, error) {
 		_ = binary.Write(buf, binary.BigEndian, fanout[i])
 	}
 	for _, e := range sorted {
-		buf.Write(e.oid[:])
+		buf.Write(e.oid.Bytes())
 	}
 	for _, e := range sorted {
 		_ = binary.Write(buf, binary.BigEndian, e.crc32)
@@ -103,9 +115,9 @@ func (b *IdxBuilder) Build() ([]byte, error) {
 		_ = binary.Write(buf, binary.BigEndian, loff)
 	}
 
-	buf.Write(b.packChecksum[:])
-	idxSum := sha1.Sum(buf.Bytes()) //nolint:gosec // Git .idx v2 trailer requires SHA-1
-	buf.Write(idxSum[:])
+	buf.Write(b.packChecksum.Bytes())
+	idxSum := algo.Sum(buf.Bytes())
+	buf.Write(idxSum.Bytes())
 	return buf.Bytes(), nil
 }
 
@@ -123,6 +135,7 @@ func BuildIdx(p *ParsedPack) ([]byte, error) {
 
 // Idx is a parsed, read-only Git .idx v2 index supporting O(log N) OID lookup.
 type Idx struct {
+	algo         HashAlgorithm
 	fanout       [idxFanoutEntries]uint32
 	oids         []OID
 	crcs         []uint32
@@ -131,9 +144,18 @@ type Idx struct {
 	idxChecksum  OID
 }
 
-// ParseIdx validates and parses a Git .idx v2 byte slice.
+// ParseIdx validates and parses a SHA-1 Git .idx v2 byte slice.
 func ParseIdx(data []byte) (*Idx, error) {
-	if len(data) < idxMinSize {
+	return ParseIdxWithAlgorithm(data, SHA1)
+}
+
+// ParseIdxWithAlgorithm validates and parses a Git .idx v2 byte slice using algo (default SHA-1).
+func ParseIdxWithAlgorithm(data []byte, algo HashAlgorithm) (*Idx, error) {
+	algo = DefaultHashAlgorithm(algo)
+	oidSize := algo.Size()
+	minSize := idxHeaderSize + idxFanoutSize + 2*oidSize
+
+	if len(data) < minSize {
 		return nil, fmt.Errorf("idx too short (%d bytes): %w", len(data), ErrInvalidIdx)
 	}
 	if !bytes.Equal(data[:4], idxMagic[:]) {
@@ -144,17 +166,26 @@ func ParseIdx(data []byte) (*Idx, error) {
 		return nil, fmt.Errorf("idx version %d: %w", version, ErrUnsupportedVersion)
 	}
 
-	// Verify trailing .idx SHA-1 checksum.
-	body := data[:len(data)-packTrailerSize]
-	expectedSum := sha1.Sum(body) //nolint:gosec // Git .idx v2 checksum requires SHA-1
-	var actualSum OID
-	copy(actualSum[:], data[len(data)-packTrailerSize:])
+	// Verify trailing .idx checksum.
+	body := data[:len(data)-oidSize]
+	expectedSum := algo.Sum(body)
+	actualSum, err := OIDFromBytes(data[len(data)-oidSize:])
+	if err != nil {
+		return nil, fmt.Errorf("decode idx checksum: %w", ErrChecksumMismatch)
+	}
 	if expectedSum != actualSum {
 		return nil, fmt.Errorf("idx checksum %s != %s: %w", actualSum, expectedSum, ErrChecksumMismatch)
 	}
 
-	idx := &Idx{idxChecksum: actualSum}
-	copy(idx.packChecksum[:], data[len(data)-2*packTrailerSize:len(data)-packTrailerSize])
+	packChecksum, err := OIDFromBytes(data[len(data)-2*oidSize : len(data)-oidSize])
+	if err != nil {
+		return nil, fmt.Errorf("decode pack checksum: %w", ErrInvalidIdx)
+	}
+	idx := &Idx{
+		algo:         algo,
+		packChecksum: packChecksum,
+		idxChecksum:  actualSum,
+	}
 
 	pos := idxHeaderSize
 	var prev uint32
@@ -169,10 +200,10 @@ func ParseIdx(data []byte) (*Idx, error) {
 	}
 
 	count := int(idx.fanout[255])
-	oidEnd := pos + count*20
+	oidEnd := pos + count*oidSize
 	crcEnd := oidEnd + count*4
 	offEnd := crcEnd + count*4
-	trailerStart := len(data) - 2*packTrailerSize
+	trailerStart := len(data) - 2*oidSize
 	if offEnd > trailerStart {
 		return nil, fmt.Errorf("idx truncated for %d entries: %w", count, ErrInvalidIdx)
 	}
@@ -185,8 +216,12 @@ func ParseIdx(data []byte) (*Idx, error) {
 
 	idx.oids = make([]OID, count)
 	for i := 0; i < count; i++ {
-		copy(idx.oids[i][:], data[pos+i*20:pos+(i+1)*20])
-		if i > 0 && bytes.Compare(idx.oids[i-1][:], idx.oids[i][:]) >= 0 {
+		oid, err := OIDFromBytes(data[pos+i*oidSize : pos+(i+1)*oidSize])
+		if err != nil {
+			return nil, fmt.Errorf("invalid oid at index %d: %w", i, ErrInvalidIdx)
+		}
+		idx.oids[i] = oid
+		if i > 0 && idx.oids[i-1].Compare(idx.oids[i]) >= 0 {
 			return nil, fmt.Errorf("unsorted or duplicate OID at index %d: %w", i, ErrInvalidIdx)
 		}
 	}
@@ -213,34 +248,43 @@ func ParseIdx(data []byte) (*Idx, error) {
 	return idx, nil
 }
 
+// Algorithm returns the HashAlgorithm used by this .idx file.
+func (x *Idx) Algorithm() HashAlgorithm {
+	return DefaultHashAlgorithm(x.algo)
+}
+
 // Count returns the number of indexed objects.
 func (x *Idx) Count() uint32 {
 	return x.fanout[255]
 }
 
-// PackChecksum returns the SHA-1 checksum of the associated packfile.
+// PackChecksum returns the checksum of the associated packfile.
 func (x *Idx) PackChecksum() OID {
 	return x.packChecksum
 }
 
-// IdxChecksum returns the SHA-1 checksum of the .idx file itself.
+// IdxChecksum returns the checksum of the .idx file itself.
 func (x *Idx) IdxChecksum() OID {
 	return x.idxChecksum
 }
 
 // Lookup searches the index for oid and returns its packfile byte offset and entry CRC32.
 func (x *Idx) Lookup(oid OID) (uint64, uint32, bool) {
-	var lo int
-	if oid[0] > 0 {
-		lo = int(x.fanout[oid[0]-1])
+	if oid.Len() != x.Algorithm().Size() {
+		return 0, 0, false
 	}
-	hi := int(x.fanout[oid[0]])
+	first := oid.FirstByte()
+	var lo int
+	if first > 0 {
+		lo = int(x.fanout[first-1])
+	}
+	hi := int(x.fanout[first])
 	if lo >= hi {
 		return 0, 0, false
 	}
 
 	rel := sort.Search(hi-lo, func(i int) bool {
-		return bytes.Compare(x.oids[lo+i][:], oid[:]) >= 0
+		return x.oids[lo+i].Compare(oid) >= 0
 	})
 	pos := lo + rel
 	if pos < hi && x.oids[pos] == oid {

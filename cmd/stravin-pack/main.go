@@ -209,6 +209,7 @@ func (d *staticRepoDiscoverer) DiscoverTargets(ctx context.Context) ([]compactio
 				RefShards:      meta.RefShards,
 				OriginRegion:   d.region,
 				Tier:           compaction.Tier0,
+				ObjectFormat:   meta.EffectiveObjectFormat(),
 			})
 		}
 	}
