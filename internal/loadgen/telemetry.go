@@ -23,6 +23,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
+
+	"stravin.dev/core/internal/telemetry"
 )
 
 const (
@@ -272,6 +274,7 @@ func buildTelemetry(
 		"stravin_loadgen_op_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Duration of loadgen operations in seconds"),
+		telemetry.WithDurationSecondsBuckets(),
 	)
 	if err != nil {
 		return nil, err

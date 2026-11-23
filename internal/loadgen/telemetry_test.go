@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,8 @@ import (
 
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
+	"stravin.dev/core/internal/telemetry"
 )
 
 func TestInMemoryTelemetryExportsTracesMetricsLogsOnShutdown(t *testing.T) {
@@ -133,5 +136,52 @@ func TestTelemetryParallelShutdownDoesNotStarveFastExporters(t *testing.T) {
 	}
 	if !errors.Is(err, errSlow) || !errors.Is(err, errFast) {
 		t.Fatalf("Shutdown error = %v, want both %v and %v", err, errSlow, errFast)
+	}
+}
+
+func TestOpDurationHistogram_UsesSecondScaleBuckets(t *testing.T) {
+	var logBuf bytes.Buffer
+	tel, exp, err := NewInMemoryTelemetry(&logBuf)
+	if err != nil {
+		t.Fatalf("NewInMemoryTelemetry: %v", err)
+	}
+	defer func() { _ = tel.Shutdown(context.Background()) }()
+
+	ctx := context.Background()
+	tel.RecordOp(ctx, PersonaDev, "smoke", "fetch", "ok", 4*time.Millisecond)
+	tel.RecordOp(ctx, PersonaDev, "smoke", "fetch", "ok", 20*time.Millisecond)
+
+	var rm metricdata.ResourceMetrics
+	if err := exp.MetricReader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	var dp *metricdata.HistogramDataPoint[float64]
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "stravin_loadgen_op_duration_seconds" {
+				continue
+			}
+			hist, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("data type = %T, want metricdata.Histogram[float64]", m.Data)
+			}
+			if len(hist.DataPoints) != 1 {
+				t.Fatalf("data points = %d, want 1", len(hist.DataPoints))
+			}
+			dp = &hist.DataPoints[0]
+		}
+	}
+	if dp == nil {
+		t.Fatal("stravin_loadgen_op_duration_seconds not found")
+	}
+	if !slices.Equal(dp.Bounds, telemetry.DurationSecondsBuckets) {
+		t.Fatalf("Bounds = %v, want %v", dp.Bounds, telemetry.DurationSecondsBuckets)
+	}
+	if dp.BucketCounts[1] != 1 {
+		t.Errorf("bucket (0.001, 0.005] count = %d, want 1 (counts: %v)", dp.BucketCounts[1], dp.BucketCounts)
+	}
+	if dp.BucketCounts[3] != 1 {
+		t.Errorf("bucket (0.01, 0.025] count = %d, want 1 (counts: %v)", dp.BucketCounts[3], dp.BucketCounts)
 	}
 }

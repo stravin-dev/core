@@ -38,6 +38,7 @@ func NewMetrics(provider *telemetry.Provider) (*Metrics, error) {
 		"stravin_edge_request_duration_seconds",
 		metric.WithDescription("Duration of Git ingress requests in seconds."),
 		metric.WithUnit("s"),
+		telemetry.WithDurationSecondsBuckets(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("edge: init stravin_edge_request_duration_seconds: %w", err)
