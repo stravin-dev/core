@@ -114,7 +114,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Cumulative unexpected client/oracle errors across all personas (must remain zero).",
+      "description": "Unexpected client/oracle errors over the selected time range across all personas (must remain zero).",
       "fieldConfig": {
         "defaults": {
           "thresholds": {
@@ -141,7 +141,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(stravin_loadgen_unexpected_errors_total) or vector(0)",
+          "expr": "round(sum(increase(stravin_loadgen_unexpected_errors_total[$__range])) or vector(0))",
           "legendFormat": "unexpected errors",
           "refId": "A"
         }
@@ -151,7 +151,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Cumulative git fsck --full --strict integrity failures (must remain zero).",
+      "description": "git fsck --full --strict integrity failures over the selected time range (must remain zero).",
       "fieldConfig": {
         "defaults": {
           "thresholds": {
@@ -178,7 +178,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(stravin_loadgen_fsck_failures_total) or vector(0)",
+          "expr": "round(sum(increase(stravin_loadgen_fsck_failures_total[$__range])) or vector(0))",
           "legendFormat": "git fsck failures",
           "refId": "A"
         }

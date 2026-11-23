@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -327,10 +328,55 @@ func assertCoreDashboardRowsAndGrid(t *testing.T, dash grafanaDashboard) {
 	}
 }
 
+var counterSelectorRe = regexp.MustCompile(`stravin_[a-z0-9_]+_total(?:\{[^}]*\})?`)
+
+func assertNoUnboundedCounters(t *testing.T, dashboard, panelTitle, expr string) {
+	t.Helper()
+	for _, loc := range counterSelectorRe.FindAllStringIndex(expr, -1) {
+		rest := expr[loc[1]:]
+		if !strings.HasPrefix(rest, "[") {
+			t.Errorf("%s Overview panel %q queries unbounded counter %q in expr %q",
+				dashboard, panelTitle, expr[loc[0]:loc[1]], expr)
+		}
+	}
+}
+
+func assertRangeScopedCounterExpr(t *testing.T, dashboard, panelTitle, expr string) {
+	t.Helper()
+	if !strings.Contains(expr, "increase(") || !strings.Contains(expr, "[$__range]") {
+		t.Errorf("%s Overview error panel %q must use increase(...[$__range]), got %q",
+			dashboard, panelTitle, expr)
+	}
+	if !strings.Contains(expr, "or vector(0)") {
+		t.Errorf("%s Overview error panel %q must include `or vector(0)` for empty ranges, got %q",
+			dashboard, panelTitle, expr)
+	}
+	matches := counterSelectorRe.FindAllStringIndex(expr, -1)
+	if len(matches) == 0 {
+		t.Errorf("%s Overview error panel %q expected at least one counter metric in expr %q",
+			dashboard, panelTitle, expr)
+		return
+	}
+	for _, loc := range matches {
+		rest := expr[loc[1]:]
+		if !strings.HasPrefix(rest, "[$__range]") {
+			t.Errorf("%s Overview error panel %q counter %q must be scoped with [$__range] in expr %q",
+				dashboard, panelTitle, expr[loc[0]:loc[1]], expr)
+		}
+	}
+}
+
 func assertCoreOverviewSection(t *testing.T, sec dashboardSection) {
 	t.Helper()
 	if len(sec.panels) < 6 {
 		t.Fatalf("stravin-core Overview row has %d panels, want at least 6 KPI stat panels", len(sec.panels))
+	}
+
+	requiredRangeScopedPanels := map[string]bool{
+		"System Health (Server Error Rate)":          false,
+		"Total Server Errors":                        false,
+		"Client Canceled (499) & Rate Limited (429)": false,
+		"Compaction & Control Errors":                false,
 	}
 
 	var exprs []string
@@ -352,8 +398,23 @@ func assertCoreOverviewSection(t *testing.T, sec dashboardSection) {
 		if hasGreen && hasRed {
 			thresholdedHealthPanels++
 		}
+		_, mustScopeRange := requiredRangeScopedPanels[p.Title]
+		if mustScopeRange {
+			requiredRangeScopedPanels[p.Title] = true
+		}
 		for _, tgt := range p.Targets {
 			exprs = append(exprs, tgt.Expr)
+			if p.Type == "stat" {
+				assertNoUnboundedCounters(t, "stravin-core", p.Title, tgt.Expr)
+			}
+			if mustScopeRange {
+				assertRangeScopedCounterExpr(t, "stravin-core", p.Title, tgt.Expr)
+			}
+		}
+	}
+	for title, found := range requiredRangeScopedPanels {
+		if !found {
+			t.Errorf("stravin-core Overview row missing expected error stat panel %q", title)
 		}
 	}
 	if statCount < 6 {
@@ -438,6 +499,34 @@ func TestGrafanaDashboards_StravinCoreAndLoadTester(t *testing.T) {
 	assertLoadgenDashboardRowsAndPanels(t, loadgenDash)
 }
 
+func assertLoadgenOverviewSection(t *testing.T, sec dashboardSection) {
+	t.Helper()
+	requiredRangeScopedPanels := map[string]bool{
+		"Unexpected Errors (Total)": false,
+		"git fsck Failures (Total)": false,
+	}
+	for _, p := range sec.panels {
+		if p.Type != "stat" {
+			continue
+		}
+		_, mustScopeRange := requiredRangeScopedPanels[p.Title]
+		if mustScopeRange {
+			requiredRangeScopedPanels[p.Title] = true
+		}
+		for _, tgt := range p.Targets {
+			assertNoUnboundedCounters(t, "stravin-loadgen", p.Title, tgt.Expr)
+			if mustScopeRange {
+				assertRangeScopedCounterExpr(t, "stravin-loadgen", p.Title, tgt.Expr)
+			}
+		}
+	}
+	for title, found := range requiredRangeScopedPanels {
+		if !found {
+			t.Errorf("stravin-loadgen Overview row missing expected error stat panel %q", title)
+		}
+	}
+}
+
 func assertLoadgenDashboardRowsAndPanels(t *testing.T, dash grafanaDashboard) {
 	t.Helper()
 
@@ -484,6 +573,10 @@ func assertLoadgenDashboardRowsAndPanels(t *testing.T, dash grafanaDashboard) {
 		if _, ok := foundRows[wantRow]; !ok {
 			t.Errorf("stravin-loadgen missing collapsible row section matching %q", wantRow)
 		}
+	}
+
+	if overviewSec, ok := foundRows["Overview"]; ok {
+		assertLoadgenOverviewSection(t, overviewSec)
 	}
 
 	// Verify separate Dev & AI Agent scenario distribution pie charts.
