@@ -22,41 +22,47 @@ const (
 	defaultMinPacksTier1 = 1
 	defaultMaxBatchSize  = 100
 	defaultGCGraceWindow = 24 * time.Hour
+
+	// DefaultMaxTier0PackBytes caps the size of individual packs eligible for
+	// Tier-0 streaming merges so large base packs are not repeatedly rewritten.
+	DefaultMaxTier0PackBytes int64 = 16 * 1024 * 1024
 )
 
 // EngineConfig configures the sharded compaction Engine.
 type EngineConfig struct {
-	Leases        *LeaseManager
-	Manifests     ManifestStore
-	ManifestGC    ManifestGCStore
-	Refs          RefLister
-	Strategies    map[Tier]CompactionStrategy
-	MinPacksTier0 int
-	MinPacksTier1 int
-	MaxBatchSize  int
-	GCGraceWindow time.Duration
-	Clock         lease.Clock
-	ULIDGen       func(time.Time) (string, error)
-	Metrics       *Metrics
-	Logger        *slog.Logger
+	Leases            *LeaseManager
+	Manifests         ManifestStore
+	ManifestGC        ManifestGCStore
+	Refs              RefLister
+	Strategies        map[Tier]CompactionStrategy
+	MinPacksTier0     int
+	MinPacksTier1     int
+	MaxTier0PackBytes int64
+	MaxBatchSize      int
+	GCGraceWindow     time.Duration
+	Clock             lease.Clock
+	ULIDGen           func(time.Time) (string, error)
+	Metrics           *Metrics
+	Logger            *slog.Logger
 }
 
 // Engine executes sharded compaction jobs: lease acquisition -> S3 artifact
 // build/upload -> two-phase DynamoDB manifest swap (Publish -> Supersede).
 type Engine struct {
-	leases        *LeaseManager
-	manifests     ManifestStore
-	manifestGC    ManifestGCStore
-	refs          RefLister
-	strategies    map[Tier]CompactionStrategy
-	minPacksTier0 int
-	minPacksTier1 int
-	maxBatchSize  int
-	gcGraceWindow time.Duration
-	clock         lease.Clock
-	ulidGen       func(time.Time) (string, error)
-	metrics       *Metrics
-	logger        *slog.Logger
+	leases            *LeaseManager
+	manifests         ManifestStore
+	manifestGC        ManifestGCStore
+	refs              RefLister
+	strategies        map[Tier]CompactionStrategy
+	minPacksTier0     int
+	minPacksTier1     int
+	maxTier0PackBytes int64
+	maxBatchSize      int
+	gcGraceWindow     time.Duration
+	clock             lease.Clock
+	ulidGen           func(time.Time) (string, error)
+	metrics           *Metrics
+	logger            *slog.Logger
 }
 
 // NewEngine constructs a compaction Engine from cfg.
@@ -78,6 +84,10 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	minTier1 := cfg.MinPacksTier1
 	if minTier1 <= 0 {
 		minTier1 = defaultMinPacksTier1
+	}
+	maxTier0Bytes := cfg.MaxTier0PackBytes
+	if maxTier0Bytes == 0 {
+		maxTier0Bytes = DefaultMaxTier0PackBytes
 	}
 	maxBatch := cfg.MaxBatchSize
 	if maxBatch <= 0 || maxBatch > defaultMaxBatchSize {
@@ -109,19 +119,20 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	}
 
 	return &Engine{
-		leases:        cfg.Leases,
-		manifests:     cfg.Manifests,
-		manifestGC:    cfg.ManifestGC,
-		refs:          cfg.Refs,
-		strategies:    strats,
-		minPacksTier0: minTier0,
-		minPacksTier1: minTier1,
-		maxBatchSize:  maxBatch,
-		gcGraceWindow: grace,
-		clock:         clk,
-		ulidGen:       ulidGen,
-		metrics:       cfg.Metrics,
-		logger:        logger,
+		leases:            cfg.Leases,
+		manifests:         cfg.Manifests,
+		manifestGC:        cfg.ManifestGC,
+		refs:              cfg.Refs,
+		strategies:        strats,
+		minPacksTier0:     minTier0,
+		minPacksTier1:     minTier1,
+		maxTier0PackBytes: maxTier0Bytes,
+		maxBatchSize:      maxBatch,
+		gcGraceWindow:     grace,
+		clock:             clk,
+		ulidGen:           ulidGen,
+		metrics:           cfg.Metrics,
+		logger:            logger,
 	}, nil
 }
 
@@ -191,6 +202,10 @@ func (e *Engine) CompactShard(ctx context.Context, target ShardTarget) (JobResul
 		return JobResult{}, fmt.Errorf("compaction: query shard %d: %w", target.Shard, err)
 	}
 	e.metrics.recordUncompactedPacks(spanCtx, target.Shard, len(activePacks))
+
+	if target.Tier == Tier0 && e.maxTier0PackBytes > 0 {
+		activePacks = filterTier0EligiblePacks(activePacks, e.maxTier0PackBytes)
+	}
 
 	minPacks := e.minPacksTier0
 	if target.Tier == Tier1 {
@@ -379,4 +394,14 @@ func (e *Engine) supersedePhase(ctx context.Context, target ShardTarget, oldPack
 		}
 	}
 	return nil
+}
+
+func filterTier0EligiblePacks(packs []ddb.PackManifest, maxBytes int64) []ddb.PackManifest {
+	eligible := make([]ddb.PackManifest, 0, len(packs))
+	for _, p := range packs {
+		if p.SizeBytes <= maxBytes {
+			eligible = append(eligible, p)
+		}
+	}
+	return eligible
 }

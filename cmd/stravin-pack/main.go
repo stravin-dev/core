@@ -39,6 +39,7 @@ const (
 	defaultLeaseTTL        = 30 * time.Second
 	defaultShutdownTimeout = 5 * time.Second
 	defaultGitExecTimeout  = 10 * time.Minute
+	defaultMinPacksTier0   = 16
 )
 
 type packConfig struct {
@@ -54,6 +55,8 @@ type packConfig struct {
 	GCInterval            time.Duration
 	GCGraceWindow         time.Duration
 	LeaseTTL              time.Duration
+	MinPacksTier0         int
+	MaxTier0PackBytes     int64
 	RequireCRRReplication bool
 	CRRBreakerThreshold   int
 	CRRBreakerCooldown    time.Duration
@@ -91,6 +94,8 @@ func loadConfig() packConfig {
 		GCInterval:            envDuration("STRAVIN_PACK_GC_INTERVAL", defaultGCInterval),
 		GCGraceWindow:         envDuration("STRAVIN_PACK_GC_GRACE", defaultGCGraceWindow),
 		LeaseTTL:              envDuration("STRAVIN_PACK_LEASE_TTL", defaultLeaseTTL),
+		MinPacksTier0:         envInt("STRAVIN_PACK_MIN_PACKS_TIER0", defaultMinPacksTier0),
+		MaxTier0PackBytes:     envInt64("STRAVIN_PACK_MAX_TIER0_PACK_BYTES", compaction.DefaultMaxTier0PackBytes),
 		RequireCRRReplication: envBool("STRAVIN_PACK_REQUIRE_CRR_REPLICATION", false),
 		CRRBreakerThreshold:   envInt("STRAVIN_PACK_CRR_BREAKER_THRESHOLD", compaction.DefaultCRRBreakerThreshold),
 		CRRBreakerCooldown:    envDuration("STRAVIN_PACK_CRR_BREAKER_COOLDOWN", compaction.DefaultCRRBreakerCooldown),
@@ -135,6 +140,18 @@ func envInt(key string, fallback int) int {
 		return fallback
 	}
 	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return fallback
+	}
+	return v
+}
+
+func envInt64(key string, fallback int64) int64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || v <= 0 {
 		return fallback
 	}
@@ -295,12 +312,14 @@ func run(ctx context.Context, cfg packConfig) error {
 	}
 
 	engine, err := compaction.NewEngine(compaction.EngineConfig{
-		Leases:        leaseMgr,
-		Manifests:     ddbRepo,
-		ManifestGC:    gcAdapter,
-		Refs:          ddbRepo,
-		GCGraceWindow: cfg.GCGraceWindow,
-		Metrics:       metrics,
+		Leases:            leaseMgr,
+		Manifests:         ddbRepo,
+		ManifestGC:        gcAdapter,
+		Refs:              ddbRepo,
+		MinPacksTier0:     cfg.MinPacksTier0,
+		MaxTier0PackBytes: cfg.MaxTier0PackBytes,
+		GCGraceWindow:     cfg.GCGraceWindow,
+		Metrics:           metrics,
 		Strategies: map[compaction.Tier]compaction.CompactionStrategy{
 			compaction.Tier0: tier0,
 			compaction.Tier1: tier1,

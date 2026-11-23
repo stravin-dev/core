@@ -418,3 +418,89 @@ func TestWorker_RunAndGracefulShutdown(t *testing.T) {
 		t.Fatalf("expected queue to be drained, got Len=%d", worker.Queue().Len())
 	}
 }
+
+func TestEngine_Tier0SkipsLargePacksAboveMaxTier0PackBytes(t *testing.T) {
+	clk := newStaticClock(time.Date(2026, 11, 22, 18, 0, 0, 0, time.UTC))
+	rk := mustTestRepoKey(t, "tenant-cap", "repo-cap")
+	const manifestShards = 1
+
+	leaseStore := newFakeLeaseStore()
+	manifests := newFakeManifestStore(manifestShards)
+	objects := newFakePackObjectStore(clk)
+
+	objsLarge, cLarge := buildCommitTreeBlob(t, "base.txt", "large base\n", "base commit", nil)
+	packLarge, idxLarge, shaLarge := buildTestGitPack(t, objsLarge...)
+	objsSmall1, cSmall1 := buildCommitTreeBlob(t, "s1.txt", "small 1\n", "small 1", &cLarge)
+	packSmall1, idxSmall1, shaSmall1 := buildTestGitPack(t, objsSmall1...)
+	objsSmall2, _ := buildCommitTreeBlob(t, "s2.txt", "small 2\n", "small 2", &cSmall1)
+	packSmall2, idxSmall2, shaSmall2 := buildTestGitPack(t, objsSmall2...)
+
+	ctx := context.Background()
+	_ = objects.PutPack(ctx, rk, shaLarge, packLarge, idxLarge)
+	_ = objects.PutPack(ctx, rk, shaSmall1, packSmall1, idxSmall1)
+	_ = objects.PutPack(ctx, rk, shaSmall2, packSmall2, idxSmall2)
+
+	// Mark packLarge with a SizeBytes above MaxTier0PackBytes (16 MiB).
+	manifests.put(ddb.PackManifest{
+		Repo: rk, ULID: "01J00000000000000000000001", PackID: shaLarge,
+		SizeBytes: 20 * 1024 * 1024, OriginRegion: "us-east-1", Status: ddb.PackStatusActive, CreatedAt: clk.Now(),
+	})
+	manifests.put(ddb.PackManifest{
+		Repo: rk, ULID: "01J00000000000000000000002", PackID: shaSmall1,
+		SizeBytes: int64(len(packSmall1)), OriginRegion: "us-east-1", Status: ddb.PackStatusActive, CreatedAt: clk.Now(),
+	})
+
+	leaseMgr, _ := NewLeaseManager(leaseStore, LeaseManagerConfig{OwnerID: "w-cap", TTL: 5 * time.Second})
+	tier0, _ := NewTier0Strategy(objects, pack.DefaultLimits())
+	engine, err := NewEngine(EngineConfig{
+		Leases:            leaseMgr,
+		Manifests:         manifests,
+		ManifestGC:        manifests,
+		MinPacksTier0:     2,
+		MaxTier0PackBytes: DefaultMaxTier0PackBytes,
+		Clock:             clk,
+		Strategies:        map[Tier]CompactionStrategy{Tier0: tier0},
+	})
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	// Only 1 small pack is eligible; Tier-0 must skip instead of rewriting the 20 MiB base pack.
+	res1, err := engine.CompactShard(ctx, ShardTarget{
+		Repo: rk, Shard: 0, ManifestShards: manifestShards, OriginRegion: "us-east-1", Tier: Tier0,
+	})
+	if err != nil {
+		t.Fatalf("CompactShard(1): %v", err)
+	}
+	if !res1.Skipped {
+		t.Fatalf("expected Tier-0 to skip when only 1 pack <= MaxTier0PackBytes, got %+v", res1)
+	}
+
+	// Add a second small pack; Tier-0 should merge only the 2 small packs and keep shaLarge ACTIVE.
+	manifests.put(ddb.PackManifest{
+		Repo: rk, ULID: "01J00000000000000000000003", PackID: shaSmall2,
+		SizeBytes: int64(len(packSmall2)), OriginRegion: "us-east-1", Status: ddb.PackStatusActive, CreatedAt: clk.Now(),
+	})
+
+	res2, err := engine.CompactShard(ctx, ShardTarget{
+		Repo: rk, Shard: 0, ManifestShards: manifestShards, OriginRegion: "us-east-1", Tier: Tier0,
+	})
+	if err != nil {
+		t.Fatalf("CompactShard(2): %v", err)
+	}
+	if res2.Skipped || res2.InputPacks != 2 {
+		t.Fatalf("expected Tier-0 to merge 2 small packs, got %+v", res2)
+	}
+
+	active, err := manifests.QueryManifestShard(ctx, rk, 0, "", true)
+	if err != nil {
+		t.Fatalf("QueryManifestShard: %v", err)
+	}
+	activeIDs := make(map[string]bool, len(active))
+	for _, m := range active {
+		activeIDs[m.PackID] = true
+	}
+	if !activeIDs[shaLarge] || !activeIDs[res2.OutputPackID] || len(activeIDs) != 2 {
+		t.Fatalf("expected shaLarge and merged small pack ACTIVE, got %v", activeIDs)
+	}
+}

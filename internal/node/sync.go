@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -19,7 +20,10 @@ import (
 	"stravin.dev/core/internal/tenant"
 )
 
-const defaultMaxConcurrentPackFetches = 8
+const (
+	defaultMaxConcurrentPackFetches = 8
+	defaultPruneReconcileInterval   = 30 * time.Second
+)
 
 // MetadataStore is the narrow DynamoDB read seam used by Materializer.
 // *ddb.Repository satisfies this interface directly.
@@ -44,6 +48,7 @@ type MaterializerConfig struct {
 	Telemetry                *telemetry.Provider
 	Metrics                  *Metrics
 	MaxConcurrentPackFetches int
+	PruneReconcileInterval   time.Duration
 }
 
 // SyncResult holds the authoritative DynamoDB state and pinned NVMe bare-repo handle.
@@ -59,12 +64,16 @@ type SyncResult struct {
 // Materializer implements the GoF Facade / Template Method pipeline for
 // synchronizing DynamoDB metadata and S3 packfiles into the warm NVMe cache.
 type Materializer struct {
-	meta           MetadataStore
-	packs          PackFetcher
-	cache          *cache.Cache
-	tracer         trace.Tracer
-	metrics        *Metrics
-	maxConcurrency int
+	meta                   MetadataStore
+	packs                  PackFetcher
+	cache                  *cache.Cache
+	tracer                 trace.Tracer
+	metrics                *Metrics
+	maxConcurrency         int
+	pruneReconcileInterval time.Duration
+
+	reconcileMu   sync.Mutex
+	lastReconcile map[tenant.RepoKey]time.Time
 }
 
 // NewMaterializer constructs a Materializer with validated dependencies.
@@ -86,13 +95,19 @@ func NewMaterializer(cfg MaterializerConfig) (*Materializer, error) {
 	if maxConc <= 0 {
 		maxConc = defaultMaxConcurrentPackFetches
 	}
+	reconcileInterval := cfg.PruneReconcileInterval
+	if reconcileInterval <= 0 {
+		reconcileInterval = defaultPruneReconcileInterval
+	}
 	return &Materializer{
-		meta:           cfg.Meta,
-		packs:          cfg.Packs,
-		cache:          cfg.Cache,
-		tracer:         tp.Tracer("stravin-node"),
-		metrics:        cfg.Metrics,
-		maxConcurrency: maxConc,
+		meta:                   cfg.Meta,
+		packs:                  cfg.Packs,
+		cache:                  cfg.Cache,
+		tracer:                 tp.Tracer("stravin-node"),
+		metrics:                cfg.Metrics,
+		maxConcurrency:         maxConc,
+		pruneReconcileInterval: reconcileInterval,
+		lastReconcile:          make(map[tenant.RepoKey]time.Time),
 	}, nil
 }
 
@@ -241,7 +256,59 @@ func (m *Materializer) syncManifestPacks(ctx context.Context, repo tenant.RepoKe
 		}
 	}
 
+	if m.shouldReconcilePrune(repo, fetched > 0) {
+		m.pruneSupersededPacks(ctx, repo, meta)
+	}
+
 	return fetched, cached, nil
+}
+
+func (m *Materializer) shouldReconcilePrune(repo tenant.RepoKey, fetchedNewPacks bool) bool {
+	if fetchedNewPacks {
+		return true
+	}
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+	last, ok := m.lastReconcile[repo]
+	return !ok || time.Since(last) >= m.pruneReconcileInterval
+}
+
+func (m *Materializer) markReconciled(repo tenant.RepoKey) {
+	m.reconcileMu.Lock()
+	m.lastReconcile[repo] = time.Now()
+	m.reconcileMu.Unlock()
+}
+
+func (m *Materializer) pruneSupersededPacks(ctx context.Context, repo tenant.RepoKey, meta ddb.RepoMeta) {
+	cachedIDs := m.cache.CachedPackIDs(repo)
+	if len(cachedIDs) == 0 {
+		m.markReconciled(repo)
+		return
+	}
+
+	activeSet := make(map[string]struct{}, len(cachedIDs))
+	for shard := 0; shard < meta.ManifestShards; shard++ {
+		activeEntries, err := m.meta.QueryManifestShard(ctx, repo, shard, "", true)
+		if err != nil {
+			return
+		}
+		for _, pm := range activeEntries {
+			if pm.Status == ddb.PackStatusActive {
+				activeSet[pm.PackID] = struct{}{}
+			}
+		}
+	}
+
+	var stale []string
+	for _, id := range cachedIDs {
+		if _, ok := activeSet[id]; !ok {
+			stale = append(stale, id)
+		}
+	}
+	if len(stale) > 0 {
+		_ = m.cache.PrunePacks(repo, stale)
+	}
+	m.markReconciled(repo)
 }
 
 func (m *Materializer) fetchAndInstallPacks(ctx context.Context, repo tenant.RepoKey, packIDs []string) error {
