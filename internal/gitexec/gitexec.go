@@ -162,6 +162,7 @@ type RepackRequest struct {
 	Quiet            bool
 	WriteMIDX        bool
 	WriteCommitGraph bool
+	StdinPacks       []string
 	Stdout           io.Writer
 	Stderr           io.Writer
 	Timeout          time.Duration
@@ -378,7 +379,17 @@ func (e *SubprocessExecutor) ExecRepack(ctx context.Context, req RepackRequest) 
 		if req.WriteBitmap {
 			args = append(args, "--bitmap")
 		}
-		if err := e.run(ctx, "multi-pack-index", spec, req.RepoDir, args, nil, nil, req.Stdout, req.Stderr, req.Timeout); err != nil {
+		var stdin io.Reader
+		if len(req.StdinPacks) > 0 {
+			for _, p := range req.StdinPacks {
+				if !isSafeGitToken(p) || strings.ContainsAny(p, "/\\") {
+					return fmt.Errorf("%w: invalid stdin pack name %q", ErrInvalidRequest, p)
+				}
+			}
+			args = append(args, "--stdin-packs")
+			stdin = strings.NewReader(strings.Join(req.StdinPacks, "\n") + "\n")
+		}
+		if err := e.run(ctx, "multi-pack-index", spec, req.RepoDir, args, nil, stdin, req.Stdout, req.Stderr, req.Timeout); err != nil {
 			return err
 		}
 	}

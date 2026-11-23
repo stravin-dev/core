@@ -137,6 +137,9 @@ func TestGit3Phase4_Reftable_MIDXBitmapCommitGraph_And_BundleURI_DualHash(t *tes
 			stack.runGit(cloneNoBundle, nil, "fsck", "--full", "--strict")
 
 			// 3. Verify NVMe bare cache repo uses reftable + MIDX + .bitmap + commit-graph.
+			if err := stack.materializer.WaitAuxIndexes(context.Background()); err != nil {
+				t.Fatalf("WaitAuxIndexes: %v", err)
+			}
 			repoPath, err := stack.nvmeCache.RepoPath(rk)
 			if err != nil {
 				t.Fatalf("RepoPath: %v", err)
@@ -228,5 +231,6 @@ func newInMemoryStackWithBundleResolver(t *testing.T, resolver node.BundleURIRes
 
 type inMemoryStackWithCache struct {
 	*inMemoryStack
-	nvmeCache *cache.Cache
+	nvmeCache    *cache.Cache
+	materializer *node.Materializer
 }

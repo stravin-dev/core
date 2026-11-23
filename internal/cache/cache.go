@@ -65,6 +65,8 @@ type repoEntry struct {
 	pins         int
 	pruneGen     uint64         // monotonically incremented when new packs are scheduled for pruning
 	pinsByGen    map[uint64]int // generation -> count of active pins acquired at that generation
+	midxValid    bool           // true when on-disk MIDX was built with --stdin-packs at midxGen
+	midxGen      uint64         // pruneGen at which the on-disk MIDX was built (excludes packs with cutoff < midxGen)
 }
 
 // RepoHandle is a GoF Proxy representing an active reader lease on a materialized
@@ -328,7 +330,7 @@ func (c *Cache) PrunePacks(repo tenant.RepoKey, packIDs []string) error {
 	entry.pruneGen++
 
 	if !hasPinsAtOrBefore(entry, cutoff) {
-		c.unlinkPacksLocked(entry, newlyScheduled)
+		c.unlinkPacksLocked(entry, newlyScheduled, cutoff)
 		c.recordPackMetricsLocked()
 		c.mu.Unlock()
 		return nil
@@ -339,10 +341,55 @@ func (c *Cache) PrunePacks(repo tenant.RepoKey, packIDs []string) error {
 	}
 	// Invalidate any existing multi-pack-index immediately so newer-generation readers
 	// do not open a MIDX referencing packs that will be unlinked once prior pins drain.
+	entry.midxValid = false
 	invalidatePackAuxIndexes(filepath.Join(entry.path, "objects", "pack"))
 	c.recordPackMetricsLocked()
 	c.mu.Unlock()
 	return nil
+}
+
+// ActivePackIdxNames returns a sorted list of active (non-pendingPrune) pack
+// .idx basenames (e.g. "pack-<id>.idx") along with the repository's current
+// prune generation. Callers pass the returned generation to MarkMIDXBuilt after
+// writing a multi-pack-index with --stdin-packs.
+func (c *Cache) ActivePackIdxNames(repo tenant.RepoKey) ([]string, uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.repos[repo]
+	if !ok {
+		return nil, 0
+	}
+	out := make([]string, 0, len(entry.packs))
+	for id := range entry.packs {
+		if _, pending := entry.pendingPrune[id]; pending {
+			continue
+		}
+		out = append(out, packFileBase(id)+".idx")
+	}
+	sort.Strings(out)
+	return out, entry.pruneGen
+}
+
+// MarkMIDXBuilt records that the on-disk multi-pack-index for repo was built
+// using the active pack set from prune generation gen (excluding all packs
+// scheduled for pruning at cutoff < gen). If a newer prune occurred since gen,
+// the newly written MIDX may reference a pending-prune pack, so it is
+// invalidated immediately and MarkMIDXBuilt returns false.
+func (c *Cache) MarkMIDXBuilt(repo tenant.RepoKey, gen uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.repos[repo]
+	if !ok {
+		return false
+	}
+	if gen < entry.pruneGen {
+		entry.midxValid = false
+		invalidatePackAuxIndexes(filepath.Join(entry.path, "objects", "pack"))
+		return false
+	}
+	entry.midxValid = true
+	entry.midxGen = gen
+	return true
 }
 
 // PendingPruneCount returns the number of superseded packs awaiting prior-generation
@@ -569,16 +616,22 @@ func (c *Cache) drainEligiblePrunesLocked(entry *repoEntry) bool {
 		return false
 	}
 	minGen, hasActive := minActivePinGen(entry)
-	var ready []string
+	var (
+		ready     []string
+		maxCutoff uint64
+	)
 	for id, cutoff := range entry.pendingPrune {
 		if !hasActive || cutoff < minGen {
+			if len(ready) == 0 || cutoff > maxCutoff {
+				maxCutoff = cutoff
+			}
 			ready = append(ready, id)
 		}
 	}
 	if len(ready) == 0 {
 		return false
 	}
-	c.unlinkPacksLocked(entry, ready)
+	c.unlinkPacksLocked(entry, ready, maxCutoff)
 	return true
 }
 
@@ -671,7 +724,7 @@ func (c *Cache) evictLocked(exclude tenant.RepoKey) []tenant.RepoKey {
 	return evicted
 }
 
-func (c *Cache) unlinkPacksLocked(entry *repoEntry, packIDs []string) {
+func (c *Cache) unlinkPacksLocked(entry *repoEntry, packIDs []string, maxCutoff uint64) {
 	packDir := filepath.Join(entry.path, "objects", "pack")
 	var removedCount int64
 	for _, id := range packIDs {
@@ -692,7 +745,12 @@ func (c *Cache) unlinkPacksLocked(entry *repoEntry, packIDs []string) {
 		removedCount++
 	}
 	if removedCount > 0 {
-		invalidatePackAuxIndexes(packDir)
+		// Only invalidate MIDX/bitmap if the on-disk MIDX was not rebuilt after
+		// maxCutoff (i.e. could still reference one of the unlinked packs).
+		if !entry.midxValid || entry.midxGen <= maxCutoff {
+			entry.midxValid = false
+			invalidatePackAuxIndexes(packDir)
+		}
 		c.metrics.recordPacksPruned(removedCount)
 	}
 	if c.tenantBytes[entry.key.TenantID] <= 0 {

@@ -107,6 +107,7 @@ func TestServer_AdvertiseRefsStrictlyFromDynamoDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
+	t.Cleanup(mat.Close)
 
 	nodeSrv, err := NewServer(ServerConfig{
 		Materializer: mat,
@@ -189,6 +190,7 @@ func TestServer_ReceivePackWriteHandlerSeam(t *testing.T) {
 		Packs: newFakePackFetcher(),
 		Cache: c,
 	})
+	t.Cleanup(mat.Close)
 
 	// Default server returns Unimplemented for git-receive-pack.
 	defaultSrv, err := NewServer(ServerConfig{
@@ -296,6 +298,7 @@ func TestServer_UploadPackRealGitRoundTripOverBufconn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
+	t.Cleanup(mat.Close)
 
 	nodeSrv, err := NewServer(ServerConfig{
 		Materializer: mat,
@@ -493,6 +496,7 @@ func setupTestNodeServer(t *testing.T, execImpl gitexec.GitExecutor, wh WriteHan
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
+	t.Cleanup(mat.Close)
 
 	metrics := NewMetrics(tp, "us-east-1")
 	srv, err := NewServer(ServerConfig{

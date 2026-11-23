@@ -329,6 +329,86 @@ func TestExecRepackGeneratesMIDXAndCommitGraphRealGit(t *testing.T) {
 	}
 }
 
+func TestExecRepackMIDXStdinPacksRealGit(t *testing.T) {
+	requireGit(t)
+	bareDir, _ := createBareRepoWithCommits(t, 2)
+
+	execImpl := NewSubprocessExecutor(Config{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	// Repack into one pack first so we have a known valid pack+idx pair.
+	if err := execImpl.ExecRepack(context.Background(), RepackRequest{
+		RepoDir:         bareDir,
+		Repack:          true,
+		All:             true,
+		DeleteRedundant: true,
+	}); err != nil {
+		t.Fatalf("initial ExecRepack: %v", err)
+	}
+
+	packDir := filepath.Join(bareDir, "objects", "pack")
+	idxMatches, err := filepath.Glob(filepath.Join(packDir, "pack-*.idx"))
+	if err != nil || len(idxMatches) != 1 {
+		t.Fatalf("expected 1 pack .idx after repack, got %v (err=%v)", idxMatches, err)
+	}
+	activeIdx := filepath.Base(idxMatches[0])
+	activeBase := strings.TrimSuffix(activeIdx, ".idx")
+
+	// Duplicate the pack+idx under a second filename to simulate a pending-prune pack.
+	pendingBase := "pack-0000000000000000000000000000000000000001"
+	for _, ext := range []string{".pack", ".idx"} {
+		data, readErr := os.ReadFile(filepath.Join(packDir, activeBase+ext))
+		if readErr != nil {
+			t.Fatalf("read %s%s: %v", activeBase, ext, readErr)
+		}
+		if writeErr := os.WriteFile(filepath.Join(packDir, pendingBase+ext), data, 0o600); writeErr != nil {
+			t.Fatalf("write %s%s: %v", pendingBase, ext, writeErr)
+		}
+	}
+
+	// Build MIDX + .bitmap including ONLY activeIdx via --stdin-packs.
+	if err := execImpl.ExecRepack(context.Background(), RepackRequest{
+		RepoDir:     bareDir,
+		WriteMIDX:   true,
+		WriteBitmap: true,
+		StdinPacks:  []string{activeIdx},
+	}); err != nil {
+		t.Fatalf("ExecRepack with StdinPacks: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(packDir, "multi-pack-index")); err != nil {
+		t.Fatalf("expected multi-pack-index: %v", err)
+	}
+	bitmaps, err := filepath.Glob(filepath.Join(packDir, "multi-pack-index-*.bitmap"))
+	if err != nil || len(bitmaps) == 0 {
+		t.Fatalf("expected multi-pack-index .bitmap, got %v (err=%v)", bitmaps, err)
+	}
+
+	// Delete the excluded pending-prune pack+idx and verify MIDX still passes git verification.
+	for _, ext := range []string{".pack", ".idx"} {
+		if err := os.Remove(filepath.Join(packDir, pendingBase+ext)); err != nil {
+			t.Fatalf("remove %s%s: %v", pendingBase, ext, err)
+		}
+	}
+	verifyCmd := exec.Command("git", "--git-dir", bareDir, "multi-pack-index", "verify")
+	if out, err := verifyCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git multi-pack-index verify failed after deleting excluded pack: %v\n%s", err, string(out))
+	}
+
+	// Invalid StdinPacks entries must be rejected.
+	for _, bad := range []string{"../escape.idx", "pack-a.idx\npack-b.idx", ""} {
+		err := execImpl.ExecRepack(context.Background(), RepackRequest{
+			RepoDir:    bareDir,
+			WriteMIDX:  true,
+			StdinPacks: []string{bad},
+		})
+		if !errors.Is(err, ErrInvalidRequest) {
+			t.Errorf("ExecRepack StdinPacks=[%q] err = %v, want ErrInvalidRequest", bad, err)
+		}
+	}
+}
+
 func TestContextCancellationKillsProcessGroup(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
 	helperPath := filepath.Join(t.TempDir(), "slow-git.sh")
