@@ -46,6 +46,13 @@ jobs:
           go-version: ${{ steps.tools.outputs.go }}
           cache: true
 
+      - name: Ensure zstd is installed
+        run: |
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y zstd
+          fi
+
       - name: Cross-compile and package Stravin binaries
         run: |
           set -euo pipefail
@@ -55,7 +62,7 @@ jobs:
           fi
 
           stage_dir="dist/stravin-core-${RELEASE_TAG}-${{ matrix.target }}"
-          archive="stravin-core-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
+          archive="stravin-core-${RELEASE_TAG}-${{ matrix.target }}.tar.zst"
           checksum="${archive}.sha256"
           mkdir -p "${stage_dir}"
 
@@ -78,7 +85,7 @@ jobs:
               -o "${stage_dir}/${bin}" "./cmd/${bin}"
           done
 
-          tar -C dist -czf "dist/${archive}" "stravin-core-${RELEASE_TAG}-${{ matrix.target }}"
+          tar -cf - -C dist "stravin-core-${RELEASE_TAG}-${{ matrix.target }}" | zstd -T0 -19 --long=27 -o "dist/${archive}"
           (
             cd dist
             sha256sum "${archive}" > "${checksum}"
@@ -87,6 +94,6 @@ jobs:
       - name: Upload release artifacts
         run: |
           set -euo pipefail
-          archive="dist/stravin-core-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
+          archive="dist/stravin-core-${RELEASE_TAG}-${{ matrix.target }}.tar.zst"
           checksum="${archive}.sha256"
           gh release upload "${RELEASE_TAG}" "${archive}" "${checksum}" --clobber
