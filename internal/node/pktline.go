@@ -149,6 +149,42 @@ func AdvertiseRefs(refs []ddb.RefState, defaultBranch string, opts AdvertiseOpti
 	return buf.Bytes()
 }
 
+// AdvertiseV2Capabilities encodes a Git Wire Protocol v2 capability
+// advertisement strictly from DynamoDB RepoMeta (never consulting local disk).
+// Per gitprotocol-v2(5), Protocol v2 is advertised for git-upload-pack;
+// git-receive-pack continues to use v0/v1 via AdvertiseRefs.
+func AdvertiseV2Capabilities(opts AdvertiseOptions) []byte {
+	serviceName := strings.TrimSpace(opts.ServiceName)
+	if serviceName == "" {
+		serviceName = defaultServiceName
+	}
+	agent := strings.TrimSpace(opts.Agent)
+	if agent == "" {
+		agent = defaultGitAgent
+	}
+	objFormat := ddb.NormalizeObjectFormat(opts.ObjectFormat)
+
+	var buf bytes.Buffer
+	if opts.IncludeServiceHeader {
+		buf.Write(EncodePktLine([]byte("# service=" + serviceName + "\n")))
+		buf.Write(FlushPkt)
+	}
+
+	caps := []string{
+		"version 2",
+		"agent=" + agent,
+		"ls-refs=unborn",
+		"fetch=shallow wait-for-done filter",
+		"server-option",
+		"object-format=" + string(objFormat),
+	}
+	for _, capLine := range caps {
+		buf.Write(EncodePktLine([]byte(capLine + "\n")))
+	}
+	buf.Write(FlushPkt)
+	return buf.Bytes()
+}
+
 func receivePackCapabilities(agent string, objFormat ddb.ObjectFormat) string {
 	caps := []string{
 		"report-status",

@@ -98,6 +98,7 @@ func isCorruptionMessage(msg string) bool {
 		"corrupt",
 		"hash mismatch",
 		"invalid sha1",
+		"invalid sha256",
 		"broken link",
 		"dangling",
 		"fsck",

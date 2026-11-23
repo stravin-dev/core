@@ -57,9 +57,10 @@ type RequestMeta struct {
 	RepoID      tenant.RepoID
 	Operation   Operation
 	TraceParent string
+	GitProtocol string
 }
 
-// Validate checks that TenantID, RepoID, Operation, and optional TraceParent are well-formed.
+// Validate checks that TenantID, RepoID, Operation, and optional TraceParent/GitProtocol are well-formed.
 func (m RequestMeta) Validate() error {
 	if err := m.TenantID.Validate(); err != nil {
 		return err
@@ -72,6 +73,12 @@ func (m RequestMeta) Validate() error {
 	}
 	if m.TraceParent != "" && strings.ContainsAny(m.TraceParent, "\r\n\x00") {
 		return errors.New("rpc: invalid traceparent header")
+	}
+	if m.GitProtocol != "" {
+		clean, ok := SanitizeGitProtocol(m.GitProtocol)
+		if !ok || clean != m.GitProtocol {
+			return errors.New("rpc: invalid git-protocol header")
+		}
 	}
 	return nil
 }
@@ -94,6 +101,9 @@ func InjectMetadata(ctx context.Context, meta RequestMeta) (context.Context, err
 	if meta.TraceParent != "" {
 		pairs = append(pairs, HeaderTraceParent, meta.TraceParent)
 	}
+	if meta.GitProtocol != "" {
+		pairs = append(pairs, HeaderGitProtocol, meta.GitProtocol)
+	}
 	return metadata.AppendToOutgoingContext(ctx, pairs...), nil
 }
 
@@ -108,6 +118,7 @@ func ExtractMetadata(ctx context.Context) (RequestMeta, error) {
 		RepoID:      tenant.RepoID(firstValue(md, HeaderRepoID)),
 		Operation:   Operation(firstValue(md, HeaderOperation)),
 		TraceParent: firstValue(md, HeaderTraceParent),
+		GitProtocol: firstValue(md, HeaderGitProtocol),
 	}
 	if err := meta.Validate(); err != nil {
 		return RequestMeta{}, status.Error(codes.InvalidArgument, err.Error())

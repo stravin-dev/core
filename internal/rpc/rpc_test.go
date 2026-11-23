@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -18,12 +19,62 @@ import (
 	"stravin.dev/core/internal/tenant"
 )
 
+func TestSanitizeGitProtocol(t *testing.T) {
+	valid := []struct {
+		in      string
+		want    string
+		wantVer string
+	}{
+		{in: "version=0", want: "version=0", wantVer: "0"},
+		{in: "version=1", want: "version=1", wantVer: "1"},
+		{in: "version=2", want: "version=2", wantVer: "2"},
+		{in: "version=2:object-format=sha256", want: "version=2:object-format=sha256", wantVer: "2"},
+		{in: "version=2:object-format=sha1:agent=git/2.54.0-Darwin", want: "version=2:object-format=sha1:agent=git/2.54.0-Darwin", wantVer: "2"},
+		{in: "object-format=sha256", want: "object-format=sha256", wantVer: ""},
+	}
+	for _, tc := range valid {
+		got, ok := rpc.SanitizeGitProtocol(tc.in)
+		if !ok || got != tc.want {
+			t.Errorf("SanitizeGitProtocol(%q) = (%q, %v), want (%q, true)", tc.in, got, ok, tc.want)
+		}
+		if ver := rpc.GitProtocolVersion(got); ver != tc.wantVer {
+			t.Errorf("GitProtocolVersion(%q) = %q, want %q", got, ver, tc.wantVer)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"version=3",
+		"version=2\r\nX-Injected: 1",
+		"version=2\n",
+		"version=2\x00",
+		"version=2; rm -rf /",
+		"version=2:LD_PRELOAD=/tmp/evil.so",
+		"object-format=md5",
+		"version=2:version=1",
+		"object-format=sha1:object-format=sha256",
+		":version=2",
+		"version=2:",
+		"version=2::object-format=sha256",
+		"version=2 ",
+		"agent=",
+		"agent=git/2.54;id",
+		"agent=" + strings.Repeat("a", rpc.MaxGitProtocolLen),
+	}
+	for _, in := range invalid {
+		if got, ok := rpc.SanitizeGitProtocol(in); ok {
+			t.Errorf("SanitizeGitProtocol(%q) = (%q, true), want rejected", in, got)
+		}
+	}
+}
+
 func TestMetadataRoundTrip(t *testing.T) {
 	meta := rpc.RequestMeta{
 		TenantID:    "acme",
 		RepoID:      "core",
 		Operation:   rpc.OpUploadPack,
 		TraceParent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		GitProtocol: "version=2:object-format=sha256",
 	}
 
 	outCtx, err := rpc.InjectMetadata(context.Background(), meta)
@@ -52,6 +103,8 @@ func TestMetadataValidationRejectsInvalid(t *testing.T) {
 		{TenantID: "acme", RepoID: "../bad", Operation: rpc.OpUploadPack},
 		{TenantID: "acme", RepoID: "core", Operation: "git-shell"},
 		{TenantID: "acme", RepoID: "core", Operation: rpc.OpReceivePack, TraceParent: "bad\nheader"},
+		{TenantID: "acme", RepoID: "core", Operation: rpc.OpUploadPack, GitProtocol: "version=2\nLD_PRELOAD=1"},
+		{TenantID: "acme", RepoID: "core", Operation: rpc.OpUploadPack, GitProtocol: "unknown=token"},
 	}
 	for _, meta := range bad {
 		if _, err := rpc.InjectMetadata(context.Background(), meta); err == nil {

@@ -59,6 +59,7 @@ type UploadPackRequest struct {
 	RepoDir       string
 	AdvertiseRefs bool
 	StatelessRPC  bool
+	GitProtocol   string
 	Stdin         io.Reader
 	Stdout        io.Writer
 	Stderr        io.Writer
@@ -192,7 +193,20 @@ func (e *SubprocessExecutor) ExecUploadPack(ctx context.Context, req UploadPackR
 		return ErrEmptyRepoDir
 	}
 
-	args := []string{"-c", "uploadpack.allowReachableSHA1InWant=true", "upload-pack"}
+	var extraEnv []string
+	if req.GitProtocol != "" {
+		if !isSafeGitProtocolEnv(req.GitProtocol) {
+			return fmt.Errorf("%w: invalid GIT_PROTOCOL value", ErrInvalidRequest)
+		}
+		extraEnv = []string{"GIT_PROTOCOL=" + req.GitProtocol}
+	}
+
+	args := []string{
+		"-c", "uploadpack.allowReachableSHA1InWant=true",
+		"-c", "uploadpack.allowAnySHA1InWant=true",
+		"-c", "uploadpack.allowFilter=true",
+		"upload-pack",
+	}
 	if req.StatelessRPC {
 		args = append(args, "--stateless-rpc")
 	}
@@ -206,7 +220,7 @@ func (e *SubprocessExecutor) ExecUploadPack(ctx context.Context, req UploadPackR
 		RepoDir:  req.RepoDir,
 		ReadOnly: true,
 	}
-	return e.run(ctx, "upload-pack", spec, req.RepoDir, args, req.Stdin, req.Stdout, req.Stderr, req.Timeout)
+	return e.run(ctx, "upload-pack", spec, req.RepoDir, args, extraEnv, req.Stdin, req.Stdout, req.Stderr, req.Timeout)
 }
 
 // ExecIndexPack invokes `git index-pack` for validating/indexing a packfile
@@ -240,7 +254,7 @@ func (e *SubprocessExecutor) ExecIndexPack(ctx context.Context, req IndexPackReq
 		StagingDir: req.StagingDir,
 		ReadOnly:   req.StagingDir != "",
 	}
-	return e.run(ctx, "index-pack", spec, req.RepoDir, args, req.Stdin, req.Stdout, req.Stderr, req.Timeout)
+	return e.run(ctx, "index-pack", spec, req.RepoDir, args, nil, req.Stdin, req.Stdout, req.Stderr, req.Timeout)
 }
 
 // ExecRepack runs configured compaction steps (git repack, multi-pack-index,
@@ -276,7 +290,7 @@ func (e *SubprocessExecutor) ExecRepack(ctx context.Context, req RepackRequest) 
 		if req.Quiet {
 			args = append(args, "-q")
 		}
-		if err := e.run(ctx, "repack", spec, req.RepoDir, args, nil, req.Stdout, req.Stderr, req.Timeout); err != nil {
+		if err := e.run(ctx, "repack", spec, req.RepoDir, args, nil, nil, req.Stdout, req.Stderr, req.Timeout); err != nil {
 			return err
 		}
 	}
@@ -286,14 +300,14 @@ func (e *SubprocessExecutor) ExecRepack(ctx context.Context, req RepackRequest) 
 		if req.WriteBitmap {
 			args = append(args, "--bitmap")
 		}
-		if err := e.run(ctx, "multi-pack-index", spec, req.RepoDir, args, nil, req.Stdout, req.Stderr, req.Timeout); err != nil {
+		if err := e.run(ctx, "multi-pack-index", spec, req.RepoDir, args, nil, nil, req.Stdout, req.Stderr, req.Timeout); err != nil {
 			return err
 		}
 	}
 
 	if req.WriteCommitGraph {
 		args := []string{"--git-dir", req.RepoDir, "commit-graph", "write", "--reachable", "--changed-paths"}
-		if err := e.run(ctx, "commit-graph", spec, req.RepoDir, args, nil, req.Stdout, req.Stderr, req.Timeout); err != nil {
+		if err := e.run(ctx, "commit-graph", spec, req.RepoDir, args, nil, nil, req.Stdout, req.Stderr, req.Timeout); err != nil {
 			return err
 		}
 	}
@@ -307,6 +321,7 @@ func (e *SubprocessExecutor) run(
 	spec SandboxSpec,
 	workDir string,
 	subArgs []string,
+	extraEnv []string,
 	stdin io.Reader,
 	stdout io.Writer,
 	stderr io.Writer,
@@ -333,7 +348,7 @@ func (e *SubprocessExecutor) run(
 	}()
 
 	fullArgs := buildGitArgs(subArgs...)
-	env := scrubbedEnv(e.allowedPATH)
+	env := scrubbedEnv(e.allowedPATH, extraEnv...)
 
 	stderrBuf := newLimitedBuffer(e.maxStderrBytes)
 	stderrWriter := io.Writer(stderrBuf)
@@ -429,17 +444,37 @@ func (e *SubprocessExecutor) handleSandboxFallback(cause error) {
 
 // scrubbedEnv constructs the minimal allowlisted environment for every git
 // subprocess, preventing host secrets or AWS credentials from leaking.
-func scrubbedEnv(allowedPATH string) []string {
+func scrubbedEnv(allowedPATH string, extraEnv ...string) []string {
 	if allowedPATH == "" {
 		allowedPATH = DefaultAllowedPATH
 	}
-	return []string{
-		"PATH=" + allowedPATH,
+	env := make([]string, 0, 5+len(extraEnv))
+	env = append(env,
+		"PATH="+allowedPATH,
 		"HOME=/nonexistent",
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_TERMINAL_PROMPT=0",
+	)
+	env = append(env, extraEnv...)
+	return env
+}
+
+// isSafeGitProtocolEnv provides defense-in-depth validation on GIT_PROTOCOL
+// before injecting it into the scrubbed git subprocess environment.
+func isSafeGitProtocolEnv(v string) bool {
+	if v == "" || len(v) > 128 {
+		return false
 	}
+	for i := 0; i < len(v); i++ {
+		b := v[i]
+		isAlphaNum := (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+		isAllowed := b == '.' || b == '_' || b == '=' || b == ':' || b == '/' || b == '-'
+		if !isAlphaNum && !isAllowed {
+			return false
+		}
+	}
+	return true
 }
 
 // buildGitArgs prepends mandatory config attack-surface lockdown flags before
