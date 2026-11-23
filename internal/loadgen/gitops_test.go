@@ -135,3 +135,22 @@ func TestExtractHTTPStatusAndRedactToken(t *testing.T) {
 		t.Errorf("secret not redacted: %q", redacted)
 	}
 }
+
+func TestGitClientBuildEnvSSHConnectTimeout(t *testing.T) {
+	g := NewGitClient(t.TempDir(), GitOptions{SSHKey: "/tmp/test_key"})
+	env := g.buildEnv()
+
+	var sshCmd string
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GIT_SSH_COMMAND=") {
+			sshCmd = strings.TrimPrefix(kv, "GIT_SSH_COMMAND=")
+			break
+		}
+	}
+	if sshCmd == "" {
+		t.Fatal("expected GIT_SSH_COMMAND to be set when SSHKey is configured")
+	}
+	if !strings.Contains(sshCmd, "-o ConnectTimeout=5") {
+		t.Errorf("GIT_SSH_COMMAND = %q, want -o ConnectTimeout=5", sshCmd)
+	}
+}
