@@ -1,3 +1,11 @@
+# [1.8.0](https://github.com/stravin-dev/core/compare/v1.7.2...v1.8.0) (2026-11-23)
+
+
+### Features
+
+* **observability:** add NVMe cache pruning and aux-index failure metrics to stravin-core dashboard ([bc9fc1f](https://github.com/stravin-dev/core/commit/bc9fc1f60ae557222d092391e6dde43590ec3b18))
+* **observability:** add NVMe cache pruning and aux-index failure metrics to stravin-core dashboard ([#140](https://github.com/stravin-dev/core/issues/140)) ([c48872a](https://github.com/stravin-dev/core/commit/c48872aab87d39d863f8c84e939d3067ec661c02))
+
 ## [1.7.2](https://github.com/stravin-dev/core/compare/v1.7.1...v1.7.2) (2026-11-23)
 
 
