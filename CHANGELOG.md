@@ -1,3 +1,16 @@
+# [1.6.0](https://github.com/stravin-dev/core/compare/v1.5.0...v1.6.0) (2026-11-23)
+
+
+### Bug Fixes
+
+* **cache:** invalidate multi-pack-index and bitmap when unlinking pruned packs ([6893156](https://github.com/stravin-dev/core/commit/68931564f6332227ba3f529ab2cee6610d8818bb))
+
+
+### Features
+
+* **node,storage:** adopt reftable NVMe cache, MIDX/bitmap/commit-graph, and bundle-uri offload ([f9fb3aa](https://github.com/stravin-dev/core/commit/f9fb3aa0adef72be89bbdb3c64ffd5f07687b06c))
+* **node,storage:** adopt reftable NVMe cache, MIDX/bitmap/commit-graph, and bundle-uri offload ([#124](https://github.com/stravin-dev/core/issues/124)) ([b00e6d7](https://github.com/stravin-dev/core/commit/b00e6d7cb85cdb15c17eed816203c5868ade9a74))
+
 # [1.5.0](https://github.com/stravin-dev/core/compare/v1.4.0...v1.5.0) (2026-11-23)
 
 
