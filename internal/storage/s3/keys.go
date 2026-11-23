@@ -54,6 +54,14 @@ func WasmHookKey(wasmSHA256 string) (string, error) {
 	return fmt.Sprintf("hooks/%s.wasm", sha), nil
 }
 
+// BundleKey returns "bundles/{tenant_id}/{repo_id}/latest.bundle".
+func BundleKey(repo tenant.RepoKey) (string, error) {
+	if err := repo.Validate(); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("bundles/%s/%s/latest.bundle", repo.TenantID, repo.RepoID), nil
+}
+
 func auxKey(repo tenant.RepoKey, hashPrefixOrSHA, manifestEpoch, ext string) (string, error) {
 	if err := repo.Validate(); err != nil {
 		return "", err

@@ -16,6 +16,7 @@ import (
 	"stravin.dev/core/internal/pack"
 	"stravin.dev/core/internal/storage/ddb"
 	"stravin.dev/core/internal/storage/s3"
+	"stravin.dev/core/internal/tenant"
 )
 
 const (
@@ -82,7 +83,17 @@ func (s *Tier1Strategy) Compact(ctx context.Context, req StrategyRequest) (Strat
 	algo := pack.DefaultHashAlgorithm(req.HashAlgorithm)
 	trailerBytes := algo.Size()
 
-	if err := initBareRepoLayout(tmpDir, algo); err != nil {
+	if refExec, ok := s.gitExec.(gitexec.BareRepoExecutor); ok {
+		if err := refExec.ExecInitBare(ctx, gitexec.InitBareRequest{
+			Repo:         req.Repo,
+			RepoDir:      tmpDir,
+			ObjectFormat: pack.DefaultHashAlgorithm(algo).Name(),
+			RefFormat:    "reftable",
+			Timeout:      s.timeout,
+		}); err != nil {
+			return StrategyResult{}, fmt.Errorf("compaction tier1: init reftable bare repo: %w", err)
+		}
+	} else if err := initBareRepoLayout(tmpDir, algo); err != nil {
 		return StrategyResult{}, fmt.Errorf("compaction tier1: init bare repo: %w", err)
 	}
 
@@ -130,10 +141,15 @@ func (s *Tier1Strategy) Compact(ctx context.Context, req StrategyRequest) (Strat
 		}
 	}
 
-	if err := writePackedRefs(tmpDir, req.Refs, discoveredCommits); err != nil {
+	if refExec, ok := s.gitExec.(gitexec.BareRepoExecutor); ok {
+		if err := populateTier1Refs(ctx, refExec, req.Repo, tmpDir, req.Refs, discoveredCommits, s.timeout); err != nil {
+			return StrategyResult{}, fmt.Errorf("compaction tier1: update refs: %w", err)
+		}
+	} else if err := writePackedRefs(tmpDir, req.Refs, discoveredCommits); err != nil {
 		return StrategyResult{}, fmt.Errorf("compaction tier1: write packed-refs: %w", err)
 	}
 
+	hasReachableRefs := len(req.Refs) > 0 || len(discoveredCommits) > 0
 	repackReq := gitexec.RepackRequest{
 		Repo:             req.Repo,
 		RepoDir:          tmpDir,
@@ -142,7 +158,8 @@ func (s *Tier1Strategy) Compact(ctx context.Context, req StrategyRequest) (Strat
 		DeleteRedundant:  true,
 		Quiet:            true,
 		WriteMIDX:        true,
-		WriteCommitGraph: true,
+		WriteBitmap:      hasReachableRefs,
+		WriteCommitGraph: hasReachableRefs,
 		Timeout:          s.timeout,
 	}
 	if err := s.gitExec.ExecRepack(ctx, repackReq); err != nil {
@@ -189,12 +206,75 @@ func (s *Tier1Strategy) Compact(ctx context.Context, req StrategyRequest) (Strat
 		return StrategyResult{}, fmt.Errorf("compaction tier1: read commit-graph: %w", err)
 	}
 
+	var bundleKey string
+	if len(req.Refs) > 0 {
+		if bundleExec, ok := s.gitExec.(gitexec.BundleExecutor); ok {
+			if bundlePutter, ok := s.store.(BundlePutter); ok {
+				bundlePath := filepath.Join(tmpDir, "latest.bundle")
+				if err := bundleExec.ExecBundleCreate(ctx, gitexec.BundleCreateRequest{
+					Repo:       req.Repo,
+					RepoDir:    tmpDir,
+					OutputPath: bundlePath,
+					Timeout:    s.timeout,
+				}); err == nil {
+					//nolint:gosec // bundlePath is strictly inside our ephemeral MkdirTemp directory
+					if bundleBytes, readErr := os.ReadFile(bundlePath); readErr == nil && len(bundleBytes) > 0 {
+						if err := bundlePutter.PutBundle(ctx, req.Repo, bundleBytes); err != nil {
+							return StrategyResult{}, fmt.Errorf("compaction tier1: upload bundle: %w", err)
+						}
+						bundleKey, _ = s3.BundleKey(req.Repo)
+					}
+				}
+			}
+		}
+	}
+
 	return StrategyResult{
 		OutputPackID: packSHA256,
 		OutputSize:   int64(len(packBytes)),
 		AuxMIDXKey:   auxMIDXKey,
 		AuxGraphKey:  auxGraphKey,
+		BundleKey:    bundleKey,
 	}, nil
+}
+
+func populateTier1Refs(ctx context.Context, refExec gitexec.BareRepoExecutor, repo tenant.RepoKey, dir string, refs []ddb.RefState, fallbackCommits []pack.OID, timeout time.Duration) error {
+	var updates []gitexec.RefUpdateSpec
+	if len(refs) > 0 {
+		sorted := make([]ddb.RefState, len(refs))
+		copy(sorted, refs)
+		sort.Slice(sorted, func(i, j int) bool {
+			return sorted[i].RefName < sorted[j].RefName
+		})
+		for _, r := range sorted {
+			if r.OID == "" || ddb.IsZeroOID(r.OID) || r.RefName == "" {
+				continue
+			}
+			updates = append(updates, gitexec.RefUpdateSpec{
+				RefName: r.RefName,
+				NewOID:  r.OID,
+			})
+		}
+	} else if len(fallbackCommits) > 0 {
+		sort.Slice(fallbackCommits, func(i, j int) bool {
+			return fallbackCommits[i].Compare(fallbackCommits[j]) < 0
+		})
+		for i, oid := range fallbackCommits {
+			updates = append(updates, gitexec.RefUpdateSpec{
+				RefName: fmt.Sprintf("refs/heads/stravin-pack-%d", i),
+				NewOID:  oid.String(),
+			})
+		}
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	return refExec.ExecUpdateRef(ctx, gitexec.UpdateRefRequest{
+		Repo:    repo,
+		RepoDir: dir,
+		Updates: updates,
+		Timeout: timeout,
+	})
 }
 
 func initBareRepoLayout(dir string, algo pack.HashAlgorithm) error {

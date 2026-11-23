@@ -59,6 +59,7 @@ type JobResult struct {
 	BytesReclaimed int64
 	AuxMIDXKey     string
 	AuxGraphKey    string
+	BundleKey      string
 	Skipped        bool
 }
 
@@ -121,6 +122,12 @@ type PackObjectStore interface {
 	ListRepoPacks(ctx context.Context, repo tenant.RepoKey) ([]s3.PackObjectInfo, error)
 }
 
+// BundlePutter optionally uploads a repository Git bundle to S3 after Tier-1
+// compaction so stravin-node can advertise it over Protocol v2 bundle-uri.
+type BundlePutter interface {
+	PutBundle(ctx context.Context, repo tenant.RepoKey, data []byte) error
+}
+
 // StrategyRequest passes inputs to a CompactionStrategy implementation.
 type StrategyRequest struct {
 	Repo          tenant.RepoKey
@@ -138,6 +145,7 @@ type StrategyResult struct {
 	OutputSize   int64
 	AuxMIDXKey   string
 	AuxGraphKey  string
+	BundleKey    string
 }
 
 // CompactionStrategy is the GoF Strategy interface implemented by Tier-0

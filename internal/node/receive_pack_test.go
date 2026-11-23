@@ -1181,12 +1181,39 @@ func TestReceivePack_RefDirectoryCollisions(t *testing.T) {
 		}
 	})
 
+	seedExistingRef := func(t *testing.T, env *testReceivePackEnv, refName, content string) string {
+		t.Helper()
+		oid, _, packBytes := buildSyntheticCommitPack(t, content, "seed "+refName+"\n", nil)
+		parsed, err := pack.Parse(bytes.NewReader(packBytes), pack.ParseOptions{})
+		if err != nil {
+			t.Fatalf("parse seed pack: %v", err)
+		}
+		idxBytes, err := pack.BuildIdx(parsed)
+		if err != nil {
+			t.Fatalf("build seed idx: %v", err)
+		}
+		sum := sha256.Sum256(packBytes)
+		packID := hex.EncodeToString(sum[:])
+		if err := env.s3Store.PutPack(context.Background(), env.rk, packID, packBytes, idxBytes); err != nil {
+			t.Fatalf("put seed pack: %v", err)
+		}
+		env.ddbStore.AddManifest(env.rk, 0, ddb.PackManifest{
+			Repo:         env.rk,
+			ULID:         "01ARZ3NDEKTSV4RRFFQ69G5FZ0",
+			PackID:       packID,
+			SizeBytes:    int64(len(packBytes)),
+			OriginRegion: "us-east-1",
+			Status:       ddb.PackStatusActive,
+		})
+		env.ddbStore.SetRefs(env.rk, []ddb.RefState{
+			{Repo: env.rk, RefName: refName, OID: oid.String(), PackID: packID},
+		})
+		return oid.String()
+	}
+
 	t.Run("DeleteParentAndCreateChildInSameBatchAllowed", func(t *testing.T) {
 		env := newTestReceivePackEnv(t, "replace-parent-with-child")
-		existingOID := strings.Repeat("c", 40)
-		env.ddbStore.SetRefs(env.rk, []ddb.RefState{
-			{Repo: env.rk, RefName: "refs/heads/a", OID: existingOID},
-		})
+		existingOID := seedExistingRef(t, env, "refs/heads/a", "seed-a\n")
 
 		commitOID, _, packBytes := buildSyntheticCommitPack(t, "replace\n", "replace commit\n", nil)
 		wire := buildPushWirePayload(
@@ -1216,10 +1243,7 @@ func TestReceivePack_RefDirectoryCollisions(t *testing.T) {
 
 	t.Run("DeleteChildAndCreateParentInSameBatchAllowed", func(t *testing.T) {
 		env := newTestReceivePackEnv(t, "replace-child-with-parent")
-		existingOID := strings.Repeat("d", 40)
-		env.ddbStore.SetRefs(env.rk, []ddb.RefState{
-			{Repo: env.rk, RefName: "refs/heads/a/b", OID: existingOID},
-		})
+		existingOID := seedExistingRef(t, env, "refs/heads/a/b", "seed-ab\n")
 
 		commitOID, _, packBytes := buildSyntheticCommitPack(t, "replace2\n", "replace2 commit\n", nil)
 		wire := buildPushWirePayload(
@@ -1249,10 +1273,7 @@ func TestReceivePack_RefDirectoryCollisions(t *testing.T) {
 
 	t.Run("SiblingNamePrefixAllowed", func(t *testing.T) {
 		env := newTestReceivePackEnv(t, "sibling-prefix")
-		existingOID := strings.Repeat("e", 40)
-		env.ddbStore.SetRefs(env.rk, []ddb.RefState{
-			{Repo: env.rk, RefName: "refs/heads/a", OID: existingOID},
-		})
+		_ = seedExistingRef(t, env, "refs/heads/a", "seed-sibling\n")
 
 		commitOID, _, packBytes := buildSyntheticCommitPack(t, "sibling\n", "sibling commit\n", nil)
 		wire := buildPushWirePayload(

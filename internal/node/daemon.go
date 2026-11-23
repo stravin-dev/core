@@ -209,12 +209,15 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 	refresher.Start(ctx)
 	defer refresher.Stop()
 
+	gitExec := gitexec.NewSubprocessExecutor(resolveGitExecConfig(cfg.GitExec, logger))
 	materializer, err := NewMaterializer(MaterializerConfig{
-		Meta:      ddbRepo,
-		Packs:     s3Store,
-		Cache:     nvmeCache,
-		Telemetry: tp,
-		Metrics:   metrics,
+		Meta:        ddbRepo,
+		Packs:       s3Store,
+		Cache:       nvmeCache,
+		GitExecutor: gitExec,
+		Telemetry:   tp,
+		Metrics:     metrics,
+		Logger:      logger,
 	})
 	if err != nil {
 		return fmt.Errorf("node: init materializer: %w", err)
@@ -248,11 +251,11 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 		}
 	}
 
-	gitExec := gitexec.NewSubprocessExecutor(resolveGitExecConfig(cfg.GitExec, logger))
 	nodeSrv, err := NewServer(ServerConfig{
 		Materializer:   materializer,
 		GitExecutor:    gitExec,
 		WriteHandler:   writeHandler,
+		BundleResolver: NewS3BundleURIResolver(s3Store, 0),
 		LeaseRefresher: refresher,
 		Telemetry:      tp,
 		Metrics:        metrics,

@@ -73,6 +73,8 @@ type AdvertiseOptions struct {
 	Agent string
 	// ObjectFormat specifies the repository's Git object hash format (defaults to sha1).
 	ObjectFormat ddb.ObjectFormat
+	// AdvertiseBundleURI includes the Protocol v2 `bundle-uri` capability when true.
+	AdvertiseBundleURI bool
 }
 
 // AdvertiseRefs encodes a standard Git protocol v1 pkt-line ref advertisement
@@ -177,6 +179,9 @@ func AdvertiseV2Capabilities(opts AdvertiseOptions) []byte {
 		"fetch=shallow wait-for-done filter",
 		"server-option",
 		"object-format=" + string(objFormat),
+	}
+	if opts.AdvertiseBundleURI {
+		caps = append(caps, "bundle-uri")
 	}
 	for _, capLine := range caps {
 		buf.Write(EncodePktLine([]byte(capLine + "\n")))

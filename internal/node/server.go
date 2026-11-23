@@ -21,6 +21,7 @@ import (
 	"stravin.dev/core/internal/gitexec"
 	"stravin.dev/core/internal/rpc"
 	"stravin.dev/core/internal/storage/ddb"
+	"stravin.dev/core/internal/storage/s3"
 	"stravin.dev/core/internal/telemetry"
 	"stravin.dev/core/internal/tenant"
 )
@@ -53,11 +54,58 @@ func (UnimplementedWriteHandler) HandleReceivePack(_ context.Context, _ rpc.Requ
 	return status.Error(codes.Unimplemented, ErrWriteNotImplemented.Error())
 }
 
+// BundleURIResolver resolves an optional presigned bundle URL for Protocol v2
+// bundle-uri cold-clone offload. Returning ("", nil) means no bundle exists.
+type BundleURIResolver interface {
+	ResolveBundleURI(ctx context.Context, repo tenant.RepoKey) (string, error)
+}
+
+// BundlePresigner is the narrow S3 presign seam satisfied by *s3.Store.
+type BundlePresigner interface {
+	PresignBundleURL(ctx context.Context, repo tenant.RepoKey, expiry time.Duration) (string, error)
+}
+
+// S3BundleURIResolver resolves presigned S3 bundle URLs via *s3.Store.
+type S3BundleURIResolver struct {
+	presigner BundlePresigner
+	expiry    time.Duration
+}
+
+// NewS3BundleURIResolver creates a BundleURIResolver backed by an S3 presigner.
+func NewS3BundleURIResolver(presigner BundlePresigner, expiry time.Duration) *S3BundleURIResolver {
+	if presigner == nil {
+		return nil
+	}
+	if expiry <= 0 {
+		expiry = 15 * time.Minute
+	}
+	return &S3BundleURIResolver{presigner: presigner, expiry: expiry}
+}
+
+// ResolveBundleURI returns a validated presigned bundle URL or ("", nil) when absent.
+func (r *S3BundleURIResolver) ResolveBundleURI(ctx context.Context, repo tenant.RepoKey) (string, error) {
+	if r == nil || r.presigner == nil {
+		return "", nil
+	}
+	u, err := r.presigner.PresignBundleURL(ctx, repo, r.expiry)
+	if err != nil {
+		if errors.Is(err, s3.ErrNotFound) {
+			return "", nil
+		}
+		return "", err
+	}
+	if err := gitexec.ValidateBundleURI(u); err != nil {
+		return "", err
+	}
+	return u, nil
+}
+
 // ServerConfig configures the stravin-node gRPC GitWire server.
 type ServerConfig struct {
 	Materializer   *Materializer
 	GitExecutor    gitexec.GitExecutor
 	WriteHandler   WriteHandler
+	BundleResolver BundleURIResolver
 	LeaseRefresher *LeaseRefresher
 	Telemetry      *telemetry.Provider
 	Metrics        *Metrics
@@ -70,6 +118,7 @@ type Server struct {
 	materializer   *Materializer
 	gitExec        gitexec.GitExecutor
 	writeHandler   WriteHandler
+	bundleResolver BundleURIResolver
 	leaseRefresher *LeaseRefresher
 	tracer         trace.Tracer
 	metrics        *Metrics
@@ -107,6 +156,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		materializer:   cfg.Materializer,
 		gitExec:        cfg.GitExecutor,
 		writeHandler:   wh,
+		bundleResolver: cfg.BundleResolver,
 		leaseRefresher: cfg.LeaseRefresher,
 		tracer:         tp.Tracer("stravin-node"),
 		metrics:        metrics,
@@ -222,12 +272,14 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 
 	stdoutW := &streamChunkWriter{stream: stream}
 	var stderrBuf bytes.Buffer
+	bundleURI := s.resolveBundleURI(execCtx, repo, meta.GitProtocol)
 
 	execErr := s.gitExec.ExecUploadPack(execCtx, gitexec.UploadPackRequest{
 		Repo:         repo,
 		RepoDir:      syncRes.Handle.Path(),
 		StatelessRPC: statelessRPC,
 		GitProtocol:  meta.GitProtocol,
+		BundleURI:    bundleURI,
 		Stdin:        stdinR,
 		Stdout:       stdoutW,
 		Stderr:       &stderrBuf,
@@ -295,6 +347,7 @@ func (s *Server) serveAdvertiseRefs(ctx context.Context, repoKey tenant.RepoKey,
 
 	var payload []byte
 	if rpc.GitProtocolVersion(gitProtocol) == "2" {
+		opts.AdvertiseBundleURI = s.resolveBundleURI(ctx, repoKey, gitProtocol) != ""
 		payload = AdvertiseV2Capabilities(opts)
 	} else {
 		payload = AdvertiseRefs(refs, repoMeta.DefaultBranch, opts)
@@ -306,6 +359,31 @@ func (s *Server) serveAdvertiseRefs(ctx context.Context, repoKey tenant.RepoKey,
 		}
 	}
 	return stream.Send(&rpc.Frame{EOF: true, ExitCode: 0})
+}
+
+func (s *Server) resolveBundleURI(ctx context.Context, repo tenant.RepoKey, gitProtocol string) string {
+	if s.bundleResolver == nil || rpc.GitProtocolVersion(gitProtocol) != "2" {
+		return ""
+	}
+	uri, err := s.bundleResolver.ResolveBundleURI(ctx, repo)
+	if err != nil {
+		s.logger.DebugContext(ctx, "node: skipped bundle-uri resolution",
+			"repo", repo.String(),
+			"error", err,
+		)
+		return ""
+	}
+	if uri == "" {
+		return ""
+	}
+	if err := gitexec.ValidateBundleURI(uri); err != nil {
+		s.logger.WarnContext(ctx, "node: rejected invalid bundle-uri",
+			"repo", repo.String(),
+			"error", err,
+		)
+		return ""
+	}
+	return uri
 }
 
 type streamChunkWriter struct {

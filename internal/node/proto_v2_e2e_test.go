@@ -76,6 +76,10 @@ type inMemoryStack struct {
 }
 
 func newInMemoryStack(t *testing.T) *inMemoryStack {
+	return newInMemoryStackWithOptions(t, nil).inMemoryStack
+}
+
+func newInMemoryStackWithOptions(t *testing.T, bundleResolver node.BundleURIResolver) *inMemoryStackWithCache {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git binary not installed")
@@ -127,6 +131,7 @@ func newInMemoryStack(t *testing.T) *inMemoryStack {
 		Materializer:   mat,
 		GitExecutor:    gitExec,
 		WriteHandler:   recvHandler,
+		BundleResolver: bundleResolver,
 		LeaseRefresher: refresher,
 		Region:         string(region),
 	})
@@ -223,7 +228,10 @@ func newInMemoryStack(t *testing.T) *inMemoryStack {
 			fn()
 		}
 	})
-	return s
+	return &inMemoryStackWithCache{
+		inMemoryStack: s,
+		nvmeCache:     nvmeCache,
+	}
 }
 
 func (s *inMemoryStack) createRepo(repoID string, format ddb.ObjectFormat) tenant.RepoKey {
