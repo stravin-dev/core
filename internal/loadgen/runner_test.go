@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"sync/atomic"
 	"testing"
@@ -21,6 +22,12 @@ func (s *stubScenario) Name() string                                    { return
 func (s *stubScenario) Persona() Persona                                { return s.persona }
 func (s *stubScenario) Weight() int                                     { return s.weight }
 func (s *stubScenario) Run(ctx context.Context, env *ScenarioEnv) error { return s.fn(ctx, env) }
+
+type stubSSHScenario struct {
+	stubScenario
+}
+
+func (s *stubSSHScenario) RequiresSSH() bool { return true }
 
 func TestRegistryWeightedSelectionDeterminism(t *testing.T) {
 	reg := NewRegistry()
@@ -180,4 +187,144 @@ func TestRunnerFailFastOnUnexpectedError(t *testing.T) {
 		t.Fatalf("FailFast took too long (%v); should cancel think-time immediately", elapsed)
 	}
 	_ = errors.New
+}
+
+func TestNewRunnerSkipsSSHScenariosWithoutSSHKey(t *testing.T) {
+	noop := func(context.Context, *ScenarioEnv) error { return nil }
+	makeRegistry := func() *Registry {
+		reg := NewRegistry()
+		reg.MustRegister(&stubScenario{name: "dev-http", persona: PersonaDev, weight: 10, fn: noop})
+		reg.MustRegister(&stubSSHScenario{stubScenario: stubScenario{name: "dev-ssh", persona: PersonaDev, weight: 10, fn: noop}})
+		reg.MustRegister(&stubScenario{name: "agent-http", persona: PersonaAgent, weight: 10, fn: noop})
+		reg.MustRegister(&stubSSHScenario{stubScenario: stubScenario{name: "agent-ssh", persona: PersonaAgent, weight: 10, fn: noop}})
+		return reg
+	}
+
+	tests := []struct {
+		name           string
+		sshKey         string
+		sshAddr        string
+		scenarios      []string
+		devs           int
+		agents         int
+		wantDevCount   int
+		wantAgentCount int
+	}{
+		{
+			name:           "skips ssh scenarios when ssh-key empty",
+			sshKey:         "",
+			sshAddr:        "127.0.0.1:2222",
+			devs:           1,
+			agents:         1,
+			wantDevCount:   1,
+			wantAgentCount: 1,
+		},
+		{
+			name:           "keeps ssh scenarios when ssh-key set",
+			sshKey:         "/tmp/id_ed25519",
+			sshAddr:        "127.0.0.1:2222",
+			devs:           1,
+			agents:         1,
+			wantDevCount:   2,
+			wantAgentCount: 2,
+		},
+		{
+			name:           "keeps ssh scenarios when ssh-addr uses file scheme",
+			sshKey:         "",
+			sshAddr:        "file:///tmp/repos",
+			devs:           1,
+			agents:         1,
+			wantDevCount:   2,
+			wantAgentCount: 2,
+		},
+		{
+			name:           "keeps ssh scenario when explicitly selected",
+			sshKey:         "",
+			sshAddr:        "127.0.0.1:2222",
+			scenarios:      []string{"dev-ssh"},
+			devs:           1,
+			agents:         0,
+			wantDevCount:   1,
+			wantAgentCount: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Devs = tc.devs
+			cfg.Agents = tc.agents
+			cfg.SSHKey = tc.sshKey
+			cfg.SSHAddr = tc.sshAddr
+			cfg.Scenarios = tc.scenarios
+
+			var logBuf bytes.Buffer
+			tel, _, err := NewInMemoryTelemetry(&logBuf)
+			if err != nil {
+				t.Fatalf("NewInMemoryTelemetry: %v", err)
+			}
+			defer func() { _ = tel.Shutdown(context.Background()) }()
+
+			runner, err := NewRunner(cfg, makeRegistry(), tel, NewOracle())
+			if err != nil {
+				t.Fatalf("NewRunner: %v", err)
+			}
+			if got := len(runner.registry.Scenarios(PersonaDev)); got != tc.wantDevCount {
+				t.Errorf("dev scenarios = %d, want %d", got, tc.wantDevCount)
+			}
+			if got := len(runner.registry.Scenarios(PersonaAgent)); got != tc.wantAgentCount {
+				t.Errorf("agent scenarios = %d, want %d", got, tc.wantAgentCount)
+			}
+		})
+	}
+}
+
+func TestRunnerClassifiesPerCommandTimeoutAsTransientNotCanceled(t *testing.T) {
+	var runs atomic.Int64
+	reg := NewRegistry()
+	reg.MustRegister(&stubScenario{
+		name:    "dev-timeout",
+		persona: PersonaDev,
+		weight:  10,
+		fn: func(ctx context.Context, env *ScenarioEnv) error {
+			runs.Add(1)
+			return &GitError{
+				Op:       "clone",
+				ExitCode: -1,
+				Err:      fmt.Errorf("git clone timed out after 30s: %w", context.DeadlineExceeded),
+			}
+		},
+	})
+
+	cfg := DefaultConfig()
+	cfg.Devs = 1
+	cfg.Agents = 0
+	cfg.Seed = 7
+	cfg.ThinkMin = 5 * time.Millisecond
+	cfg.ThinkMax = 10 * time.Millisecond
+	cfg.Duration = 60 * time.Millisecond
+	cfg.FailFast = true
+
+	var logBuf bytes.Buffer
+	tel, _, err := NewInMemoryTelemetry(&logBuf)
+	if err != nil {
+		t.Fatalf("NewInMemoryTelemetry: %v", err)
+	}
+	defer func() { _ = tel.Shutdown(context.Background()) }()
+
+	runner, err := NewRunner(cfg, reg, tel, NewOracle())
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	res := runner.Run(context.Background())
+	if runs.Load() == 0 {
+		t.Fatal("expected scenario to execute at least once")
+	}
+	if res.Oracle.TotalOps == 0 {
+		t.Fatalf("expected TotalOps > 0 (classified as retryable_transient, not canceled); got %+v", res.Oracle)
+	}
+	if res.Oracle.HasFailures() {
+		t.Fatalf("expected 0 unexpected failures for per-command timeout, got %+v", res.Oracle)
+	}
 }

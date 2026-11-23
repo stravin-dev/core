@@ -165,20 +165,48 @@ func TestExtractHTTPStatusAndRedactToken(t *testing.T) {
 }
 
 func TestGitClientBuildEnvSSHConnectTimeout(t *testing.T) {
-	g := NewGitClient(t.TempDir(), GitOptions{SSHKey: "/tmp/test_key"})
-	env := g.buildEnv()
+	tests := []struct {
+		name        string
+		sshKey      string
+		wantKeyFlag bool
+	}{
+		{name: "without ssh key", sshKey: "", wantKeyFlag: false},
+		{name: "with ssh key", sshKey: "/tmp/test_key", wantKeyFlag: true},
+	}
 
-	var sshCmd string
-	for _, kv := range env {
-		if strings.HasPrefix(kv, "GIT_SSH_COMMAND=") {
-			sshCmd = strings.TrimPrefix(kv, "GIT_SSH_COMMAND=")
-			break
-		}
+	requiredFlags := []string{
+		"-o StrictHostKeyChecking=no",
+		"-o UserKnownHostsFile=/dev/null",
+		"-o BatchMode=yes",
+		"-o ConnectTimeout=5",
 	}
-	if sshCmd == "" {
-		t.Fatal("expected GIT_SSH_COMMAND to be set when SSHKey is configured")
-	}
-	if !strings.Contains(sshCmd, "-o ConnectTimeout=5") {
-		t.Errorf("GIT_SSH_COMMAND = %q, want -o ConnectTimeout=5", sshCmd)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewGitClient(t.TempDir(), GitOptions{SSHKey: tc.sshKey})
+			env := g.buildEnv()
+
+			var sshCmd string
+			for _, kv := range env {
+				if strings.HasPrefix(kv, "GIT_SSH_COMMAND=") {
+					sshCmd = strings.TrimPrefix(kv, "GIT_SSH_COMMAND=")
+				}
+			}
+			if sshCmd == "" {
+				t.Fatal("expected GIT_SSH_COMMAND to always be set")
+			}
+			for _, flag := range requiredFlags {
+				if !strings.Contains(sshCmd, flag) {
+					t.Errorf("GIT_SSH_COMMAND = %q, want %q", sshCmd, flag)
+				}
+			}
+			keyFlag := "-i " + tc.sshKey
+			if tc.wantKeyFlag && !strings.Contains(sshCmd, keyFlag) {
+				t.Errorf("GIT_SSH_COMMAND = %q, want %q", sshCmd, keyFlag)
+			}
+			if !tc.wantKeyFlag && strings.Contains(sshCmd, " -i ") {
+				t.Errorf("GIT_SSH_COMMAND = %q, must not include -i when SSHKey is empty", sshCmd)
+			}
+		})
 	}
 }

@@ -634,6 +634,7 @@ type agentProtocolSwitchHTTPSSH struct{}
 func (s *agentProtocolSwitchHTTPSSH) Name() string             { return "agent_protocol_switch_http_ssh" }
 func (s *agentProtocolSwitchHTTPSSH) Persona() loadgen.Persona { return loadgen.PersonaAgent }
 func (s *agentProtocolSwitchHTTPSSH) Weight() int              { return 8 }
+func (s *agentProtocolSwitchHTTPSSH) RequiresSSH() bool        { return true }
 
 func (s *agentProtocolSwitchHTTPSSH) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
@@ -43,11 +44,12 @@ func (e *GitError) Error() string {
 
 func (e *GitError) Unwrap() error { return e.Err }
 
-// GitOptions configures auth and SSH settings for GitClient.
+// GitOptions configures auth, SSH, and timeout settings for GitClient.
 type GitOptions struct {
-	AuthToken string
-	SSHKey    string
-	ExtraEnv  []string
+	AuthToken  string
+	SSHKey     string
+	CmdTimeout time.Duration
+	ExtraEnv   []string
 }
 
 // GitClient wraps local git CLI operations inside an isolated per-worker directory.
@@ -82,8 +84,15 @@ func (g *GitClient) Run(ctx context.Context, args ...string) (string, error) {
 		op = args[0]
 	}
 
+	cmdCtx := ctx
+	if g.opts.CmdTimeout > 0 {
+		var cancel context.CancelFunc
+		cmdCtx, cancel = context.WithTimeout(ctx, g.opts.CmdTimeout)
+		defer cancel()
+	}
+
 	fullArgs := g.buildArgs(args)
-	cmd := exec.CommandContext(ctx, "git", fullArgs...) //#nosec G204 -- loadgen invokes local git CLI with controlled arguments
+	cmd := exec.CommandContext(cmdCtx, "git", fullArgs...) //#nosec G204 -- loadgen invokes local git CLI with controlled arguments
 	configureGitCommand(cmd)
 	if g.workDir != "" {
 		if info, err := os.Stat(g.workDir); err == nil && info.IsDir() {
@@ -104,6 +113,9 @@ func (g *GitClient) Run(ctx context.Context, args ...string) (string, error) {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
+		}
+		if ctx.Err() == nil && errors.Is(cmdCtx.Err(), context.DeadlineExceeded) {
+			err = fmt.Errorf("git %s timed out after %s: %w", op, g.opts.CmdTimeout, context.DeadlineExceeded)
 		}
 		return outStr, &GitError{
 			Op:         op,
@@ -249,10 +261,11 @@ func (g *GitClient) buildArgs(args []string) []string {
 
 func (g *GitClient) buildEnv() []string {
 	env := append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	sshCmd := "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5"
 	if g.opts.SSHKey != "" {
-		sshCmd := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5", g.opts.SSHKey)
-		env = append(env, "GIT_SSH_COMMAND="+sshCmd)
+		sshCmd += " -i " + g.opts.SSHKey
 	}
+	env = append(env, "GIT_SSH_COMMAND="+sshCmd)
 	if len(g.opts.ExtraEnv) > 0 {
 		env = append(env, g.opts.ExtraEnv...)
 	}
