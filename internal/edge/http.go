@@ -1,6 +1,7 @@
 package edge
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/base64"
@@ -63,6 +64,7 @@ type HTTPHandler struct {
 	metrics                  *Metrics
 	logger                   *slog.Logger
 	probes                   *health.Registry
+	packCache                *PackCacheCoordinator
 	maxDecompressedBodyBytes int64
 }
 
@@ -127,6 +129,13 @@ func (h *HTTPHandler) SetMaxDecompressedBodyBytes(limit int64) {
 	if limit > 0 {
 		h.maxDecompressedBodyBytes = limit
 	}
+}
+
+// SetPackCache attaches an optional external full-clone pack response cache
+// coordinator. Cache lookups always run strictly after authentication,
+// tenant authorization, rate limiting, and repository resolution.
+func (h *HTTPHandler) SetPackCache(c *PackCacheCoordinator) {
+	h.packCache = c
 }
 
 // ServeHTTP dispatches health probes and Smart HTTP Git endpoints.
@@ -226,7 +235,12 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		prefix:      route.responsePrefix,
 	}
 
-	var stdin io.Reader
+	var (
+		stdin        io.Reader
+		stdout       io.Writer = sw
+		captureW     *boundedCaptureWriter
+		finishFlight func([]byte)
+	)
 	proxyCtx := ctx
 	switch route.kind {
 	case routeInfoRefs:
@@ -240,16 +254,61 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer closeBody()
 		stdin = NewByteLimitingReader(ctx, body, h.limiter, route.repo.TenantID)
 		proxyCtx = metadata.AppendToOutgoingContext(ctx, headerStatelessRPC, "true")
+
+		if route.kind == routeUploadPack && h.packCache != nil && rpc.GitProtocolVersion(rpcMeta.GitProtocol) == "2" {
+			reqBytes, completeEOF, readErr := readBoundedRequest(stdin, maxV2FetchCacheReqBytes)
+			if readErr != nil {
+				h.handleProxyError(w, ctx, sw, route, readErr, start)
+				return
+			}
+			switch {
+			case completeEOF && IsCacheableV2FullCloneFetch(reqBytes):
+				cacheKey := UploadPackCacheKey(route.repo, rpcMeta.GitProtocol, reqBytes)
+				cachedResp, finish, hit, waitErr := h.packCache.GetOrJoin(ctx, cacheKey)
+				if waitErr != nil {
+					h.handleProxyError(w, ctx, sw, route, waitErr, start)
+					return
+				}
+				if hit {
+					if _, wErr := sw.Write(cachedResp); wErr != nil {
+						h.handleProxyError(w, ctx, sw, route, wErr, start)
+						return
+					}
+					sw.ensureHeader()
+					if sw.unflushed > 0 {
+						sw.flush()
+					}
+					h.metrics.RecordRequest(ctx, "http", route.metricOp, strconv.Itoa(http.StatusOK), "", time.Since(start))
+					return
+				}
+				if finish != nil {
+					finishFlight = finish
+					defer finishFlight(nil)
+					if capBytes := h.packCache.MaxCaptureBytes(); capBytes > 0 {
+						captureW = &boundedCaptureWriter{
+							dst:      sw,
+							maxBytes: capBytes,
+						}
+						stdout = captureW
+					}
+				}
+				stdin = bytes.NewReader(reqBytes)
+			case completeEOF:
+				stdin = bytes.NewReader(reqBytes)
+			default:
+				stdin = io.MultiReader(bytes.NewReader(reqBytes), stdin)
+			}
+		}
 	}
 
-	exitCode, err := h.proxy.ProxyStream(proxyCtx, peer, rpcMeta, stdin, sw, nil)
+	exitCode, err := h.proxy.ProxyStream(proxyCtx, peer, rpcMeta, stdin, stdout, nil)
 	if err != nil && route.kind == routeInfoRefs && !sw.wroteHeader && isTransientInfoRefsError(ctx, err) {
 		timer := time.NewTimer(infoRefsRetryBackoff)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 		case <-timer.C:
-			exitCode, err = h.proxy.ProxyStream(proxyCtx, peer, rpcMeta, stdin, sw, nil)
+			exitCode, err = h.proxy.ProxyStream(proxyCtx, peer, rpcMeta, stdin, stdout, nil)
 		}
 	}
 	if err != nil {
@@ -271,6 +330,14 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"exit_code", exitCode,
 		)
 		return
+	}
+
+	if finishFlight != nil {
+		if captureW != nil && !captureW.exceeded {
+			finishFlight(captureW.buf.Bytes())
+		} else {
+			finishFlight(nil)
+		}
 	}
 
 	h.metrics.RecordRequest(ctx, "http", route.metricOp, strconv.Itoa(http.StatusOK), "", time.Since(start))
