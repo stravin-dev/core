@@ -122,3 +122,81 @@ func TestGRPCNodeDialerWithConfig_AuthToken(t *testing.T) {
 		}
 	})
 }
+
+type stubDialer struct {
+	client rpc.GitWireClient
+}
+
+func (d stubDialer) Client(string) (rpc.GitWireClient, error) { return d.client, nil }
+
+type stubGitWireClient struct {
+	open func(ctx context.Context, meta rpc.RequestMeta) (rpc.GitWireStream, error)
+}
+
+func (c stubGitWireClient) OpenStream(ctx context.Context, meta rpc.RequestMeta) (rpc.GitWireStream, error) {
+	return c.open(ctx, meta)
+}
+
+type sendEOFStream struct {
+	ctx      context.Context
+	sendDone chan struct{}
+	recvErr  error
+}
+
+func (s *sendEOFStream) Context() context.Context { return s.ctx }
+
+func (s *sendEOFStream) Send(*rpc.Frame) error {
+	select {
+	case <-s.sendDone:
+	default:
+		close(s.sendDone)
+	}
+	return io.EOF
+}
+
+func (s *sendEOFStream) Recv() (*rpc.Frame, error) {
+	<-s.sendDone
+	if err := s.ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, s.recvErr
+}
+
+func TestWireProxy_SendEOFPreservesRecvError(t *testing.T) {
+	wantErr := status.Error(codes.Unavailable, "upstream unavailable")
+	meta := rpc.RequestMeta{
+		TenantID:  "acme",
+		RepoID:    "core",
+		Operation: rpc.OpUploadPack,
+	}
+
+	for _, tc := range []struct {
+		name  string
+		stdin func() io.Reader
+	}{
+		{name: "with stdin", stdin: func() io.Reader { return strings.NewReader("payload") }},
+		{name: "nil stdin", stdin: func() io.Reader { return nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := stubGitWireClient{
+				open: func(ctx context.Context, _ rpc.RequestMeta) (rpc.GitWireStream, error) {
+					return &sendEOFStream{
+						ctx:      ctx,
+						sendDone: make(chan struct{}),
+						recvErr:  wantErr,
+					}, nil
+				},
+			}
+			proxy, err := NewWireProxy(stubDialer{client: client})
+			if err != nil {
+				t.Fatalf("NewWireProxy: %v", err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			_, err = proxy.ProxyStream(context.Background(), "node-1:9090", meta, tc.stdin(), &stdout, &stderr)
+			if status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "upstream unavailable") {
+				t.Fatalf("ProxyStream err = %v, want Unavailable upstream unavailable", err)
+			}
+		})
+	}
+}
