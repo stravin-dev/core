@@ -206,6 +206,7 @@ type testReceivePackEnv struct {
 	ddbStore  *fakePushStore
 	s3Store   *fakeS3WriteStore
 	nvmeCache *cache.Cache
+	mat       *Materializer
 	refresher *LeaseRefresher
 	leaseBox  *fakeRegionalLeaseStore
 	tp        *telemetry.Provider
@@ -308,6 +309,7 @@ func newTestReceivePackEnv(t *testing.T, repoName string) *testReceivePackEnv {
 		ddbStore:  ddbStore,
 		s3Store:   s3Store,
 		nvmeCache: nvmeCache,
+		mat:       mat,
 		refresher: refresher,
 		leaseBox:  leaseBox,
 		tp:        tp,
@@ -1295,4 +1297,104 @@ func TestReceivePack_RefDirectoryCollisions(t *testing.T) {
 			t.Fatalf("expected sibling ref push to succeed, got %q", lines)
 		}
 	})
+}
+
+func TestReceivePack_SingleListRefsAndNoReftableMaterialization(t *testing.T) {
+	rk, err := tenant.NewRepoKey("acme", "single-listrefs")
+	if err != nil {
+		t.Fatalf("NewRepoKey: %v", err)
+	}
+	ddbStore := newFakePushStore()
+	ddbStore.PutMeta(ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      2,
+		ManifestShards: 2,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	})
+	s3Store := newFakeS3WriteStore()
+	nvmeCache, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	leaseBox := &fakeRegionalLeaseStore{
+		lease: ddb.RegionalWriteLease{
+			Region:    "us-east-1",
+			Epoch:     1,
+			Mode:      lease.ModeActive,
+			HolderID:  "ctrl-1",
+			ExpiresAt: time.Now().UTC().Add(5 * time.Minute),
+		},
+	}
+	refresher, err := NewLeaseRefresher(LeaseRefresherConfig{Store: leaseBox, Region: "us-east-1"})
+	if err != nil {
+		t.Fatalf("NewLeaseRefresher: %v", err)
+	}
+	if err := refresher.RefreshOnce(context.Background()); err != nil {
+		t.Fatalf("RefreshOnce: %v", err)
+	}
+
+	spyExec := newSpyBareRepoExecutor()
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:        ddbStore,
+		Packs:       s3Store,
+		Cache:       nvmeCache,
+		GitExecutor: spyExec,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	wh, err := NewReceivePackHandler(ReceivePackConfig{
+		Materializer:   mat,
+		Cache:          nvmeCache,
+		Packs:          s3Store,
+		Committer:      ddbStore,
+		LeaseRefresher: refresher,
+		Region:         "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("NewReceivePackHandler: %v", err)
+	}
+	srv, err := NewServer(ServerConfig{
+		Materializer:   mat,
+		GitExecutor:    spyExec,
+		WriteHandler:   wh,
+		LeaseRefresher: refresher,
+		Region:         "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	client := startBufconnNode(t, srv)
+
+	commitOID, _, packBytes := buildSyntheticCommitPack(t, "push-content\n", "push commit\n", nil)
+	wire := buildPushWirePayload(
+		[]ddb.RefUpdate{{RefName: "refs/heads/main", OldOID: ddb.ZeroOID, NewOID: commitOID.String()}},
+		"report-status side-band-64k",
+		packBytes,
+	)
+	outCtx := metadata.AppendToOutgoingContext(context.Background(), HeaderStatelessRPC, "true")
+	resp, exitCode, err := sendReceivePack(t, outCtx, client, rk, "", wire)
+	if err != nil {
+		t.Fatalf("sendReceivePack: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("exitCode = %d, want 0", exitCode)
+	}
+	band1, _ := splitSideBandResponse(t, resp)
+	lines := decodePktLines(t, band1)
+	if len(lines) != 2 || lines[1] != "ok refs/heads/main\n" {
+		t.Fatalf("unexpected report-status lines: %q", lines)
+	}
+	if ddbStore.ListRefsCalls() != 1 {
+		t.Errorf("ListRefsCalls = %d, want 1 (must not call ListRefs twice during push)", ddbStore.ListRefsCalls())
+	}
+	if spyExec.initBareCalls.Load() != 0 || spyExec.forEachRefCalls.Load() != 0 || spyExec.updateRefCalls.Load() != 0 || spyExec.symbolicRefCalls.Load() != 0 {
+		t.Errorf("expected 0 git ref subprocesses during push, got init:%d foreach:%d update:%d symref:%d",
+			spyExec.initBareCalls.Load(), spyExec.forEachRefCalls.Load(), spyExec.updateRefCalls.Load(), spyExec.symbolicRefCalls.Load())
+	}
 }

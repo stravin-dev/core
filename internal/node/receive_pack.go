@@ -453,12 +453,12 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 		return ingestedPack{}, fmt.Errorf("object format: %w", err)
 	}
 
-	syncRes, err := h.materializer.SyncAndPin(packCtx, repo)
+	handle, err := h.materializer.SyncPacksAndPin(packCtx, repo, repoMeta)
 	if err != nil {
 		recordSpanError(span, err)
 		return ingestedPack{}, fmt.Errorf("sync base packs: %w", err)
 	}
-	baseResolver := syncRes.Handle.BaseResolver()
+	baseResolver := handle.BaseResolver()
 
 	var completed []byte
 	if algoCompleter, ok := h.thinCompleter.(pack.AlgorithmAwareThinPackCompleter); ok {
@@ -467,7 +467,7 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 		completed, err = h.thinCompleter.Complete(packCtx, rawPack, baseResolver)
 	}
 	if err != nil {
-		syncRes.Handle.Release()
+		handle.Release()
 		recordSpanError(span, err)
 		return ingestedPack{}, fmt.Errorf("thin-pack completion: %w", err)
 	}
@@ -477,7 +477,7 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 		HashAlgorithm: algo,
 	})
 	if err != nil {
-		syncRes.Handle.Release()
+		handle.Release()
 		recordSpanError(span, err)
 		return ingestedPack{}, fmt.Errorf("parse completed pack: %w", err)
 	}
@@ -489,13 +489,13 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 		}
 		oid, err := pack.ParseOIDForAlgorithm(c.NewOID, algo)
 		if err != nil {
-			syncRes.Handle.Release()
+			handle.Release()
 			recordSpanError(span, err)
 			return ingestedPack{}, fmt.Errorf("invalid target oid for %s: %w", c.RefName, err)
 		}
 		if _, inNew := parsed.Objects[oid]; !inNew {
 			if _, _, baseErr := baseResolver.ResolveBase(oid); baseErr != nil {
-				syncRes.Handle.Release()
+				handle.Release()
 				err = fmt.Errorf("missing target object %s for %s", c.NewOID, c.RefName)
 				recordSpanError(span, err)
 				return ingestedPack{}, err
@@ -505,7 +505,7 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 
 	idxBytes, err := pack.BuildIdx(parsed)
 	if err != nil {
-		syncRes.Handle.Release()
+		handle.Release()
 		recordSpanError(span, err)
 		return ingestedPack{}, fmt.Errorf("build idx v2: %w", err)
 	}
@@ -519,7 +519,7 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 		idxBytes:   idxBytes,
 		packSHA256: packSHA256,
 		reader:     pack.NewPackReader(parsed, baseResolver),
-		handle:     syncRes.Handle,
+		handle:     handle,
 	}, nil
 }
 

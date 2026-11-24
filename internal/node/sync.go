@@ -77,6 +77,13 @@ type repoSyncSnapshot struct {
 	refs []ddb.RefState
 }
 
+type reftableSyncState struct {
+	repoPath   string
+	head       string
+	refs       map[string]string
+	tablesList string
+}
+
 type auxRepoState struct {
 	running   bool
 	dirty     bool
@@ -109,6 +116,9 @@ type Materializer struct {
 
 	lastSyncMu sync.Mutex
 	lastSync   map[tenant.RepoKey]repoSyncSnapshot
+
+	refStateMu sync.Mutex
+	refState   map[tenant.RepoKey]reftableSyncState
 
 	auxMu     sync.Mutex
 	auxClosed bool
@@ -175,6 +185,7 @@ func NewMaterializer(cfg MaterializerConfig) (*Materializer, error) {
 		auxRefreshInterval:     auxInterval,
 		lastReconcile:          make(map[tenant.RepoKey]time.Time),
 		lastSync:               make(map[tenant.RepoKey]repoSyncSnapshot),
+		refState:               make(map[tenant.RepoKey]reftableSyncState),
 		auxStates:              make(map[tenant.RepoKey]*auxRepoState),
 		auxCtx:                 auxCtx,
 		auxCancel:              auxCancel,
@@ -217,16 +228,26 @@ func (m *Materializer) WaitAuxIndexes(ctx context.Context) error {
 	}
 }
 
-// LoadAuthoritativeRefs reads META and all ref shards (RS#{s}) strictly from
-// DynamoDB without touching local disk or S3.
-func (m *Materializer) LoadAuthoritativeRefs(ctx context.Context, repo tenant.RepoKey) (ddb.RepoMeta, []ddb.RefState, error) {
+// LoadRepoMeta reads authoritative repository META strictly from DynamoDB
+// without querying ref shards, local disk, or S3.
+func (m *Materializer) LoadRepoMeta(ctx context.Context, repo tenant.RepoKey) (ddb.RepoMeta, error) {
 	if err := repo.Validate(); err != nil {
-		return ddb.RepoMeta{}, nil, err
+		return ddb.RepoMeta{}, err
 	}
 
 	meta, err := m.meta.GetMeta(ctx, repo)
 	if err != nil {
-		return ddb.RepoMeta{}, nil, fmt.Errorf("node: get meta %s: %w", repo, err)
+		return ddb.RepoMeta{}, fmt.Errorf("node: get meta %s: %w", repo, err)
+	}
+	return meta, nil
+}
+
+// LoadAuthoritativeRefs reads META and all ref shards (RS#{s}) strictly from
+// DynamoDB without touching local disk or S3.
+func (m *Materializer) LoadAuthoritativeRefs(ctx context.Context, repo tenant.RepoKey) (ddb.RepoMeta, []ddb.RefState, error) {
+	meta, err := m.LoadRepoMeta(ctx, repo)
+	if err != nil {
+		return ddb.RepoMeta{}, nil, err
 	}
 
 	refCtx, span := m.tracer.Start(ctx, "ddb.query_refs", trace.WithAttributes(
@@ -247,6 +268,34 @@ func (m *Materializer) LoadAuthoritativeRefs(ctx context.Context, repo tenant.Re
 	span.End()
 
 	return meta, refs, nil
+}
+
+// SyncPacksAndPin synchronizes active manifest packs from DynamoDB/S3 into the
+// warm NVMe cache and returns a pinned RepoHandle without querying ref shards
+// or materializing local reftable refs. Callers MUST invoke Handle.Release().
+func (m *Materializer) SyncPacksAndPin(ctx context.Context, repo tenant.RepoKey, repoMeta ddb.RepoMeta) (*cache.RepoHandle, error) {
+	if err := repo.Validate(); err != nil {
+		return nil, err
+	}
+
+	handle, err := m.cache.Materialize(ctx, repo, func(syncCtx context.Context, repoPath string) error {
+		fetched, _, pruned, syncErr := m.syncManifestPacks(syncCtx, repo, repoMeta)
+		if syncErr != nil {
+			return syncErr
+		}
+		if fetched > 0 || pruned > 0 {
+			m.scheduleAuxIndexRefresh(repo, repoPath, true, m.hasMaterializedRefs(repo))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if m.metrics != nil {
+		m.metrics.RecordCacheBytes(ctx, m.cache.Stats().TotalBytes)
+	}
+	return handle, nil
 }
 
 // SyncAndPin runs the full read-path synchronization pipeline under linearizable
@@ -278,10 +327,11 @@ func (m *Materializer) SyncAndPin(ctx context.Context, repo tenant.RepoKey) (Syn
 			return syncErr
 		}
 
-		if err := m.ensureReftableBareRepo(syncCtx, repo, repoPath, loadedMeta); err != nil {
+		reinitialized, err := m.ensureReftableBareRepo(syncCtx, repo, repoPath, loadedMeta)
+		if err != nil {
 			return fmt.Errorf("node: configure reftable bare repo %s: %w", repo, err)
 		}
-		refsChanged, err := m.materializeReftableRefs(syncCtx, repo, repoPath, loadedRefs, loadedMeta.DefaultBranch)
+		refsChanged, err := m.materializeReftableRefs(syncCtx, repo, repoPath, loadedRefs, loadedMeta.DefaultBranch, reinitialized)
 		if err != nil {
 			return fmt.Errorf("node: materialize reftable refs %s: %w", repo, err)
 		}
@@ -570,10 +620,10 @@ func (m *Materializer) fetchPackPair(ctx context.Context, repo tenant.RepoKey, p
 // ensureReftableBareRepo ensures the disposable NVMe bare repository is
 // initialized with --ref-format=reftable and the repository's object format
 // (sha1 or sha256), while preserving any already-installed objects/pack files.
-func (m *Materializer) ensureReftableBareRepo(ctx context.Context, repo tenant.RepoKey, repoPath string, meta ddb.RepoMeta) error {
+func (m *Materializer) ensureReftableBareRepo(ctx context.Context, repo tenant.RepoKey, repoPath string, meta ddb.RepoMeta) (bool, error) {
 	objFormat := meta.EffectiveObjectFormat()
 	if isReftableBareRepoWithFormat(repoPath, objFormat) {
-		return nil
+		return false, nil
 	}
 
 	// Remove disposable legacy files-backend metadata so `git init --bare --ref-format=reftable`
@@ -587,13 +637,17 @@ func (m *Materializer) ensureReftableBareRepo(ctx context.Context, repo tenant.R
 		defaultBranch = defaultBranchRef
 	}
 
-	return m.refExec.ExecInitBare(ctx, gitexec.InitBareRequest{
+	if err := m.refExec.ExecInitBare(ctx, gitexec.InitBareRequest{
 		Repo:          repo,
 		RepoDir:       repoPath,
 		ObjectFormat:  string(objFormat),
 		RefFormat:     "reftable",
 		DefaultBranch: defaultBranch,
-	})
+	}); err != nil {
+		m.deleteRefState(repo)
+		return false, err
+	}
+	return true, nil
 }
 
 func isReftableBareRepoWithFormat(repoPath string, format ddb.ObjectFormat) bool {
@@ -613,10 +667,31 @@ func isReftableBareRepoWithFormat(repoPath string, format ddb.ObjectFormat) bool
 	return wantSHA256 == hasSHA256
 }
 
+func readReftableTablesList(repoPath string) string {
+	b, err := os.ReadFile(filepath.Join(repoPath, "reftable", "tables.list")) //nolint:gosec // path is derived from cache RepoPath
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func (m *Materializer) deleteRefState(repo tenant.RepoKey) {
+	m.refStateMu.Lock()
+	delete(m.refState, repo)
+	m.refStateMu.Unlock()
+}
+
+func (m *Materializer) hasMaterializedRefs(repo tenant.RepoKey) bool {
+	m.refStateMu.Lock()
+	defer m.refStateMu.Unlock()
+	st, ok := m.refState[repo]
+	return ok && len(st.refs) > 0
+}
+
 // materializeReftableRefs synchronizes the bare repo's reftable refs and HEAD
 // strictly from DynamoDB's authoritative RefState list using git plumbing
 // (for-each-ref, update-ref --stdin, symbolic-ref) without touching .git/refs/*.
-func (m *Materializer) materializeReftableRefs(ctx context.Context, repo tenant.RepoKey, repoPath string, refs []ddb.RefState, defaultBranch string) (bool, error) {
+func (m *Materializer) materializeReftableRefs(ctx context.Context, repo tenant.RepoKey, repoPath string, refs []ddb.RefState, defaultBranch string, reinitialized bool) (bool, error) {
 	if strings.TrimSpace(defaultBranch) == "" {
 		defaultBranch = defaultBranchRef
 	}
@@ -629,12 +704,32 @@ func (m *Materializer) materializeReftableRefs(ctx context.Context, repo tenant.
 		desired[r.RefName] = r.OID
 	}
 
-	current, err := m.refExec.ExecForEachRef(ctx, gitexec.ForEachRefRequest{
-		Repo:    repo,
-		RepoDir: repoPath,
-	})
-	if err != nil {
-		return false, err
+	var (
+		current          map[string]string
+		materializedHead string
+		haveState        bool
+	)
+	if !reinitialized {
+		curTables := readReftableTablesList(repoPath)
+		m.refStateMu.Lock()
+		if st, ok := m.refState[repo]; ok && st.repoPath == repoPath && st.tablesList == curTables {
+			current = st.refs
+			materializedHead = st.head
+			haveState = true
+		}
+		m.refStateMu.Unlock()
+	}
+
+	if !haveState {
+		var err error
+		current, err = m.refExec.ExecForEachRef(ctx, gitexec.ForEachRefRequest{
+			Repo:    repo,
+			RepoDir: repoPath,
+		})
+		if err != nil {
+			m.deleteRefState(repo)
+			return false, err
+		}
 	}
 
 	var staleNames []string
@@ -667,18 +762,32 @@ func (m *Materializer) materializeReftableRefs(ctx context.Context, repo tenant.
 			RepoDir: repoPath,
 			Updates: updates,
 		}); err != nil {
+			m.deleteRefState(repo)
 			return false, err
 		}
 	}
 
-	if err := m.refExec.ExecSymbolicRef(ctx, gitexec.SymbolicRefRequest{
-		Repo:    repo,
-		RepoDir: repoPath,
-		Name:    "HEAD",
-		Target:  defaultBranch,
-	}); err != nil {
-		return false, err
+	if !haveState || materializedHead != defaultBranch {
+		if err := m.refExec.ExecSymbolicRef(ctx, gitexec.SymbolicRefRequest{
+			Repo:    repo,
+			RepoDir: repoPath,
+			Name:    "HEAD",
+			Target:  defaultBranch,
+		}); err != nil {
+			m.deleteRefState(repo)
+			return false, err
+		}
 	}
+
+	newTables := readReftableTablesList(repoPath)
+	m.refStateMu.Lock()
+	m.refState[repo] = reftableSyncState{
+		repoPath:   repoPath,
+		head:       defaultBranch,
+		refs:       desired,
+		tablesList: newTables,
+	}
+	m.refStateMu.Unlock()
 
 	return len(updates) > 0, nil
 }

@@ -37,6 +37,7 @@ import (
 	"stravin.dev/core/internal/lease"
 	"stravin.dev/core/internal/rpc"
 	"stravin.dev/core/internal/storage/ddb"
+	"stravin.dev/core/internal/storage/s3"
 	"stravin.dev/core/internal/telemetry"
 	"stravin.dev/core/internal/tenant"
 )
@@ -1125,5 +1126,473 @@ func TestServer_UploadPackQueueRespectsContextCancellation(t *testing.T) {
 	wantProm := `stravin_node_upload_pack_queue_timeouts_total{region="us-east-1"} 0`
 	if !strings.Contains(rec.Body.String(), wantProm) {
 		t.Errorf("expected 0 queue timeouts on client cancel, got:\n%s", rec.Body.String())
+	}
+}
+
+func TestServer_AdvertiseRefsV2SkipsListRefs(t *testing.T) {
+	ctx := context.Background()
+	rk, _ := tenant.NewRepoKey("acme", "advert-v2")
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	metaStore := newFakeMetadataStore()
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	})
+	metaStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: strings.Repeat("a", 40)},
+	})
+
+	tp, err := telemetry.NewInMemoryProvider("stravin-node")
+	if err != nil {
+		t.Fatalf("NewInMemoryProvider: %v", err)
+	}
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:      metaStore,
+		Packs:     newFakePackFetcher(),
+		Cache:     c,
+		Telemetry: tp,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	srv, err := NewServer(ServerConfig{
+		Materializer: mat,
+		GitExecutor:  &fakeGitExecutor{},
+		Telemetry:    tp,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	client := startBufconnNode(t, srv)
+	outCtx := metadata.AppendToOutgoingContext(ctx, HeaderAdvertiseRefs, "true")
+	stream, err := client.OpenStream(outCtx, rpc.RequestMeta{
+		TenantID:    rk.TenantID,
+		RepoID:      rk.RepoID,
+		Operation:   rpc.OpUploadPack,
+		GitProtocol: "version=2",
+	})
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+
+	var buf bytes.Buffer
+	for {
+		frame, recvErr := stream.Recv()
+		if errors.Is(recvErr, io.EOF) {
+			break
+		}
+		if recvErr != nil {
+			t.Fatalf("Recv: %v", recvErr)
+		}
+		buf.Write(frame.Data)
+	}
+
+	if !strings.Contains(buf.String(), "version 2\n") {
+		t.Fatalf("expected v2 capabilities, got %q", buf.String())
+	}
+	if metaStore.GetMetaCalls() != 1 {
+		t.Errorf("GetMetaCalls = %d, want 1", metaStore.GetMetaCalls())
+	}
+	if metaStore.ListRefsCalls() != 0 {
+		t.Errorf("ListRefsCalls = %d, want 0 for protocol v2", metaStore.ListRefsCalls())
+	}
+}
+
+type fakeBundlePresigner struct {
+	mu    sync.Mutex
+	url   string
+	err   error
+	calls int
+}
+
+func (f *fakeBundlePresigner) PresignBundleURL(_ context.Context, _ tenant.RepoKey, _ time.Duration) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return f.url, f.err
+}
+
+func (f *fakeBundlePresigner) Calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func TestS3BundleURIResolver_TTLCache(t *testing.T) {
+	ctx := context.Background()
+	rk, _ := tenant.NewRepoKey("acme", "bundle-cache")
+
+	var nowMu sync.Mutex
+	curTime := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	nowFn := func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return curTime
+	}
+	advance := func(d time.Duration) {
+		nowMu.Lock()
+		curTime = curTime.Add(d)
+		nowMu.Unlock()
+	}
+
+	presigner := &fakeBundlePresigner{url: "https://s3.example.com/bundle.pack?sig=1"}
+	resolver := NewS3BundleURIResolver(presigner, 15*time.Minute)
+	resolver.now = nowFn
+
+	// 1. Positive result cached within 5s TTL.
+	u1, err := resolver.ResolveBundleURI(ctx, rk)
+	if err != nil || u1 != presigner.url {
+		t.Fatalf("ResolveBundleURI(1) = (%q, %v), want (%q, nil)", u1, err, presigner.url)
+	}
+	advance(2 * time.Second)
+	u2, err := resolver.ResolveBundleURI(ctx, rk)
+	if err != nil || u2 != presigner.url {
+		t.Fatalf("ResolveBundleURI(2) = (%q, %v), want (%q, nil)", u2, err, presigner.url)
+	}
+	if presigner.Calls() != 1 {
+		t.Fatalf("presigner calls within TTL = %d, want 1", presigner.Calls())
+	}
+
+	// 2. After TTL expires, refreshes and caches negative s3.ErrNotFound.
+	advance(4 * time.Second)
+	presigner.mu.Lock()
+	presigner.url = ""
+	presigner.err = s3.ErrNotFound
+	presigner.mu.Unlock()
+
+	u3, err := resolver.ResolveBundleURI(ctx, rk)
+	if err != nil || u3 != "" {
+		t.Fatalf("ResolveBundleURI(3) = (%q, %v), want (\"\", nil)", u3, err)
+	}
+	advance(2 * time.Second)
+	u4, err := resolver.ResolveBundleURI(ctx, rk)
+	if err != nil || u4 != "" {
+		t.Fatalf("ResolveBundleURI(4) = (%q, %v), want (\"\", nil)", u4, err)
+	}
+	if presigner.Calls() != 2 {
+		t.Fatalf("presigner calls after negative cache hit = %d, want 2", presigner.Calls())
+	}
+
+	// 3. Transient errors are NOT cached.
+	advance(4 * time.Second)
+	presigner.mu.Lock()
+	presigner.err = errors.New("s3 503 slow down")
+	presigner.mu.Unlock()
+
+	if _, err := resolver.ResolveBundleURI(ctx, rk); err == nil {
+		t.Fatal("expected transient S3 error")
+	}
+	if _, err := resolver.ResolveBundleURI(ctx, rk); err == nil {
+		t.Fatal("expected second transient S3 error")
+	}
+	if presigner.Calls() != 4 {
+		t.Fatalf("presigner calls after 2 transient errors = %d, want 4", presigner.Calls())
+	}
+
+	// 4. Concurrent access under -race.
+	presigner.mu.Lock()
+	presigner.url = "https://s3.example.com/bundle.pack?sig=2"
+	presigner.err = nil
+	presigner.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = resolver.ResolveBundleURI(ctx, rk)
+		}()
+	}
+	wg.Wait()
+}
+
+type countingBundleResolver struct {
+	uri   string
+	calls atomic.Int32
+}
+
+func (r *countingBundleResolver) ResolveBundleURI(_ context.Context, _ tenant.RepoKey) (string, error) {
+	r.calls.Add(1)
+	return r.uri, nil
+}
+
+func TestServer_UploadPackV2LsRefsBypassesSemaphoreAndBundleURI(t *testing.T) {
+	rk, _ := tenant.NewRepoKey("acme", "v2-lsrefs")
+	metaStore := newFakeMetadataStore()
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	})
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:  metaStore,
+		Packs: newFakePackFetcher(),
+		Cache: c,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+	warm, err := mat.SyncAndPin(context.Background(), rk)
+	if err != nil {
+		t.Fatalf("warm SyncAndPin: %v", err)
+	}
+	warm.Handle.Release()
+
+	fetchEntered := make(chan struct{}, 1)
+	fetchRelease := make(chan struct{})
+	defer close(fetchRelease)
+
+	var (
+		mu             sync.Mutex
+		lsRefsStdin    []byte
+		lsRefsBundle   string
+		fetchBundleURI string
+	)
+	execImpl := &fakeGitExecutor{
+		uploadPackFn: func(_ context.Context, req gitexec.UploadPackRequest) error {
+			inBytes, _ := io.ReadAll(req.Stdin)
+			if bytes.Contains(inBytes, []byte("command=ls-refs")) {
+				mu.Lock()
+				lsRefsStdin = inBytes
+				lsRefsBundle = req.BundleURI
+				mu.Unlock()
+				_, _ = req.Stdout.Write([]byte("ls-refs-ok"))
+				return nil
+			}
+			mu.Lock()
+			fetchBundleURI = req.BundleURI
+			mu.Unlock()
+			select {
+			case fetchEntered <- struct{}{}:
+			default:
+			}
+			<-fetchRelease
+			return nil
+		},
+	}
+
+	bundleResolver := &countingBundleResolver{uri: "https://s3.example.com/bundle.pack"}
+	srv, err := NewServer(ServerConfig{
+		Materializer:           mat,
+		GitExecutor:            execImpl,
+		BundleResolver:         bundleResolver,
+		MaxUploadPacks:         1,
+		UploadPackQueueTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	client := startBufconnNode(t, srv)
+
+	// 1. Occupy the single upload-pack slot with a v2 fetch request.
+	fetchCtx := metadata.AppendToOutgoingContext(context.Background(), HeaderStatelessRPC, "true")
+	fetchDone := make(chan error, 1)
+	go func() {
+		st, openErr := client.OpenStream(fetchCtx, rpc.RequestMeta{
+			TenantID:    rk.TenantID,
+			RepoID:      rk.RepoID,
+			Operation:   rpc.OpUploadPack,
+			GitProtocol: "version=2",
+		})
+		if openErr != nil {
+			fetchDone <- openErr
+			return
+		}
+		fetchPayload := append(EncodePktLine([]byte("command=fetch\n")), FlushPkt...)
+		_ = st.Send(&rpc.Frame{Data: fetchPayload, EOF: true})
+		for {
+			_, rErr := st.Recv()
+			if errors.Is(rErr, io.EOF) {
+				fetchDone <- nil
+				return
+			}
+			if rErr != nil {
+				fetchDone <- rErr
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-fetchEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for fetch to hold upload-pack slot")
+	}
+
+	// 2. Send a v2 ls-refs request split across two frames while the slot is full.
+	lsCtx := metadata.AppendToOutgoingContext(context.Background(), HeaderStatelessRPC, "true")
+	lsStream, err := client.OpenStream(lsCtx, rpc.RequestMeta{
+		TenantID:    rk.TenantID,
+		RepoID:      rk.RepoID,
+		Operation:   rpc.OpUploadPack,
+		GitProtocol: "version=2",
+	})
+	if err != nil {
+		t.Fatalf("OpenStream ls-refs: %v", err)
+	}
+	fullLsRefs := append(EncodePktLine([]byte("command=ls-refs\n")), []byte("00010000")...)
+	if err := lsStream.Send(&rpc.Frame{Data: fullLsRefs[:6]}); err != nil {
+		t.Fatalf("Send frame 1: %v", err)
+	}
+	if err := lsStream.Send(&rpc.Frame{Data: fullLsRefs[6:], EOF: true}); err != nil {
+		t.Fatalf("Send frame 2: %v", err)
+	}
+
+	var lsResp bytes.Buffer
+	for {
+		frame, rErr := lsStream.Recv()
+		if errors.Is(rErr, io.EOF) {
+			break
+		}
+		if rErr != nil {
+			t.Fatalf("ls-refs Recv failed (likely blocked on semaphore): %v", rErr)
+		}
+		lsResp.Write(frame.Data)
+	}
+
+	if lsResp.String() != "ls-refs-ok" {
+		t.Fatalf("ls-refs response = %q, want ls-refs-ok", lsResp.String())
+	}
+	mu.Lock()
+	gotStdin := append([]byte(nil), lsRefsStdin...)
+	gotLsBundle := lsRefsBundle
+	gotFetchBundle := fetchBundleURI
+	mu.Unlock()
+	if !bytes.Equal(gotStdin, fullLsRefs) {
+		t.Fatalf("replayed ls-refs stdin = %q, want %q", gotStdin, fullLsRefs)
+	}
+	if gotLsBundle != "" {
+		t.Errorf("ls-refs BundleURI = %q, want empty", gotLsBundle)
+	}
+	if gotFetchBundle != bundleResolver.uri {
+		t.Errorf("fetch BundleURI = %q, want %q", gotFetchBundle, bundleResolver.uri)
+	}
+	if bundleResolver.calls.Load() != 1 {
+		t.Errorf("bundleResolver calls = %d, want 1 (only for fetch, skipped for ls-refs)", bundleResolver.calls.Load())
+	}
+}
+
+func TestServer_UploadPackSyncRunsBeforeSlotAcquire(t *testing.T) {
+	rk, _ := tenant.NewRepoKey("acme", "sync-before-slot")
+	metaStore := newFakeMetadataStore()
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	})
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:  metaStore,
+		Packs: newFakePackFetcher(),
+		Cache: c,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+	warm, err := mat.SyncAndPin(context.Background(), rk)
+	if err != nil {
+		t.Fatalf("warm SyncAndPin: %v", err)
+	}
+	warm.Handle.Release()
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+
+	execImpl := &fakeGitExecutor{
+		uploadPackFn: func(_ context.Context, _ gitexec.UploadPackRequest) error {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-release
+			return nil
+		},
+	}
+
+	srv, err := NewServer(ServerConfig{
+		Materializer:           mat,
+		GitExecutor:            execImpl,
+		MaxUploadPacks:         1,
+		UploadPackQueueTimeout: 80 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	client := startBufconnNode(t, srv)
+
+	// Hold the single upload-pack slot with request 1.
+	go func() {
+		st, openErr := client.OpenStream(context.Background(), rpc.RequestMeta{
+			TenantID:  rk.TenantID,
+			RepoID:    rk.RepoID,
+			Operation: rpc.OpUploadPack,
+		})
+		if openErr != nil {
+			return
+		}
+		_ = st.Send(&rpc.Frame{EOF: true})
+		for {
+			if _, rErr := st.Recv(); rErr != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for request 1 to hold slot")
+	}
+
+	callsBefore := metaStore.GetMetaCalls()
+
+	// Request 2 should run SyncAndPin (calling GetMeta) BEFORE timing out on the semaphore.
+	st2, err := client.OpenStream(context.Background(), rpc.RequestMeta{
+		TenantID:  rk.TenantID,
+		RepoID:    rk.RepoID,
+		Operation: rpc.OpUploadPack,
+	})
+	if err != nil {
+		t.Fatalf("OpenStream req2: %v", err)
+	}
+	_, recvErr := st2.Recv()
+	if status.Code(recvErr) != codes.ResourceExhausted {
+		t.Fatalf("req2 status = %v (err=%v), want ResourceExhausted", status.Code(recvErr), recvErr)
+	}
+	if metaStore.GetMetaCalls() <= callsBefore {
+		t.Errorf("GetMetaCalls did not increase (%d -> %d): expected SyncAndPin before acquireUploadPackSlot",
+			callsBefore, metaStore.GetMetaCalls())
 	}
 }

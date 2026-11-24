@@ -36,6 +36,8 @@ type fakeMetadataStore struct {
 	refs             map[tenant.RepoKey][]ddb.RefState
 	manifestsByShard map[tenant.RepoKey]map[int][]ddb.PackManifest
 	seenWatermarks   []string
+	getMetaCalls     int
+	listRefsCalls    int
 	err              error
 }
 
@@ -84,6 +86,7 @@ func (f *fakeMetadataStore) SetManifestStatus(repo tenant.RepoKey, shard int, ul
 func (f *fakeMetadataStore) GetMeta(_ context.Context, repo tenant.RepoKey) (ddb.RepoMeta, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.getMetaCalls++
 	if f.err != nil {
 		return ddb.RepoMeta{}, f.err
 	}
@@ -97,12 +100,25 @@ func (f *fakeMetadataStore) GetMeta(_ context.Context, repo tenant.RepoKey) (ddb
 func (f *fakeMetadataStore) ListRefs(_ context.Context, repo tenant.RepoKey, _ int) ([]ddb.RefState, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.listRefsCalls++
 	if f.err != nil {
 		return nil, f.err
 	}
 	refs := append([]ddb.RefState(nil), f.refs[repo]...)
 	sort.Slice(refs, func(i, j int) bool { return refs[i].RefName < refs[j].RefName })
 	return refs, nil
+}
+
+func (f *fakeMetadataStore) GetMetaCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getMetaCalls
+}
+
+func (f *fakeMetadataStore) ListRefsCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.listRefsCalls
 }
 
 func (f *fakeMetadataStore) QueryManifestShard(_ context.Context, repo tenant.RepoKey, shard int, afterULID string, activeOnly bool) ([]ddb.PackManifest, error) {
@@ -601,6 +617,9 @@ func TestMaterializer_PrunesSupersededPacksAfterCompaction(t *testing.T) {
 		t.Fatalf("expected pinned pack1 to remain on disk before release, err=%v", statErr)
 	}
 	res2.Handle.Release()
+	if err := mat.WaitAuxIndexes(ctx); err != nil {
+		t.Fatalf("WaitAuxIndexes: %v", err)
+	}
 
 	// Once released, superseded packs must be unlinked and only packMerged should remain.
 	if _, statErr := os.Stat(pack1Path); !errors.Is(statErr, os.ErrNotExist) {
@@ -688,6 +707,9 @@ func TestMaterializer_PrunesSupersededPacksWhileNewerReadersPinned(t *testing.T)
 	// Release prior-generation readers while res3 remains pinned (pins == 1).
 	res1.Handle.Release()
 	res2.Handle.Release()
+	if err := mat.WaitAuxIndexes(ctx); err != nil {
+		t.Fatalf("WaitAuxIndexes: %v", err)
+	}
 
 	if _, statErr := os.Stat(pack1Path); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("expected superseded pack1 to be unlinked while res3 remains pinned, err=%v", statErr)
@@ -1648,5 +1670,255 @@ func TestMaterializer_UnchangedFlightsDoNotRebuildCommitGraph(t *testing.T) {
 	}
 	if midxCalls.Load() != 2 || cgCalls.Load() != 1 {
 		t.Fatalf("after MIDX-only rebuild: midx=%d cg=%d, want 2, 1", midxCalls.Load(), cgCalls.Load())
+	}
+}
+
+type spyBareRepoExecutor struct {
+	*gitexec.SubprocessExecutor
+
+	initBareCalls    atomic.Int32
+	forEachRefCalls  atomic.Int32
+	updateRefCalls   atomic.Int32
+	symbolicRefCalls atomic.Int32
+
+	mu           sync.Mutex
+	updateRefErr error
+}
+
+func newSpyBareRepoExecutor() *spyBareRepoExecutor {
+	return &spyBareRepoExecutor{
+		SubprocessExecutor: gitexec.NewSubprocessExecutor(gitexec.Config{}),
+	}
+}
+
+func (s *spyBareRepoExecutor) ExecInitBare(ctx context.Context, req gitexec.InitBareRequest) error {
+	s.initBareCalls.Add(1)
+	return s.SubprocessExecutor.ExecInitBare(ctx, req)
+}
+
+func (s *spyBareRepoExecutor) ExecForEachRef(ctx context.Context, req gitexec.ForEachRefRequest) (map[string]string, error) {
+	s.forEachRefCalls.Add(1)
+	return s.SubprocessExecutor.ExecForEachRef(ctx, req)
+}
+
+func (s *spyBareRepoExecutor) ExecUpdateRef(ctx context.Context, req gitexec.UpdateRefRequest) error {
+	s.updateRefCalls.Add(1)
+	s.mu.Lock()
+	err := s.updateRefErr
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return s.SubprocessExecutor.ExecUpdateRef(ctx, req)
+}
+
+func (s *spyBareRepoExecutor) ExecSymbolicRef(ctx context.Context, req gitexec.SymbolicRefRequest) error {
+	s.symbolicRefCalls.Add(1)
+	return s.SubprocessExecutor.ExecSymbolicRef(ctx, req)
+}
+
+func (s *spyBareRepoExecutor) resetCounts() {
+	s.initBareCalls.Store(0)
+	s.forEachRefCalls.Store(0)
+	s.updateRefCalls.Store(0)
+	s.symbolicRefCalls.Store(0)
+}
+
+func TestMaterializer_ReftableSyncStateSkipsSubprocessesWhenUnchanged(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary not installed")
+	}
+
+	ctx := context.Background()
+	rk, _ := tenant.NewRepoKey("acme", "reftable-cache")
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	oid1, pack1Bytes, idx1Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "v1\n", "commit 1\n")
+	oid2, pack2Bytes, idx2Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "v2\n", "commit 2\n")
+	pack1 := strings.Repeat("1", 64)
+	pack2 := strings.Repeat("2", 64)
+
+	metaStore := newFakeMetadataStore()
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	})
+	metaStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: oid1},
+	})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FC1", PackID: pack1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+
+	packStore := newFakePackFetcher()
+	packStore.Put(pack1, pack1Bytes, idx1Bytes)
+	packStore.Put(pack2, pack2Bytes, idx2Bytes)
+
+	spyExec := newSpyBareRepoExecutor()
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:        metaStore,
+		Packs:       packStore,
+		Cache:       c,
+		GitExecutor: spyExec,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	// 1. Initial sync initializes reftable and syncs refs + HEAD.
+	res1, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(1): %v", err)
+	}
+	res1.Handle.Release()
+	if spyExec.initBareCalls.Load() != 1 || spyExec.forEachRefCalls.Load() != 1 || spyExec.updateRefCalls.Load() != 1 || spyExec.symbolicRefCalls.Load() != 1 {
+		t.Fatalf("initial sync counts = init:%d foreach:%d update:%d symref:%d, want 1,1,1,1",
+			spyExec.initBareCalls.Load(), spyExec.forEachRefCalls.Load(), spyExec.updateRefCalls.Load(), spyExec.symbolicRefCalls.Load())
+	}
+
+	// 2. Second sync with unchanged refs + HEAD must spawn ZERO git ref subprocesses.
+	spyExec.resetCounts()
+	res2, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(2): %v", err)
+	}
+	res2.Handle.Release()
+	if spyExec.initBareCalls.Load() != 0 || spyExec.forEachRefCalls.Load() != 0 || spyExec.updateRefCalls.Load() != 0 || spyExec.symbolicRefCalls.Load() != 0 {
+		t.Fatalf("unchanged sync counts = init:%d foreach:%d update:%d symref:%d, want 0,0,0,0",
+			spyExec.initBareCalls.Load(), spyExec.forEachRefCalls.Load(), spyExec.updateRefCalls.Load(), spyExec.symbolicRefCalls.Load())
+	}
+
+	// 3. Ref update with unchanged DefaultBranch skips ExecForEachRef and ExecSymbolicRef.
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FC2", PackID: pack2, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	metaStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: oid2},
+	})
+	spyExec.resetCounts()
+	res3, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(3): %v", err)
+	}
+	res3.Handle.Release()
+	if spyExec.forEachRefCalls.Load() != 0 || spyExec.updateRefCalls.Load() != 1 || spyExec.symbolicRefCalls.Load() != 0 {
+		t.Fatalf("ref-change sync counts = foreach:%d update:%d symref:%d, want 0,1,0",
+			spyExec.forEachRefCalls.Load(), spyExec.updateRefCalls.Load(), spyExec.symbolicRefCalls.Load())
+	}
+
+	// 4. DefaultBranch change with unchanged refs calls only ExecSymbolicRef.
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/trunk",
+	})
+	spyExec.resetCounts()
+	res4, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(4): %v", err)
+	}
+	res4.Handle.Release()
+	if spyExec.forEachRefCalls.Load() != 0 || spyExec.updateRefCalls.Load() != 0 || spyExec.symbolicRefCalls.Load() != 1 {
+		t.Fatalf("head-change sync counts = foreach:%d update:%d symref:%d, want 0,0,1",
+			spyExec.forEachRefCalls.Load(), spyExec.updateRefCalls.Load(), spyExec.symbolicRefCalls.Load())
+	}
+
+	// 5. ExecUpdateRef error invalidates in-memory state so next sync re-reads from disk.
+	metaStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: oid1},
+	})
+	spyExec.mu.Lock()
+	spyExec.updateRefErr = errors.New("simulated update-ref failure")
+	spyExec.mu.Unlock()
+	if _, err := mat.SyncAndPin(ctx, rk); err == nil {
+		t.Fatal("expected SyncAndPin error when ExecUpdateRef fails")
+	}
+
+	spyExec.mu.Lock()
+	spyExec.updateRefErr = nil
+	spyExec.mu.Unlock()
+	spyExec.resetCounts()
+	res5, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(5): %v", err)
+	}
+	res5.Handle.Release()
+	if spyExec.forEachRefCalls.Load() != 1 || spyExec.updateRefCalls.Load() != 1 || spyExec.symbolicRefCalls.Load() != 1 {
+		t.Fatalf("post-error recovery counts = foreach:%d update:%d symref:%d, want 1,1,1",
+			spyExec.forEachRefCalls.Load(), spyExec.updateRefCalls.Load(), spyExec.symbolicRefCalls.Load())
+	}
+}
+
+func TestMaterializer_SyncPacksAndPinSkipsRefsAndReftable(t *testing.T) {
+	ctx := context.Background()
+	rk, _ := tenant.NewRepoKey("acme", "packs-only")
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	_, pack1Bytes, idx1Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "p1\n", "commit 1\n")
+	pack1 := strings.Repeat("a", 64)
+
+	meta := ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	}
+	metaStore := newFakeMetadataStore()
+	metaStore.PutMeta(meta)
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FD1", PackID: pack1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	packStore := newFakePackFetcher()
+	packStore.Put(pack1, pack1Bytes, idx1Bytes)
+
+	spyExec := newSpyBareRepoExecutor()
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:        metaStore,
+		Packs:       packStore,
+		Cache:       c,
+		GitExecutor: spyExec,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	handle, err := mat.SyncPacksAndPin(ctx, rk, meta)
+	if err != nil {
+		t.Fatalf("SyncPacksAndPin: %v", err)
+	}
+	defer handle.Release()
+
+	if !c.HasPack(rk, pack1) {
+		t.Fatal("expected pack1 installed in cache")
+	}
+	if metaStore.GetMetaCalls() != 0 {
+		t.Errorf("GetMetaCalls = %d, want 0", metaStore.GetMetaCalls())
+	}
+	if metaStore.ListRefsCalls() != 0 {
+		t.Errorf("ListRefsCalls = %d, want 0", metaStore.ListRefsCalls())
+	}
+	if spyExec.initBareCalls.Load() != 0 || spyExec.forEachRefCalls.Load() != 0 || spyExec.updateRefCalls.Load() != 0 || spyExec.symbolicRefCalls.Load() != 0 {
+		t.Errorf("expected 0 git ref subprocesses, got init:%d foreach:%d update:%d symref:%d",
+			spyExec.initBareCalls.Load(), spyExec.forEachRefCalls.Load(), spyExec.updateRefCalls.Load(), spyExec.symbolicRefCalls.Load())
 	}
 }
