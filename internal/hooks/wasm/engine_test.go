@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -503,5 +504,32 @@ func TestEngineBulkheadAndCacheUnderRace(t *testing.T) {
 
 	if got := succeeded.Load(); got != callers {
 		t.Fatalf("succeeded = %d, want %d", got, callers)
+	}
+}
+
+func TestEffectiveMemoryPagesBounds(t *testing.T) {
+	eng := &Engine{
+		cfg: EngineConfig{
+			DefaultMemoryLimitMB: 16,
+			MaxMemoryLimitMB:     math.MaxInt,
+		},
+	}
+
+	if got := eng.effectiveMemoryPages(0); got != 16*wasmPagesPerMB {
+		t.Fatalf("effectiveMemoryPages(0) = %d, want %d", got, 16*wasmPagesPerMB)
+	}
+	wantMax := uint32(math.MaxUint32/wasmPagesPerMB) * wasmPagesPerMB
+	if got := eng.effectiveMemoryPages(math.MaxInt); got != wantMax {
+		t.Fatalf("effectiveMemoryPages(math.MaxInt) = %d, want %d", got, wantMax)
+	}
+
+	negEng := &Engine{
+		cfg: EngineConfig{
+			DefaultMemoryLimitMB: -1,
+			MaxMemoryLimitMB:     64,
+		},
+	}
+	if got := negEng.effectiveMemoryPages(-5); got != 0 {
+		t.Fatalf("effectiveMemoryPages(-5) with negative default = %d, want 0", got)
 	}
 }

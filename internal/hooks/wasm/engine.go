@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -255,6 +256,13 @@ func (e *Engine) effectiveMemoryPages(memoryLimitMB int) uint32 {
 	}
 	if mb > e.cfg.MaxMemoryLimitMB {
 		mb = e.cfg.MaxMemoryLimitMB
+	}
+	if mb < 0 {
+		return 0
+	}
+	const maxMemoryLimitMB = math.MaxUint32 / wasmPagesPerMB
+	if mb > maxMemoryLimitMB {
+		mb = maxMemoryLimitMB
 	}
 	return uint32(mb) * wasmPagesPerMB
 }
