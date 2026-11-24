@@ -1,3 +1,11 @@
+## [1.9.1](https://github.com/stravin-dev/core/compare/v1.9.0...v1.9.1) (2026-11-24)
+
+
+### Bug Fixes
+
+* **docker:** bump runtime base image to alpine:3.22 (Git 2.49.1) ([ab226e8](https://github.com/stravin-dev/core/commit/ab226e89f20ddcdf97d79fb27e6c1e097b1369eb))
+* **docker:** bump runtime base image to alpine:3.22 (Git 2.49.1) ([#146](https://github.com/stravin-dev/core/issues/146)) ([5adb649](https://github.com/stravin-dev/core/commit/5adb649c7e58de1aee9eed35b00ec7e0b5814bf1))
+
 # [1.9.0](https://github.com/stravin-dev/core/compare/v1.8.1...v1.9.0) (2026-11-24)
 
 
