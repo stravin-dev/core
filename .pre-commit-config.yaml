@@ -22,7 +22,7 @@ repos:
           bash -ec 'if command -v gofmt >/dev/null 2>&1 && [ "${STRAVIN_FORCE_DOCKER_GO:-0}" != "1" ]; then
           out="$(gofmt -l .)";
           else
-          out="$(docker run --rm -v "$PWD:/workspace" -w /workspace "${STRAVIN_GO_IMAGE:-golang:1.24-bookworm}" gofmt -l .)";
+          out="$(docker run --rm -v "$PWD:/workspace" -w /workspace "${STRAVIN_GO_IMAGE:-golang:1.25-bookworm}" gofmt -l .)";
           fi;
           if [ -n "$out" ]; then
           echo "Unformatted Go files:";
