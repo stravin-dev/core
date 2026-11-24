@@ -43,6 +43,9 @@ func TestParseFlagsDefaults(t *testing.T) {
 	if cfg.Duration != 0 {
 		t.Errorf("Duration = %v, want 0", cfg.Duration)
 	}
+	if cfg.RampUp != 5*time.Second {
+		t.Errorf("RampUp = %v, want 5s", cfg.RampUp)
+	}
 	if cfg.ThinkMin != 50*time.Millisecond {
 		t.Errorf("ThinkMin = %v, want 50ms", cfg.ThinkMin)
 	}
@@ -83,6 +86,7 @@ func TestParseFlagsCustomValues(t *testing.T) {
 		"--repos=alpha, beta ,gamma",
 		"--seed=42",
 		"--duration=2m",
+		"--ramp-up=12s",
 		"--think-min=10ms",
 		"--think-max=100ms",
 		"--otel-endpoint=",
@@ -111,8 +115,8 @@ func TestParseFlagsCustomValues(t *testing.T) {
 	if cfg.AdminURL != "http://ctrl:8090" || cfg.AdminToken != "admin-secret" {
 		t.Errorf("admin = %q / %q", cfg.AdminURL, cfg.AdminToken)
 	}
-	if cfg.Tenant != "acme" || cfg.Seed != 42 || cfg.Duration != 2*time.Minute {
-		t.Errorf("tenant/seed/duration = %q/%d/%v", cfg.Tenant, cfg.Seed, cfg.Duration)
+	if cfg.Tenant != "acme" || cfg.Seed != 42 || cfg.Duration != 2*time.Minute || cfg.RampUp != 12*time.Second {
+		t.Errorf("tenant/seed/duration/rampup = %q/%d/%v/%v", cfg.Tenant, cfg.Seed, cfg.Duration, cfg.RampUp)
 	}
 	if cfg.OtelEndpoint != "" || cfg.FlushTimeout != 5*time.Second || cfg.CmdTimeout != 45*time.Second {
 		t.Errorf("otel/flush/cmd = %q/%v/%v", cfg.OtelEndpoint, cfg.FlushTimeout, cfg.CmdTimeout)
@@ -139,6 +143,7 @@ func TestConfigValidateErrors(t *testing.T) {
 		{name: "think max < think min", mutate: func(c *Config) { c.ThinkMin = 200 * time.Millisecond; c.ThinkMax = 100 * time.Millisecond }},
 		{name: "negative think min", mutate: func(c *Config) { c.ThinkMin = -1 * time.Millisecond }},
 		{name: "negative duration", mutate: func(c *Config) { c.Duration = -1 * time.Second }},
+		{name: "negative ramp up", mutate: func(c *Config) { c.RampUp = -1 * time.Second }},
 		{name: "zero flush timeout", mutate: func(c *Config) { c.FlushTimeout = 0 }},
 		{name: "negative cmd timeout", mutate: func(c *Config) { c.CmdTimeout = -1 * time.Second }},
 		{name: "negative max retries", mutate: func(c *Config) { c.MaxRetries = -1 }},
@@ -188,5 +193,16 @@ func TestParseFlagsRespectsEnvShutdownTimeout(t *testing.T) {
 	}
 	if cfgOverride.FlushTimeout != 3*time.Second {
 		t.Fatalf("FlushTimeout override = %v, want 3s", cfgOverride.FlushTimeout)
+	}
+}
+
+func TestParseFlagsRampUpZeroDisablesRampUp(t *testing.T) {
+	var stderr bytes.Buffer
+	cfg, err := ParseFlags([]string{"--ramp-up=0"}, &stderr)
+	if err != nil {
+		t.Fatalf("ParseFlags(--ramp-up=0) unexpected error: %v", err)
+	}
+	if cfg.RampUp != 0 {
+		t.Fatalf("RampUp = %v, want 0", cfg.RampUp)
 	}
 }

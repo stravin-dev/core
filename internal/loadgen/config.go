@@ -27,6 +27,7 @@ type Config struct {
 	Repos        []string
 	Seed         int64
 	Duration     time.Duration
+	RampUp       time.Duration
 	ThinkMin     time.Duration
 	ThinkMax     time.Duration
 	OtelEndpoint string
@@ -52,6 +53,7 @@ func DefaultConfig() Config {
 		SSHAddr:      "127.0.0.1:2222",
 		Tenant:       "loadgen",
 		Repos:        []string{"repo-1", "repo-2", "repo-3"},
+		RampUp:       5 * time.Second,
 		ThinkMin:     50 * time.Millisecond,
 		ThinkMax:     500 * time.Millisecond,
 		OtelEndpoint: "http://127.0.0.1:4317",
@@ -84,6 +86,7 @@ func ParseFlags(args []string, stderr io.Writer) (Config, error) {
 	fs.StringVar(&reposCSV, "repos", strings.Join(cfg.Repos, ","), "comma-separated repository names")
 	fs.Int64Var(&cfg.Seed, "seed", 0, "PRNG seed (0 uses current time)")
 	fs.DurationVar(&cfg.Duration, "duration", 0, "run duration (0 runs continuously until Ctrl+C)")
+	fs.DurationVar(&cfg.RampUp, "ramp-up", cfg.RampUp, "staggered worker startup ramp-up window (0 disables ramp-up)")
 	fs.DurationVar(&cfg.ThinkMin, "think-min", cfg.ThinkMin, "minimum randomized think time between scenarios")
 	fs.DurationVar(&cfg.ThinkMax, "think-max", cfg.ThinkMax, "maximum randomized think time between scenarios")
 	fs.StringVar(&cfg.OtelEndpoint, "otel-endpoint", cfg.OtelEndpoint, "OTLP gRPC endpoint (empty disables OTLP export)")
@@ -126,6 +129,9 @@ func (c Config) Validate() error {
 	}
 	if c.Duration < 0 {
 		return errors.New("loadgen: --duration must be non-negative")
+	}
+	if c.RampUp < 0 {
+		return errors.New("loadgen: --ramp-up must be non-negative")
 	}
 	if c.ThinkMin < 0 || c.ThinkMax < 0 {
 		return errors.New("loadgen: --think-min and --think-max must be non-negative")

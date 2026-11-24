@@ -88,19 +88,12 @@ func (r *Runner) Run(ctx context.Context) RunResult {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < r.cfg.Devs; i++ {
+	for _, s := range buildWorkerSchedule(r.cfg.Devs, r.cfg.Agents, r.cfg.RampUp) {
 		wg.Add(1)
-		go func(workerID int) {
+		go func(slot workerSlot) {
 			defer wg.Done()
-			r.runWorker(runCtx, cancel, PersonaDev, workerID, seed)
-		}(i)
-	}
-	for i := 0; i < r.cfg.Agents; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			r.runWorker(runCtx, cancel, PersonaAgent, workerID, seed)
-		}(i)
+			r.runWorker(runCtx, cancel, slot.persona, slot.workerID, seed, slot.delay)
+		}(s)
 	}
 
 	wg.Wait()
@@ -113,7 +106,11 @@ func (r *Runner) Run(ctx context.Context) RunResult {
 	}
 }
 
-func (r *Runner) runWorker(ctx context.Context, cancelRun context.CancelFunc, persona Persona, workerID int, baseSeed int64) {
+func (r *Runner) runWorker(ctx context.Context, cancelRun context.CancelFunc, persona Persona, workerID int, baseSeed int64, startDelay time.Duration) {
+	if !sleepContext(ctx, startDelay) {
+		return
+	}
+
 	metricCtx := context.Background()
 	r.tel.AddActiveThreads(metricCtx, persona, 1)
 	defer r.tel.AddActiveThreads(metricCtx, persona, -1)
@@ -274,4 +271,45 @@ func nextThinkDuration(minD, maxD time.Duration, rng *rand.Rand) time.Duration {
 	}
 	span := int64(maxD - minD)
 	return minD + time.Duration(rng.Int64N(span+1))
+}
+
+type workerSlot struct {
+	persona  Persona
+	workerID int
+	delay    time.Duration
+}
+
+// buildWorkerSchedule assigns each dev and agent worker an evenly spaced start
+// slot across rampUp, interleaving personas proportionally so both ramp
+// smoothly across the window.
+func buildWorkerSchedule(devs, agents int, rampUp time.Duration) []workerSlot {
+	total := devs + agents
+	if total <= 0 {
+		return nil
+	}
+	var slot time.Duration
+	if total > 1 && rampUp > 0 {
+		slot = rampUp / time.Duration(total)
+	}
+	schedule := make([]workerSlot, 0, total)
+	devIdx, agentIdx := 0, 0
+	for k := 0; k < total; k++ {
+		delay := time.Duration(k) * slot
+		if devIdx < devs && (agentIdx >= agents || devIdx*agents <= agentIdx*devs) {
+			schedule = append(schedule, workerSlot{
+				persona:  PersonaDev,
+				workerID: devIdx,
+				delay:    delay,
+			})
+			devIdx++
+		} else {
+			schedule = append(schedule, workerSlot{
+				persona:  PersonaAgent,
+				workerID: agentIdx,
+				delay:    delay,
+			})
+			agentIdx++
+		}
+	}
+	return schedule
 }
