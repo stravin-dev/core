@@ -3,6 +3,7 @@ package ctrl
 import (
 	"context"
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -457,4 +458,37 @@ func TestRecoveryAuditKey(t *testing.T) {
 	if _, err := RecoveryAuditKey(RecoveryAuditRecord{Repo: rk}); err == nil {
 		t.Fatal("expected error for empty audit_id")
 	}
+}
+
+func TestRecoveryReconciler_OverflowEpochClampedInSpan(t *testing.T) {
+	clk := &fakeClock{now: time.Date(2026, 11, 21, 15, 25, 0, 0, time.UTC)}
+	rk, _ := tenant.NewRepoKey("acme", "recovery-overflow")
+
+	ddbStore := newMemScrubDDB()
+	ddbStore.seedRepo(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-west-2", FailoverEpoch: lease.Epoch(math.MaxInt64) + 1, RefShards: 1, ManifestShards: 1, WriteState: lease.ModeDraining,
+	})
+
+	tel, err := telemetry.NewInMemoryProvider("stravin-ctrl")
+	if err != nil {
+		t.Fatalf("NewInMemoryProvider: %v", err)
+	}
+	defer func() { _ = tel.Shutdown(context.Background()) }()
+
+	metrics, err := NewMetrics(tel)
+	if err != nil {
+		t.Fatalf("NewMetrics: %v", err)
+	}
+
+	reconciler, err := NewRecoveryReconciler(RecoveryConfig{
+		DDB: ddbStore, S3: newMemScrubS3(), Region: "us-east-1", Clock: clk, Metrics: metrics,
+	})
+	if err != nil {
+		t.Fatalf("NewRecoveryReconciler: %v", err)
+	}
+
+	if _, err := reconciler.ReconcileRepo(context.Background(), RecoveryRequest{Repo: rk}); err != nil {
+		t.Fatalf("ReconcileRepo: %v", err)
+	}
+	assertSpanFailoverEpoch(t, tel.SpanExporter.GetSpans(), "ctrl.recovery.reconcile", math.MaxInt64)
 }

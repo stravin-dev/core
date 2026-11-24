@@ -2,11 +2,13 @@ package ctrl
 
 import (
 	"context"
+	"math"
 	"slices"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"stravin.dev/core/internal/lease"
 	"stravin.dev/core/internal/telemetry"
@@ -60,4 +62,46 @@ func TestScrubDurationHistogram_UsesSecondScaleBuckets(t *testing.T) {
 	if dp.BucketCounts[3] != 1 {
 		t.Errorf("bucket (0.01, 0.025] count = %d, want 1 (counts: %v)", dp.BucketCounts[3], dp.BucketCounts)
 	}
+}
+
+func TestEpochToInt64(t *testing.T) {
+	tests := []struct {
+		name  string
+		epoch lease.Epoch
+		want  int64
+	}{
+		{name: "zero", epoch: 0, want: 0},
+		{name: "small", epoch: 42, want: 42},
+		{name: "max int64", epoch: lease.Epoch(math.MaxInt64), want: math.MaxInt64},
+		{name: "max int64 plus one", epoch: lease.Epoch(math.MaxInt64) + 1, want: math.MaxInt64},
+		{name: "max uint64", epoch: lease.Epoch(math.MaxUint64), want: math.MaxInt64},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := epochToInt64(tc.epoch); got != tc.want {
+				t.Errorf("epochToInt64(%d) = %d, want %d", tc.epoch, got, tc.want)
+			}
+		})
+	}
+}
+
+func assertSpanFailoverEpoch(t *testing.T, spans tracetest.SpanStubs, spanName string, want int64) {
+	t.Helper()
+	for _, sp := range spans {
+		if sp.Name != spanName {
+			continue
+		}
+		for _, attr := range sp.Attributes {
+			if attr.Key == telemetry.AttrFailoverEpoch {
+				if got := attr.Value.AsInt64(); got != want {
+					t.Errorf("span %q %s = %d, want %d", spanName, telemetry.AttrFailoverEpoch, got, want)
+				}
+				return
+			}
+		}
+		t.Errorf("span %q missing attribute %s", spanName, telemetry.AttrFailoverEpoch)
+		return
+	}
+	t.Fatalf("span %q not found in %d recorded spans", spanName, len(spans))
 }

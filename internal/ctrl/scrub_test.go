@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -491,4 +492,37 @@ func TestScrubber_DryRunAndTransientS3Error(t *testing.T) {
 	if _, ok := ddbStore.refs[rk.String()]["refs/heads/main"]; !ok {
 		t.Fatalf("transient S3 error must not mutate ref state")
 	}
+}
+
+func TestScrubber_OverflowEpochClampedInSpan(t *testing.T) {
+	clk := &fakeClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
+	rk, _ := tenant.NewRepoKey("acme", "scrub-overflow")
+
+	ddbStore := newMemScrubDDB()
+	ddbStore.seedRepo(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: lease.Epoch(math.MaxUint64), RefShards: 1, ManifestShards: 1, WriteState: lease.ModeActive,
+	})
+
+	tel, err := telemetry.NewInMemoryProvider("stravin-ctrl")
+	if err != nil {
+		t.Fatalf("NewInMemoryProvider: %v", err)
+	}
+	defer func() { _ = tel.Shutdown(context.Background()) }()
+
+	metrics, err := NewMetrics(tel)
+	if err != nil {
+		t.Fatalf("NewMetrics: %v", err)
+	}
+
+	scrubber, err := NewScrubber(ScrubConfig{
+		DDB: ddbStore, S3: newMemScrubS3(), Region: "us-east-1", Clock: clk, Metrics: metrics,
+	})
+	if err != nil {
+		t.Fatalf("NewScrubber: %v", err)
+	}
+
+	if _, err := scrubber.ScrubRepo(context.Background(), ScrubRequest{Repo: rk}); err != nil {
+		t.Fatalf("ScrubRepo: %v", err)
+	}
+	assertSpanFailoverEpoch(t, tel.SpanExporter.GetSpans(), "ctrl.scrub.region", math.MaxInt64)
 }

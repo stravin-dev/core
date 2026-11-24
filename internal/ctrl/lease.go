@@ -413,7 +413,7 @@ func (m *LeaseManager) FenceRegion(ctx context.Context, req FenceRequest) (Fence
 
 	spanAttrs := telemetry.NewSpanAttrs().
 		HomeRegion(string(m.region)).
-		FailoverEpoch(int64(newEpoch))
+		FailoverEpoch(epochToInt64(newEpoch))
 	if req.Repo != nil {
 		spanAttrs.TenantID(string(req.Repo.TenantID)).RepoID(string(req.Repo.RepoID))
 	}
@@ -531,7 +531,7 @@ func (m *LeaseManager) UpdateRepoEpoch(ctx context.Context, repo tenant.RepoKey,
 			TenantID(string(repo.TenantID)).
 			RepoID(string(repo.RepoID)).
 			HomeRegion(string(current.HomeRegion)).
-			FailoverEpoch(int64(targetEpoch)).
+			FailoverEpoch(epochToInt64(targetEpoch)).
 			Build()...,
 	))
 	defer span.End()

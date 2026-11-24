@@ -276,7 +276,7 @@ func (c *reconcileRepoCommand) Execute(ctx context.Context) (RecoveryReport, err
 			TenantID(string(req.Repo.TenantID)).
 			RepoID(string(req.Repo.RepoID)).
 			HomeRegion(string(meta.HomeRegion)).
-			FailoverEpoch(int64(meta.FailoverEpoch)).
+			FailoverEpoch(epochToInt64(meta.FailoverEpoch)).
 			Build()...,
 	))
 	defer span.End()
