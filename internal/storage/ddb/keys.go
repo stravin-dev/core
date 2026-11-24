@@ -25,7 +25,7 @@ const (
 	MaxManifestShards = 32
 
 	// MaxAtomicPushRefs caps per-push ref updates to stay safely under
-	// DynamoDB's 100-item TransactWriteItems limit (45*2 RS+RH + 1 MS = 91).
+	// DynamoDB's 100-item TransactWriteItems limit (45*2 RS+RH + 1 MS + 1 META = 92).
 	MaxAtomicPushRefs = 45
 
 	// ZeroOID is Git's 40-zero null SHA-1 object ID used for branch creation/deletion.

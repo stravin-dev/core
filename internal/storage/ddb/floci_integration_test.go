@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 	streamtypes "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
 
@@ -416,4 +417,132 @@ func streamNum(img map[string]streamtypes.AttributeValue, k string) string {
 		return ""
 	}
 	return n.Value
+}
+
+func TestFlociIntegration_MetaVersionBumps(t *testing.T) {
+	ddbClient, _, table := newFlociClients(t)
+	ctx := context.Background()
+
+	repo, err := NewRepository(ddbClient, table)
+	if err != nil {
+		t.Fatalf("NewRepository: %v", err)
+	}
+
+	nonce := fmt.Sprintf("ver-%d", time.Now().UnixNano())
+	rk := mustRepoKey(t, "local", nonce)
+	metaKey, err := MetaKey(rk)
+	if err != nil {
+		t.Fatalf("MetaKey: %v", err)
+	}
+
+	// Put a legacy META item without ref_version or manifest_version attributes.
+	_, err = ddbClient.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(table),
+		Item: map[string]types.AttributeValue{
+			AttrPK:            attrS(metaKey.PK),
+			AttrSK:            attrS(metaKey.SK),
+			"tenant_id":       attrS(string(rk.TenantID)),
+			"repo_id":         attrS(string(rk.RepoID)),
+			"home_region":     attrS("us-east-1"),
+			"failover_epoch":  attrNUint64(1),
+			"ref_shards":      attrNInt(2),
+			"manifest_shards": attrNInt(2),
+			"write_state":     attrS(string(lease.ModeActive)),
+			"default_branch":  attrS("refs/heads/main"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("PutItem(legacy META): %v", err)
+	}
+
+	got, err := repo.GetMeta(ctx, rk)
+	if err != nil {
+		t.Fatalf("GetMeta(initial): %v", err)
+	}
+	if got.RefVersion != 0 || got.ManifestVersion != 0 {
+		t.Fatalf("initial versions = (%d, %d), want (0, 0)", got.RefVersion, got.ManifestVersion)
+	}
+
+	// 1. Push with pack bumps both ref_version and manifest_version (0 -> 1, 0 -> 1).
+	pushRes, err := repo.CommitPush(ctx, CommitPushInput{
+		Repo:           rk,
+		RefShards:      2,
+		ManifestShards: 2,
+		Epoch:          1,
+		OriginRegion:   "us-east-1",
+		Updates: []RefUpdate{
+			{RefName: "refs/heads/main", OldOID: ZeroOID, NewOID: oidA},
+		},
+		Pack: &PackUpload{PackID: "pack-v1", SizeBytes: 128},
+	})
+	if err != nil {
+		t.Fatalf("CommitPush(with pack): %v", err)
+	}
+	got, err = repo.GetMeta(ctx, rk)
+	if err != nil {
+		t.Fatalf("GetMeta(after push 1): %v", err)
+	}
+	if got.RefVersion != 1 || got.ManifestVersion != 1 {
+		t.Fatalf("after push 1 versions = (%d, %d), want (1, 1)", got.RefVersion, got.ManifestVersion)
+	}
+
+	// 2. Delete-only push without pack bumps only ref_version (1 -> 2, manifest stays 1).
+	if _, err := repo.CommitPush(ctx, CommitPushInput{
+		Repo:           rk,
+		RefShards:      2,
+		ManifestShards: 2,
+		Epoch:          1,
+		OriginRegion:   "us-east-1",
+		Updates: []RefUpdate{
+			{RefName: "refs/heads/main", OldOID: oidA, NewOID: ZeroOID},
+		},
+	}); err != nil {
+		t.Fatalf("CommitPush(delete-only): %v", err)
+	}
+	got, err = repo.GetMeta(ctx, rk)
+	if err != nil {
+		t.Fatalf("GetMeta(after push 2): %v", err)
+	}
+	if got.RefVersion != 2 || got.ManifestVersion != 1 {
+		t.Fatalf("after push 2 versions = (%d, %d), want (2, 1)", got.RefVersion, got.ManifestVersion)
+	}
+
+	// 3. PublishCompactedPacks bumps manifest_version (1 -> 2).
+	compactedULID, err := NewULID(time.Now().UTC().Add(time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewULID: %v", err)
+	}
+	if err := repo.PublishCompactedPacks(ctx, rk, 2, []PackManifest{{
+		Repo:         rk,
+		ULID:         compactedULID,
+		PackID:       "pack-compacted",
+		SizeBytes:    256,
+		OriginRegion: "us-east-1",
+		Status:       PackStatusActive,
+	}}); err != nil {
+		t.Fatalf("PublishCompactedPacks: %v", err)
+	}
+	got, err = repo.GetMeta(ctx, rk)
+	if err != nil {
+		t.Fatalf("GetMeta(after publish): %v", err)
+	}
+	if got.RefVersion != 2 || got.ManifestVersion != 2 {
+		t.Fatalf("after publish versions = (%d, %d), want (2, 2)", got.RefVersion, got.ManifestVersion)
+	}
+
+	// 4. SupersedePacks bumps manifest_version (2 -> 3).
+	if err := repo.SupersedePacks(ctx, rk, 2, []PackManifest{{
+		Repo:   rk,
+		ULID:   pushRes.ULID,
+		PackID: "pack-v1",
+	}}); err != nil {
+		t.Fatalf("SupersedePacks: %v", err)
+	}
+	got, err = repo.GetMeta(ctx, rk)
+	if err != nil {
+		t.Fatalf("GetMeta(after supersede): %v", err)
+	}
+	if got.RefVersion != 2 || got.ManifestVersion != 3 {
+		t.Fatalf("after supersede versions = (%d, %d), want (2, 3)", got.RefVersion, got.ManifestVersion)
+	}
 }

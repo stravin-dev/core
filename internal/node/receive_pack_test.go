@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -100,6 +101,13 @@ func (f *fakePushStore) CommitPush(_ context.Context, in ddb.CommitPushInput) (d
 			OriginRegion: in.Pack.OriginRegion,
 			Status:       ddb.PackStatusActive,
 		})
+	}
+	if m, ok := f.metas[in.Repo]; ok {
+		m.RefVersion++
+		if in.Pack != nil {
+			m.ManifestVersion++
+		}
+		f.metas[in.Repo] = m
 	}
 
 	return ddb.CommitPushResult{
@@ -1683,5 +1691,152 @@ func TestReceivePackHandler_UpdateNonExistentRefViaGetRefRejectedAsStale(t *test
 	}
 	if got := ddbStore.GetRefCalls(); got != 1 {
 		t.Errorf("GetRefCalls = %d, want 1", got)
+	}
+}
+
+func TestReceivePack_SameNodePushUpdatesVersionedCache(t *testing.T) {
+	ctx := context.Background()
+	rk, _ := tenant.NewRepoKey("acme", "same-node-cache")
+
+	commit1, pack1, idx1 := buildSyntheticCommitPackForSync(t, pack.SHA1, "base\n", "base commit\n")
+	commit2, pack2, _ := buildSyntheticCommitPackForSync(t, pack.SHA1, "next\n", "next commit\n")
+	packID1 := strings.Repeat("b", 64)
+
+	ddbStore := newFakePushStore()
+	ddbStore.PutMeta(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1,
+		RefShards: 2, ManifestShards: 1, WriteState: lease.ModeActive, DefaultBranch: "refs/heads/main",
+		RefVersion: 1, ManifestVersion: 1,
+	})
+	ddbStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: commit1},
+	})
+	ddbStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5F01", PackID: packID1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+
+	s3Store := newFakeS3WriteStore()
+	s3Store.Put(packID1, pack1, idx1)
+	nvmeCache, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	leaseBox := &fakeRegionalLeaseStore{
+		lease: ddb.RegionalWriteLease{
+			Region: "us-east-1", Epoch: 1, Mode: lease.ModeActive,
+			HolderID: "ctrl-1", ExpiresAt: time.Now().UTC().Add(5 * time.Minute),
+		},
+	}
+	refresher, err := NewLeaseRefresher(LeaseRefresherConfig{Store: leaseBox, Region: "us-east-1"})
+	if err != nil {
+		t.Fatalf("NewLeaseRefresher: %v", err)
+	}
+	if err := refresher.RefreshOnce(ctx); err != nil {
+		t.Fatalf("RefreshOnce: %v", err)
+	}
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:                   ddbStore,
+		Packs:                  s3Store,
+		Cache:                  nvmeCache,
+		PruneReconcileInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+	wh, err := NewReceivePackHandler(ReceivePackConfig{
+		Materializer: mat, Cache: nvmeCache, Packs: s3Store,
+		Committer: ddbStore, LeaseRefresher: refresher, Region: "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("NewReceivePackHandler: %v", err)
+	}
+	srv, err := NewServer(ServerConfig{
+		Materializer: mat, GitExecutor: newSpyBareRepoExecutor(), WriteHandler: wh,
+		LeaseRefresher: refresher, Region: "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	client := startBufconnNode(t, srv)
+
+	// Warm both refCache (v1) and syncedManifestVersion (v1) via SyncAndPin.
+	warm, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(warm): %v", err)
+	}
+	warm.Handle.Release()
+	listBeforePush := ddbStore.ListRefsCalls()
+	manifestBeforePush := ddbStore.QueryManifestCalls()
+
+	// Same-node push updating refs/heads/main and creating refs/heads/feat with pack2.
+	wire := buildPushWirePayload(
+		[]ddb.RefUpdate{
+			{RefName: "refs/heads/main", OldOID: commit1, NewOID: commit2},
+			{RefName: "refs/heads/feat", OldOID: ddb.ZeroOID, NewOID: commit2},
+		},
+		"report-status side-band-64k",
+		pack2,
+	)
+	outCtx := metadata.AppendToOutgoingContext(ctx, HeaderStatelessRPC, "true")
+	resp, exitCode, err := sendReceivePack(t, outCtx, client, rk, "", wire)
+	if err != nil {
+		t.Fatalf("sendReceivePack: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("exitCode = %d, want 0", exitCode)
+	}
+	band1, _ := splitSideBandResponse(t, resp)
+	lines := decodePktLines(t, band1)
+	if len(lines) != 3 || lines[0] != "unpack ok\n" || lines[1] != "ok refs/heads/main\n" || lines[2] != "ok refs/heads/feat\n" {
+		t.Fatalf("unexpected report-status lines: %q", lines)
+	}
+
+	// Subsequent LoadAuthoritativeRefs sees v2 from GetMeta and serves updated refs with 0 ListRefs calls!
+	gotMeta, gotRefs, err := mat.LoadAuthoritativeRefs(ctx, rk)
+	if err != nil {
+		t.Fatalf("LoadAuthoritativeRefs(after push): %v", err)
+	}
+	if gotMeta.RefVersion != 2 || gotMeta.ManifestVersion != 2 {
+		t.Fatalf("got versions = (%d, %d), want (2, 2)", gotMeta.RefVersion, gotMeta.ManifestVersion)
+	}
+	if ddbStore.ListRefsCalls() != listBeforePush {
+		t.Fatalf("ListRefsCalls = %d, want %d (0 extra ListRefs after same-node push)", ddbStore.ListRefsCalls(), listBeforePush)
+	}
+	if len(gotRefs) != 2 || gotRefs[0].RefName != "refs/heads/feat" || gotRefs[0].OID != commit2 ||
+		gotRefs[1].RefName != "refs/heads/main" || gotRefs[1].OID != commit2 {
+		t.Fatalf("unexpected cached refs after push: %+v", gotRefs)
+	}
+
+	// Next SyncAndPin updates on-disk reftable with 0 ListRefs and 0 QueryManifestShard calls!
+	synced, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(after push): %v", err)
+	}
+	mainOut, err := exec.Command("git", "-C", synced.Handle.Path(), "rev-parse", "refs/heads/main").CombinedOutput()
+	featOut, featErr := exec.Command("git", "-C", synced.Handle.Path(), "rev-parse", "refs/heads/feat").CombinedOutput()
+	synced.Handle.Release()
+	if err != nil || strings.TrimSpace(string(mainOut)) != commit2 {
+		t.Fatalf("reftable refs/heads/main = %q (err=%v), want %q", strings.TrimSpace(string(mainOut)), err, commit2)
+	}
+	if featErr != nil || strings.TrimSpace(string(featOut)) != commit2 {
+		t.Fatalf("reftable refs/heads/feat = %q (err=%v), want %q", strings.TrimSpace(string(featOut)), featErr, commit2)
+	}
+	if ddbStore.ListRefsCalls() != listBeforePush {
+		t.Fatalf("ListRefsCalls after SyncAndPin = %d, want %d", ddbStore.ListRefsCalls(), listBeforePush)
+	}
+	if ddbStore.QueryManifestCalls() != manifestBeforePush {
+		t.Fatalf("QueryManifestCalls after SyncAndPin = %d, want %d", ddbStore.QueryManifestCalls(), manifestBeforePush)
+	}
+
+	// Simulate a racing push on another node (RefVersion jumps 2 -> 4): next LoadAuthoritativeRefs must reload via ListRefs.
+	racedMeta := gotMeta
+	racedMeta.RefVersion = 4
+	ddbStore.PutMeta(racedMeta)
+	if _, _, err := mat.LoadAuthoritativeRefs(ctx, rk); err != nil {
+		t.Fatalf("LoadAuthoritativeRefs(after race): %v", err)
+	}
+	if ddbStore.ListRefsCalls() != listBeforePush+1 {
+		t.Fatalf("ListRefsCalls after external race = %d, want %d", ddbStore.ListRefsCalls(), listBeforePush+1)
 	}
 }

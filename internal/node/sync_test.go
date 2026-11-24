@@ -2068,3 +2068,228 @@ func TestMaterializer_SyncManifestPacksParallelShards(t *testing.T) {
 		}
 	}
 }
+
+func TestMaterializer_VersionGatedCache_ZeroListRefsAndManifestQueries(t *testing.T) {
+	ctx := context.Background()
+	rk, _ := tenant.NewRepoKey("acme", "versioned-cache")
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	commit1, pack1, idx1 := buildSyntheticCommitPackForSync(t, pack.SHA1, "v1\n", "commit 1\n")
+	commit2, pack2, idx2 := buildSyntheticCommitPackForSync(t, pack.SHA1, "v2\n", "commit 2\n")
+	packID1 := strings.Repeat("1", 64)
+	packID2 := strings.Repeat("2", 64)
+
+	meta := ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1,
+		RefShards: 2, ManifestShards: 2, WriteState: lease.ModeActive, DefaultBranch: "refs/heads/main",
+		RefVersion: 1, ManifestVersion: 1,
+	}
+	metaStore := newFakeMetadataStore()
+	metaStore.PutMeta(meta)
+	metaStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: commit1},
+	})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5F01", PackID: packID1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	packStore := newFakePackFetcher()
+	packStore.Put(packID1, pack1, idx1)
+	packStore.Put(packID2, pack2, idx2)
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:                   metaStore,
+		Packs:                  packStore,
+		Cache:                  c,
+		PruneReconcileInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	// 1. First LoadAuthoritativeRefs populates refCache (1 ListRefs).
+	gotMeta, gotRefs, err := mat.LoadAuthoritativeRefs(ctx, rk)
+	if err != nil {
+		t.Fatalf("LoadAuthoritativeRefs(1): %v", err)
+	}
+	if gotMeta.RefVersion != 1 || len(gotRefs) != 1 || gotRefs[0].OID != commit1 {
+		t.Fatalf("unexpected first load: meta=%+v refs=%+v", gotMeta, gotRefs)
+	}
+	if metaStore.ListRefsCalls() != 1 {
+		t.Fatalf("ListRefsCalls = %d, want 1", metaStore.ListRefsCalls())
+	}
+	// Mutating returned slice must not corrupt cache.
+	gotRefs[0].OID = "corrupted"
+
+	// 2. Repeated LoadAuthoritativeRefs with unchanged RefVersion makes 0 ListRefs calls.
+	_, gotRefs2, err := mat.LoadAuthoritativeRefs(ctx, rk)
+	if err != nil {
+		t.Fatalf("LoadAuthoritativeRefs(2): %v", err)
+	}
+	if len(gotRefs2) != 1 || gotRefs2[0].OID != commit1 {
+		t.Fatalf("cached refs corrupted or wrong: %+v", gotRefs2)
+	}
+	if metaStore.ListRefsCalls() != 1 {
+		t.Fatalf("ListRefsCalls after cached read = %d, want 1", metaStore.ListRefsCalls())
+	}
+
+	// 3. First SyncAndPin reuses refCache (0 extra ListRefs), syncs manifest shards, materializes reftable.
+	res1, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(1): %v", err)
+	}
+	res1.Handle.Release()
+	if metaStore.ListRefsCalls() != 1 {
+		t.Fatalf("ListRefsCalls after first SyncAndPin = %d, want 1", metaStore.ListRefsCalls())
+	}
+	manifestCallsAfterFirst := metaStore.QueryManifestCalls()
+	if manifestCallsAfterFirst == 0 {
+		t.Fatalf("expected initial manifest queries > 0")
+	}
+
+	// 4. Repeated SyncAndPin with unchanged versions hits fast path: 0 ListRefs, 0 QueryManifestShard.
+	res2, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(2): %v", err)
+	}
+	if res2.Meta.RefVersion != 1 || len(res2.Refs) != 1 || res2.Refs[0].OID != commit1 {
+		res2.Handle.Release()
+		t.Fatalf("unexpected fast-path SyncAndPin result: %+v", res2)
+	}
+	res2.Handle.Release()
+	if metaStore.ListRefsCalls() != 1 {
+		t.Fatalf("ListRefsCalls after fast-path SyncAndPin = %d, want 1", metaStore.ListRefsCalls())
+	}
+	if metaStore.QueryManifestCalls() != manifestCallsAfterFirst {
+		t.Fatalf("QueryManifestCalls after fast-path SyncAndPin = %d, want %d", metaStore.QueryManifestCalls(), manifestCallsAfterFirst)
+	}
+
+	// 5. External RefVersion bump (1 -> 2, ManifestVersion unchanged) immediately reloads ListRefs & updates reftable with 0 QueryManifestShard.
+	meta.RefVersion = 2
+	metaStore.PutMeta(meta)
+	metaStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: commit1},
+		{Repo: rk, RefName: "refs/heads/release", OID: commit1},
+	})
+
+	_, gotRefs3, err := mat.LoadAuthoritativeRefs(ctx, rk)
+	if err != nil {
+		t.Fatalf("LoadAuthoritativeRefs(after external bump): %v", err)
+	}
+	if len(gotRefs3) != 2 || gotRefs3[1].RefName != "refs/heads/release" || gotRefs3[1].OID != commit1 {
+		t.Fatalf("expected refs/heads/release=%s, got %+v", commit1, gotRefs3)
+	}
+	if metaStore.ListRefsCalls() != 2 {
+		t.Fatalf("ListRefsCalls after external bump = %d, want 2", metaStore.ListRefsCalls())
+	}
+
+	res3, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(after external RefVersion bump): %v", err)
+	}
+	out, err := exec.Command("git", "-C", res3.Handle.Path(), "rev-parse", "refs/heads/release").CombinedOutput()
+	res3.Handle.Release()
+	if err != nil {
+		t.Fatalf("git rev-parse: %v (%s)", err, string(out))
+	}
+	if strings.TrimSpace(string(out)) != commit1 {
+		t.Fatalf("reftable refs/heads/release = %q, want %q", strings.TrimSpace(string(out)), commit1)
+	}
+	if metaStore.ListRefsCalls() != 2 {
+		t.Fatalf("ListRefsCalls after SyncAndPin = %d, want 2", metaStore.ListRefsCalls())
+	}
+	if metaStore.QueryManifestCalls() != manifestCallsAfterFirst {
+		t.Fatalf("QueryManifestCalls after ref-only bump = %d, want %d", metaStore.QueryManifestCalls(), manifestCallsAfterFirst)
+	}
+
+	// 6. External ManifestVersion bump (1 -> 2) triggers manifest sync and installs pack2.
+	meta.ManifestVersion = 2
+	metaStore.PutMeta(meta)
+	metaStore.AddManifest(rk, 1, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5F02", PackID: packID2, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	res4, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(after ManifestVersion bump): %v", err)
+	}
+	res4.Handle.Release()
+	if !c.HasPack(rk, packID2) {
+		t.Fatalf("expected pack2 installed after ManifestVersion bump")
+	}
+	if metaStore.QueryManifestCalls() <= manifestCallsAfterFirst {
+		t.Fatalf("expected QueryManifestCalls to increase after ManifestVersion bump")
+	}
+	if metaStore.ListRefsCalls() != 2 {
+		t.Fatalf("ListRefsCalls after manifest-only bump = %d, want 2", metaStore.ListRefsCalls())
+	}
+	_ = commit2
+}
+
+func TestMaterializer_VersionZeroAlwaysQueries(t *testing.T) {
+	ctx := context.Background()
+	rk, _ := tenant.NewRepoKey("acme", "version-zero")
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	commit1, pack1, idx1 := buildSyntheticCommitPackForSync(t, pack.SHA1, "v0\n", "commit 0\n")
+	packID1 := strings.Repeat("a", 64)
+
+	metaStore := newFakeMetadataStore()
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1,
+		RefShards: 1, ManifestShards: 1, WriteState: lease.ModeActive, DefaultBranch: "refs/heads/main",
+		RefVersion: 0, ManifestVersion: 0,
+	})
+	metaStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: commit1},
+	})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5F01", PackID: packID1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	packStore := newFakePackFetcher()
+	packStore.Put(packID1, pack1, idx1)
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:                   metaStore,
+		Packs:                  packStore,
+		Cache:                  c,
+		PruneReconcileInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	for i := 1; i <= 2; i++ {
+		if _, _, err := mat.LoadAuthoritativeRefs(ctx, rk); err != nil {
+			t.Fatalf("LoadAuthoritativeRefs(%d): %v", i, err)
+		}
+		if metaStore.ListRefsCalls() != i {
+			t.Fatalf("ListRefsCalls = %d, want %d for version 0", metaStore.ListRefsCalls(), i)
+		}
+	}
+
+	r1, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(1): %v", err)
+	}
+	r1.Handle.Release()
+	qAfter1 := metaStore.QueryManifestCalls()
+
+	r2, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(2): %v", err)
+	}
+	r2.Handle.Release()
+	if metaStore.ListRefsCalls() != 4 {
+		t.Fatalf("ListRefsCalls = %d, want 4 for version 0", metaStore.ListRefsCalls())
+	}
+	if metaStore.QueryManifestCalls() <= qAfter1 {
+		t.Fatalf("QueryManifestCalls = %d, want > %d for version 0", metaStore.QueryManifestCalls(), qAfter1)
+	}
+}

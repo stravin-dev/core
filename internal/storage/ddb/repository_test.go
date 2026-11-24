@@ -359,3 +359,191 @@ func TestRepository_ListRefsParallelShardsDeterministicSort(t *testing.T) {
 		}
 	}
 }
+
+func TestRepository_MetaVersionsRoundTripAndConsistentRead(t *testing.T) {
+	repo := mustRepoKey(t, "acme", "meta-ver")
+	metaKey, err := MetaKey(repo)
+	if err != nil {
+		t.Fatalf("MetaKey: %v", err)
+	}
+
+	// Legacy META without ref_version / manifest_version defaults to 0.
+	legacyItem := map[string]types.AttributeValue{
+		AttrPK:            attrS(metaKey.PK),
+		AttrSK:            attrS(metaKey.SK),
+		"home_region":     attrS("us-east-1"),
+		"failover_epoch":  attrNUint64(1),
+		"ref_shards":      attrNInt(2),
+		"manifest_shards": attrNInt(2),
+		"write_state":     attrS(string(lease.ModeActive)),
+	}
+	legacy, err := unmarshalRepoMeta(repo, legacyItem)
+	if err != nil {
+		t.Fatalf("unmarshalRepoMeta(legacy): %v", err)
+	}
+	if legacy.RefVersion != 0 || legacy.ManifestVersion != 0 {
+		t.Fatalf("legacy versions = (%d, %d), want (0, 0)", legacy.RefVersion, legacy.ManifestVersion)
+	}
+
+	// Versioned META round-trips through GetMeta with ConsistentRead=true.
+	wantMeta := RepoMeta{
+		Repo:            repo,
+		HomeRegion:      "us-east-1",
+		FailoverEpoch:   2,
+		RefShards:       4,
+		ManifestShards:  2,
+		WriteState:      lease.ModeActive,
+		DefaultBranch:   "refs/heads/main",
+		RefVersion:      11,
+		ManifestVersion: 5,
+	}
+	var gotConsistentRead bool
+	api := &stubAPI{
+		getItemFn: func(_ context.Context, in *dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error) {
+			gotConsistentRead = aws.ToBool(in.ConsistentRead)
+			return &dynamodb.GetItemOutput{Item: marshalRepoMeta(metaKey, wantMeta)}, nil
+		},
+	}
+	r, err := NewRepository(api, "stravin-core")
+	if err != nil {
+		t.Fatalf("NewRepository: %v", err)
+	}
+	got, err := r.GetMeta(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	}
+	if !gotConsistentRead {
+		t.Fatalf("GetMeta ConsistentRead = false, want true")
+	}
+	if got.RefVersion != 11 || got.ManifestVersion != 5 {
+		t.Fatalf("got versions = (%d, %d), want (11, 5)", got.RefVersion, got.ManifestVersion)
+	}
+}
+
+func TestRepository_CompactionBumpsManifestVersion(t *testing.T) {
+	repo := mustRepoKey(t, "acme", "compact-ver")
+	metaKey, err := MetaKey(repo)
+	if err != nil {
+		t.Fatalf("MetaKey: %v", err)
+	}
+
+	makePacks := func(n int) []PackManifest {
+		out := make([]PackManifest, n)
+		for i := 0; i < n; i++ {
+			out[i] = PackManifest{
+				Repo:         repo,
+				ULID:         "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+				PackID:       "pack-" + string(rune('a'+(i%26))) + "-" + time.Duration(i).String(),
+				SizeBytes:    128,
+				OriginRegion: "us-east-1",
+				Status:       PackStatusActive,
+			}
+		}
+		return out
+	}
+
+	t.Run("PublishCompactedPacks_in_tx_when_le_99", func(t *testing.T) {
+		var txItems []types.TransactWriteItem
+		updateCalls := 0
+		api := &stubAPI{
+			transactWriteF: func(_ context.Context, in *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+				txItems = in.TransactItems
+				return &dynamodb.TransactWriteItemsOutput{}, nil
+			},
+			updateItemFn: func(_ context.Context, _ *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error) {
+				updateCalls++
+				return &dynamodb.UpdateItemOutput{}, nil
+			},
+		}
+		r, _ := NewRepository(api, "stravin-core")
+		if err := r.PublishCompactedPacks(context.Background(), repo, 2, makePacks(2)); err != nil {
+			t.Fatalf("PublishCompactedPacks: %v", err)
+		}
+		if len(txItems) != 3 || updateCalls != 0 {
+			t.Fatalf("len(txItems)=%d updateCalls=%d, want 3 and 0", len(txItems), updateCalls)
+		}
+		upd := txItems[2].Update
+		if upd == nil || getString(upd.Key, AttrPK) != metaKey.PK || getString(upd.Key, AttrSK) != metaKey.SK {
+			t.Fatalf("expected META Update at txItems[2], got %+v", txItems[2])
+		}
+		if aws.ToString(upd.UpdateExpression) != "ADD manifest_version :one" {
+			t.Fatalf("UpdateExpression = %q, want ADD manifest_version :one", aws.ToString(upd.UpdateExpression))
+		}
+	})
+
+	t.Run("PublishCompactedPacks_update_after_when_100", func(t *testing.T) {
+		var txLen int
+		var updIn *dynamodb.UpdateItemInput
+		api := &stubAPI{
+			transactWriteF: func(_ context.Context, in *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+				txLen = len(in.TransactItems)
+				return &dynamodb.TransactWriteItemsOutput{}, nil
+			},
+			updateItemFn: func(_ context.Context, in *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error) {
+				updIn = in
+				return &dynamodb.UpdateItemOutput{}, nil
+			},
+		}
+		r, _ := NewRepository(api, "stravin-core")
+		if err := r.PublishCompactedPacks(context.Background(), repo, 2, makePacks(100)); err != nil {
+			t.Fatalf("PublishCompactedPacks(100): %v", err)
+		}
+		if txLen != 100 || updIn == nil {
+			t.Fatalf("txLen=%d updIn=%v, want 100 and non-nil", txLen, updIn)
+		}
+		if aws.ToString(updIn.UpdateExpression) != "ADD manifest_version :one" {
+			t.Fatalf("UpdateExpression = %q, want ADD manifest_version :one", aws.ToString(updIn.UpdateExpression))
+		}
+	})
+
+	t.Run("SupersedePacks_in_tx_when_le_99", func(t *testing.T) {
+		var txItems []types.TransactWriteItem
+		updateCalls := 0
+		api := &stubAPI{
+			transactWriteF: func(_ context.Context, in *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+				txItems = in.TransactItems
+				return &dynamodb.TransactWriteItemsOutput{}, nil
+			},
+			updateItemFn: func(_ context.Context, _ *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error) {
+				updateCalls++
+				return &dynamodb.UpdateItemOutput{}, nil
+			},
+		}
+		r, _ := NewRepository(api, "stravin-core")
+		if err := r.SupersedePacks(context.Background(), repo, 2, makePacks(3)); err != nil {
+			t.Fatalf("SupersedePacks: %v", err)
+		}
+		if len(txItems) != 4 || updateCalls != 0 {
+			t.Fatalf("len(txItems)=%d updateCalls=%d, want 4 and 0", len(txItems), updateCalls)
+		}
+		upd := txItems[3].Update
+		if upd == nil || getString(upd.Key, AttrSK) != "META" || aws.ToString(upd.UpdateExpression) != "ADD manifest_version :one" {
+			t.Fatalf("unexpected META Update at txItems[3]: %+v", txItems[3])
+		}
+	})
+
+	t.Run("SupersedePacks_update_after_when_100", func(t *testing.T) {
+		var txLen int
+		var updIn *dynamodb.UpdateItemInput
+		api := &stubAPI{
+			transactWriteF: func(_ context.Context, in *dynamodb.TransactWriteItemsInput) (*dynamodb.TransactWriteItemsOutput, error) {
+				txLen = len(in.TransactItems)
+				return &dynamodb.TransactWriteItemsOutput{}, nil
+			},
+			updateItemFn: func(_ context.Context, in *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error) {
+				updIn = in
+				return &dynamodb.UpdateItemOutput{}, nil
+			},
+		}
+		r, _ := NewRepository(api, "stravin-core")
+		if err := r.SupersedePacks(context.Background(), repo, 2, makePacks(100)); err != nil {
+			t.Fatalf("SupersedePacks(100): %v", err)
+		}
+		if txLen != 100 || updIn == nil {
+			t.Fatalf("txLen=%d updIn=%v, want 100 and non-nil", txLen, updIn)
+		}
+		if aws.ToString(updIn.UpdateExpression) != "ADD manifest_version :one" {
+			t.Fatalf("UpdateExpression = %q, want ADD manifest_version :one", aws.ToString(updIn.UpdateExpression))
+		}
+	})
+}

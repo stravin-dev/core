@@ -84,6 +84,11 @@ type repoSyncSnapshot struct {
 	refs []ddb.RefState
 }
 
+type cachedRefEntry struct {
+	version uint64
+	refs    []ddb.RefState
+}
+
 type reftableSyncState struct {
 	repoPath   string
 	head       string
@@ -124,6 +129,11 @@ type Materializer struct {
 
 	lastSyncMu sync.Mutex
 	lastSync   map[tenant.RepoKey]repoSyncSnapshot
+
+	versionMu              sync.Mutex
+	refCache               map[tenant.RepoKey]cachedRefEntry
+	syncedManifestVersion  map[tenant.RepoKey]uint64
+	materializedRefVersion map[tenant.RepoKey]uint64
 
 	refStateMu sync.Mutex
 	refState   map[tenant.RepoKey]reftableSyncState
@@ -194,6 +204,9 @@ func NewMaterializer(cfg MaterializerConfig) (*Materializer, error) {
 		refFlights:             newRefLoadFlightGroup(),
 		lastReconcile:          make(map[tenant.RepoKey]time.Time),
 		lastSync:               make(map[tenant.RepoKey]repoSyncSnapshot),
+		refCache:               make(map[tenant.RepoKey]cachedRefEntry),
+		syncedManifestVersion:  make(map[tenant.RepoKey]uint64),
+		materializedRefVersion: make(map[tenant.RepoKey]uint64),
 		refState:               make(map[tenant.RepoKey]reftableSyncState),
 		auxStates:              make(map[tenant.RepoKey]*auxRepoState),
 		auxCtx:                 auxCtx,
@@ -251,22 +264,30 @@ func (m *Materializer) LoadRepoMeta(ctx context.Context, repo tenant.RepoKey) (d
 	return meta, nil
 }
 
-// LoadAuthoritativeRefs reads META and all ref shards (RS#{s}) strictly from
-// DynamoDB without touching local disk or S3. Concurrent callers for the same
-// repository coalesce via linearizable generation-batched singleflight.
+// LoadAuthoritativeRefs reads META (ConsistentRead: true) and returns the
+// authoritative ref list for repo. When meta.RefVersion > 0 and matches the
+// in-memory version-gated ref cache, it returns a copy directly with zero
+// ListRefs calls. On cache miss, concurrent callers coalesce via linearizable
+// generation-batched singleflight.
 func (m *Materializer) LoadAuthoritativeRefs(ctx context.Context, repo tenant.RepoKey) (ddb.RepoMeta, []ddb.RefState, error) {
 	if err := repo.Validate(); err != nil {
 		return ddb.RepoMeta{}, nil, err
 	}
-	return m.refFlights.Do(ctx, repo, func(flightCtx context.Context) (ddb.RepoMeta, []ddb.RefState, error) {
-		return m.loadAuthoritativeRefsUncached(flightCtx, repo)
-	})
-}
-
-func (m *Materializer) loadAuthoritativeRefsUncached(ctx context.Context, repo tenant.RepoKey) (ddb.RepoMeta, []ddb.RefState, error) {
 	meta, err := m.LoadRepoMeta(ctx, repo)
 	if err != nil {
 		return ddb.RepoMeta{}, nil, err
+	}
+	if refs, ok := m.getCachedRefs(repo, meta.RefVersion); ok {
+		return meta, refs, nil
+	}
+	return m.refFlights.Do(ctx, repo, func(flightCtx context.Context) (ddb.RepoMeta, []ddb.RefState, error) {
+		return m.loadAuthoritativeRefsUncached(flightCtx, repo, meta)
+	})
+}
+
+func (m *Materializer) loadAuthoritativeRefsUncached(ctx context.Context, repo tenant.RepoKey, meta ddb.RepoMeta) (ddb.RepoMeta, []ddb.RefState, error) {
+	if refs, ok := m.getCachedRefs(repo, meta.RefVersion); ok {
+		return meta, refs, nil
 	}
 
 	refCtx, span := m.tracer.Start(ctx, "ddb.query_refs", trace.WithAttributes(
@@ -286,7 +307,139 @@ func (m *Materializer) loadAuthoritativeRefsUncached(ctx context.Context, repo t
 	}
 	span.End()
 
+	m.putCachedRefs(repo, meta.RefVersion, refs)
 	return meta, refs, nil
+}
+
+// RecordLocalPush applies a successfully committed same-node push delta to the
+// in-memory version-gated ref and manifest caches when the cached versions
+// match prevRefVersion / prevManifestVersion. materializedRefVersion is
+// intentionally not advanced so the next SyncAndPin updates the on-disk reftable.
+func (m *Materializer) RecordLocalPush(
+	repo tenant.RepoKey,
+	prevRefVersion, prevManifestVersion uint64,
+	cmds []ddb.RefUpdate,
+	installedPack bool,
+) {
+	m.versionMu.Lock()
+	defer m.versionMu.Unlock()
+
+	if prevRefVersion > 0 {
+		if entry, ok := m.refCache[repo]; ok && entry.version == prevRefVersion {
+			m.refCache[repo] = cachedRefEntry{
+				version: prevRefVersion + 1,
+				refs:    applyRefUpdatesToCache(repo, entry.refs, cmds),
+			}
+		}
+	}
+	if installedPack && prevManifestVersion > 0 {
+		if m.syncedManifestVersion[repo] == prevManifestVersion {
+			m.syncedManifestVersion[repo] = prevManifestVersion + 1
+		}
+	}
+}
+
+func applyRefUpdatesToCache(repo tenant.RepoKey, current []ddb.RefState, cmds []ddb.RefUpdate) []ddb.RefState {
+	byName := make(map[string]ddb.RefState, len(current)+len(cmds))
+	for _, r := range current {
+		byName[r.RefName] = r
+	}
+	for _, c := range cmds {
+		if c.IsDelete() {
+			delete(byName, c.RefName)
+			continue
+		}
+		rs := byName[c.RefName]
+		rs.Repo = repo
+		rs.RefName = c.RefName
+		rs.OID = c.NewOID
+		rs.PrevOID = c.OldOID
+		byName[c.RefName] = rs
+	}
+	updated := make([]ddb.RefState, 0, len(byName))
+	for _, r := range byName {
+		updated = append(updated, r)
+	}
+	sort.Slice(updated, func(i, j int) bool {
+		return updated[i].RefName < updated[j].RefName
+	})
+	return updated
+}
+
+func (m *Materializer) getCachedRefs(repo tenant.RepoKey, version uint64) ([]ddb.RefState, bool) {
+	if version == 0 {
+		return nil, false
+	}
+	m.versionMu.Lock()
+	entry, ok := m.refCache[repo]
+	m.versionMu.Unlock()
+	if !ok || entry.version != version {
+		return nil, false
+	}
+	return cloneRefStates(entry.refs), true
+}
+
+func (m *Materializer) putCachedRefs(repo tenant.RepoKey, version uint64, refs []ddb.RefState) {
+	if version == 0 {
+		return
+	}
+	cp := cloneRefStates(refs)
+	m.versionMu.Lock()
+	if existing, ok := m.refCache[repo]; !ok || version >= existing.version {
+		m.refCache[repo] = cachedRefEntry{version: version, refs: cp}
+	}
+	m.versionMu.Unlock()
+}
+
+func (m *Materializer) isManifestSynced(repo tenant.RepoKey, version uint64) bool {
+	if version == 0 {
+		return false
+	}
+	m.versionMu.Lock()
+	cur := m.syncedManifestVersion[repo]
+	m.versionMu.Unlock()
+	return cur == version
+}
+
+func (m *Materializer) setSyncedManifestVersion(repo tenant.RepoKey, version uint64) {
+	if version == 0 {
+		return
+	}
+	m.versionMu.Lock()
+	m.syncedManifestVersion[repo] = version
+	m.versionMu.Unlock()
+}
+
+func (m *Materializer) setMaterializedRefVersion(repo tenant.RepoKey, version uint64) {
+	if version == 0 {
+		return
+	}
+	m.versionMu.Lock()
+	m.materializedRefVersion[repo] = version
+	m.versionMu.Unlock()
+}
+
+func (m *Materializer) tryFastPathVersions(repo tenant.RepoKey, refVersion, manifestVersion uint64) ([]ddb.RefState, bool) {
+	if refVersion == 0 || manifestVersion == 0 {
+		return nil, false
+	}
+	m.versionMu.Lock()
+	defer m.versionMu.Unlock()
+	if m.materializedRefVersion[repo] != refVersion || m.syncedManifestVersion[repo] != manifestVersion {
+		return nil, false
+	}
+	entry, ok := m.refCache[repo]
+	if !ok || entry.version != refVersion {
+		return nil, false
+	}
+	return cloneRefStates(entry.refs), true
+}
+
+func (m *Materializer) invalidateDiskVersions(repo tenant.RepoKey) {
+	m.versionMu.Lock()
+	delete(m.materializedRefVersion, repo)
+	delete(m.syncedManifestVersion, repo)
+	m.versionMu.Unlock()
 }
 
 // LoadAuthoritativeRefsForCommands loads META and the authoritative ref state
@@ -388,6 +541,27 @@ func (m *Materializer) LoadAuthoritativeRefsForCommands(
 //  4. Advance manifest watermarks only after all missing packs are installed.
 //  5. Materialize disposable local bare-repo refs strictly from DynamoDB.
 func (m *Materializer) SyncAndPin(ctx context.Context, repo tenant.RepoKey) (SyncResult, error) {
+	initialMeta, err := m.LoadRepoMeta(ctx, repo)
+	if err != nil {
+		return SyncResult{}, err
+	}
+	if !m.shouldReconcilePrune(repo, false) {
+		if cachedRefs, ok := m.tryFastPathVersions(repo, initialMeta.RefVersion, initialMeta.ManifestVersion); ok {
+			handle, pinErr := m.cache.Pin(repo)
+			if pinErr == nil {
+				if m.metrics != nil {
+					m.metrics.RecordCacheBytes(ctx, m.cache.Stats().TotalBytes)
+				}
+				return SyncResult{
+					Meta:   initialMeta,
+					Refs:   cachedRefs,
+					Handle: handle,
+				}, nil
+			}
+			m.invalidateDiskVersions(repo)
+		}
+	}
+
 	var (
 		meta         ddb.RepoMeta
 		refs         []ddb.RefState
@@ -415,6 +589,7 @@ func (m *Materializer) SyncAndPin(ctx context.Context, repo tenant.RepoKey) (Syn
 		if err != nil {
 			return fmt.Errorf("node: materialize reftable refs %s: %w", repo, err)
 		}
+		m.setMaterializedRefVersion(repo, loadedMeta.RefVersion)
 		m.scheduleAuxIndexRefresh(repo, repoPath, fetched > 0 || pruned > 0 || refsChanged, len(loadedRefs) > 0)
 
 		m.recordLastSync(repo, loadedMeta, loadedRefs)
@@ -485,6 +660,10 @@ func (m *Materializer) queryManifestShardWithTrace(ctx context.Context, repo ten
 }
 
 func (m *Materializer) syncManifestPacks(ctx context.Context, repo tenant.RepoKey, meta ddb.RepoMeta) (fetched, cached, pruned int, err error) {
+	if m.isManifestSynced(repo, meta.ManifestVersion) && !m.shouldReconcilePrune(repo, false) {
+		return 0, 0, 0, nil
+	}
+
 	shardEntries := make([][]ddb.PackManifest, meta.ManifestShards)
 	if meta.ManifestShards <= 1 {
 		for shard := 0; shard < meta.ManifestShards; shard++ {
@@ -580,6 +759,7 @@ func (m *Materializer) syncManifestPacks(ctx context.Context, repo tenant.RepoKe
 		pruned = m.pruneSupersededPacks(ctx, repo, meta)
 	}
 
+	m.setSyncedManifestVersion(repo, meta.ManifestVersion)
 	return fetched, cached, pruned, nil
 }
 
@@ -804,6 +984,10 @@ func (m *Materializer) deleteRefState(repo tenant.RepoKey) {
 	m.refStateMu.Lock()
 	delete(m.refState, repo)
 	m.refStateMu.Unlock()
+
+	m.versionMu.Lock()
+	delete(m.materializedRefVersion, repo)
+	m.versionMu.Unlock()
 }
 
 // materializeReftableRefs synchronizes the bare repo's reftable refs and HEAD

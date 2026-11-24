@@ -87,8 +87,9 @@ type CommitPushResult struct {
 	RefCount    int
 }
 
-// BuildPushTransaction builds the DynamoDB TransactWriteItems payload for a push
-// without touching META. It returns the transaction items and a map from
+// BuildPushTransaction builds the DynamoDB TransactWriteItems payload for a push,
+// including an atomic META ref_version (and manifest_version when a pack is
+// uploaded) increment. It returns the transaction items and a map from
 // transaction item index to ref name for CancellationReasons attribution.
 func BuildPushTransaction(in CommitPushInput, ulid string, now time.Time, tableName string) ([]types.TransactWriteItem, map[int]string, error) {
 	if err := validateCommitPushInput(in, ulid, tableName); err != nil {
@@ -103,7 +104,7 @@ func BuildPushTransaction(in CommitPushInput, ulid string, now time.Time, tableN
 		packID = in.Pack.PackID
 	}
 
-	items := make([]types.TransactWriteItem, 0, len(in.Updates)*2+1)
+	items := make([]types.TransactWriteItem, 0, len(in.Updates)*2+2)
 	refIndex := make(map[int]string, len(in.Updates))
 
 	for _, u := range in.Updates {
@@ -228,6 +229,25 @@ func BuildPushTransaction(in CommitPushInput, ulid string, now time.Time, tableN
 			},
 		})
 	}
+
+	metaKey, err := MetaKey(in.Repo)
+	if err != nil {
+		return nil, nil, err
+	}
+	metaUpdateExpr := "ADD ref_version :one"
+	if in.Pack != nil {
+		metaUpdateExpr = "ADD ref_version :one, manifest_version :one"
+	}
+	items = append(items, types.TransactWriteItem{
+		Update: &types.Update{
+			TableName:        aws.String(tableName),
+			Key:              metaKey.AttributeMap(),
+			UpdateExpression: aws.String(metaUpdateExpr),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":one": attrNUint64(1),
+			},
+		},
+	})
 
 	return items, refIndex, nil
 }
