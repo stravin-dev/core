@@ -124,6 +124,32 @@ func TestUploadPackResponseCache_LRUEvictionAndCaps(t *testing.T) {
 	}
 }
 
+func TestDefaultPackCacheCaps(t *testing.T) {
+	if defaultPackCacheMaxBytes != 64<<20 {
+		t.Fatalf("defaultPackCacheMaxBytes = %d, want %d (64 MiB)", defaultPackCacheMaxBytes, 64<<20)
+	}
+	if defaultPackCacheMaxEntryBytes != 8<<20 {
+		t.Fatalf("defaultPackCacheMaxEntryBytes = %d, want %d (8 MiB)", defaultPackCacheMaxEntryBytes, 8<<20)
+	}
+
+	c := newUploadPackResponseCache(defaultPackCacheMaxBytes, defaultPackCacheMaxEntryBytes)
+	if c.maxBytes != 64<<20 || c.maxEntryBytes != 8<<20 {
+		t.Fatalf("cache caps = (%d, %d), want (%d, %d)", c.maxBytes, c.maxEntryBytes, 64<<20, 8<<20)
+	}
+
+	oversized := make([]byte, defaultPackCacheMaxEntryBytes+1)
+	c.Put("oversized", oversized)
+	if _, ok := c.Get("oversized"); ok {
+		t.Fatal("expected entry > 8 MiB not to be cached")
+	}
+
+	atCap := make([]byte, defaultPackCacheMaxEntryBytes)
+	c.Put("at-cap", atCap)
+	if got, ok := c.Get("at-cap"); !ok || len(got) != defaultPackCacheMaxEntryBytes {
+		t.Fatalf("Get(at-cap) = (len=%d, ok=%v), want (len=%d, ok=true)", len(got), ok, defaultPackCacheMaxEntryBytes)
+	}
+}
+
 func TestServer_UploadPackResponseCache_HitCoalesceBypassAndCap(t *testing.T) {
 	ctx := context.Background()
 	rk, _ := tenant.NewRepoKey("acme", "pack-cache")
