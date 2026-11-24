@@ -1,3 +1,11 @@
+## [1.9.4](https://github.com/stravin-dev/core/compare/v1.9.3...v1.9.4) (2026-11-24)
+
+
+### Performance Improvements
+
+* **node,pack:** pure-Go v2 ls-refs, reduce compaction/MIDX churn, and full-clone pack cache ([3f2326a](https://github.com/stravin-dev/core/commit/3f2326aa9feae7ad69136fe33a7f67deb0bfceb5))
+* **node,pack:** pure-Go v2 ls-refs, reduce compaction/MIDX churn, and full-clone pack cache ([#154](https://github.com/stravin-dev/core/issues/154)) ([#155](https://github.com/stravin-dev/core/issues/155)) ([2dd5074](https://github.com/stravin-dev/core/commit/2dd5074600bd1818c39ee084aeb5534a694bcb98))
+
 ## [1.9.3](https://github.com/stravin-dev/core/compare/v1.9.2...v1.9.3) (2026-11-24)
 
 
