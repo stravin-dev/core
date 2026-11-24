@@ -410,7 +410,10 @@ func (g *GitClient) Fsck(ctx context.Context) error {
 }
 
 func (g *GitClient) buildArgs(args []string) []string {
-	var prefix []string
+	prefix := []string{
+		"-c", "gc.auto=0",
+		"-c", "maintenance.auto=false",
+	}
 	if g.opts.AuthToken != "" {
 		header := formatAuthHeader(g.opts.AuthToken)
 		prefix = append(prefix, "-c", "http.extraHeader="+header)

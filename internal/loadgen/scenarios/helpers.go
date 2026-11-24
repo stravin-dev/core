@@ -221,6 +221,19 @@ func runFsck(ctx context.Context, env *loadgen.ScenarioEnv, scenario string, g *
 	return nil
 }
 
+// runFsckFreshClone clones remoteURL into an isolated temporary directory and runs
+// git fsck --full --strict on that fresh clone so fsck never inspects a linked
+// worktree sharing base/<repo>/.git.
+func runFsckFreshClone(ctx context.Context, env *loadgen.ScenarioEnv, scenario, remoteURL string, ent *Entropy, prefix string) error {
+	verifyDir, verifyCleanup := newTempDir(env, ent, prefix)
+	defer verifyCleanup()
+	vg, err := cloneFresh(ctx, env, scenario, remoteURL, verifyDir)
+	if err != nil {
+		return err
+	}
+	return runFsck(ctx, env, scenario, vg)
+}
+
 func fetchAndVerifySHA(ctx context.Context, env *loadgen.ScenarioEnv, scenario string, g *loadgen.GitClient, branch, expectedSHA string) error {
 	if err := env.RunOp(ctx, scenario, "fetch", loadgen.ClassifyOptions{}, func(opCtx context.Context) error {
 		return g.Fetch(opCtx, "origin", branch)

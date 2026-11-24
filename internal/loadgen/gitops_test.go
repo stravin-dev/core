@@ -164,6 +164,53 @@ func TestExtractHTTPStatusAndRedactToken(t *testing.T) {
 	}
 }
 
+func TestGitClientBuildArgsDisablesAutoGCAndMaintenance(t *testing.T) {
+	tests := []struct {
+		name      string
+		authToken string
+		wantAuth  bool
+	}{
+		{name: "without auth token", authToken: "", wantAuth: false},
+		{name: "with bearer token", authToken: "secret-token", wantAuth: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewGitClient(t.TempDir(), GitOptions{AuthToken: tc.authToken})
+			input := []string{"fetch", "--no-tags", "origin"}
+			got := g.buildArgs(input)
+
+			hasConfig := func(kv string) bool {
+				for i := 0; i+1 < len(got); i++ {
+					if got[i] == "-c" && got[i+1] == kv {
+						return true
+					}
+				}
+				return false
+			}
+
+			if !hasConfig("gc.auto=0") {
+				t.Errorf("buildArgs(%v) = %v, missing -c gc.auto=0", input, got)
+			}
+			if !hasConfig("maintenance.auto=false") {
+				t.Errorf("buildArgs(%v) = %v, missing -c maintenance.auto=false", input, got)
+			}
+			hasAuthHeader := false
+			for i := 0; i+1 < len(got); i++ {
+				if got[i] == "-c" && strings.HasPrefix(got[i+1], "http.extraHeader=Authorization: ") {
+					hasAuthHeader = true
+				}
+			}
+			if hasAuthHeader != tc.wantAuth {
+				t.Errorf("buildArgs(%v) auth header present = %v, want %v (got=%v)", input, hasAuthHeader, tc.wantAuth, got)
+			}
+			if len(got) < len(input) || strings.Join(got[len(got)-len(input):], " ") != "fetch --no-tags origin" {
+				t.Errorf("buildArgs(%v) = %v, trailing args not preserved", input, got)
+			}
+		})
+	}
+}
+
 func TestGitClientBuildEnvSSHConnectTimeout(t *testing.T) {
 	tests := []struct {
 		name        string

@@ -216,6 +216,10 @@ func TestFreshCloneExemptionsStillCloneFresh(t *testing.T) {
 		{name: "agent_deep_tree_refactor_fsck_verify", scenario: &agentDeepTreeRefactor{}, wantOp: "clone", minDelta: 1},
 		{name: "dev_large_binary_asset_fsck_verify", scenario: &devLargeBinaryAsset{}, wantOp: "clone", minDelta: 1},
 		{name: "dev_tag_and_release_verify", scenario: &devTagAndRelease{}, wantOp: "clone", minDelta: 1},
+		{name: "agent_wasm_hook_allow_and_reject_verify", scenario: &agentWasmHookAllowAndReject{}, wantOp: "clone", minDelta: 1},
+		{name: "agent_high_churn_compaction_trigger_verify", scenario: &agentHighChurnCompactionTrigger{}, wantOp: "clone", minDelta: 1},
+		{name: "agent_protocol_switch_http_ssh_verify", scenario: &agentProtocolSwitchHTTPSSH{}, wantOp: "clone", minDelta: 2},
+		{name: "agent_badref_negative_test_verify", scenario: &agentCorruptRefNegativeTest{}, wantOp: "clone", minDelta: 1},
 	}
 
 	for idx, tc := range cases {
