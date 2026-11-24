@@ -2,9 +2,14 @@ package ddb
 
 import (
 	"errors"
+	"math"
+	"math/big"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"stravin.dev/core/internal/lease"
 	"stravin.dev/core/internal/tenant"
@@ -178,5 +183,99 @@ func TestNewULIDLexicographicOrder(t *testing.T) {
 	}
 	if u1 >= u2 {
 		t.Fatalf("expected %q < %q", u1, u2)
+	}
+}
+
+func TestGetInt(t *testing.T) {
+	maxIntPlusOne := new(big.Int).Add(big.NewInt(math.MaxInt), big.NewInt(1)).String()
+	minIntMinusOne := new(big.Int).Sub(big.NewInt(math.MinInt), big.NewInt(1)).String()
+
+	tests := []struct {
+		name    string
+		item    map[string]types.AttributeValue
+		want    int
+		wantErr error
+		anyErr  bool
+	}{
+		{
+			name: "missing key defaults to zero",
+			item: map[string]types.AttributeValue{},
+			want: 0,
+		},
+		{
+			name:   "non-number attribute returns error",
+			item:   map[string]types.AttributeValue{"n": &types.AttributeValueMemberS{Value: "42"}},
+			anyErr: true,
+		},
+		{
+			name: "zero",
+			item: map[string]types.AttributeValue{"n": &types.AttributeValueMemberN{Value: "0"}},
+			want: 0,
+		},
+		{
+			name: "positive value",
+			item: map[string]types.AttributeValue{"n": &types.AttributeValueMemberN{Value: "42"}},
+			want: 42,
+		},
+		{
+			name: "negative value",
+			item: map[string]types.AttributeValue{"n": &types.AttributeValueMemberN{Value: "-7"}},
+			want: -7,
+		},
+		{
+			name: "math.MaxInt boundary",
+			item: map[string]types.AttributeValue{"n": &types.AttributeValueMemberN{Value: strconv.Itoa(math.MaxInt)}},
+			want: math.MaxInt,
+		},
+		{
+			name: "math.MinInt boundary",
+			item: map[string]types.AttributeValue{"n": &types.AttributeValueMemberN{Value: strconv.Itoa(math.MinInt)}},
+			want: math.MinInt,
+		},
+		{
+			name:    "overflow above math.MaxInt",
+			item:    map[string]types.AttributeValue{"n": &types.AttributeValueMemberN{Value: maxIntPlusOne}},
+			wantErr: strconv.ErrRange,
+		},
+		{
+			name:    "underflow below math.MinInt",
+			item:    map[string]types.AttributeValue{"n": &types.AttributeValueMemberN{Value: minIntMinusOne}},
+			wantErr: strconv.ErrRange,
+		},
+		{
+			name:    "invalid syntax",
+			item:    map[string]types.AttributeValue{"n": &types.AttributeValueMemberN{Value: "not-a-number"}},
+			wantErr: strconv.ErrSyntax,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := getInt(tc.item, "n")
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("getInt() error = %v, want %v", err, tc.wantErr)
+				}
+				if got != 0 {
+					t.Fatalf("getInt() = %d on error, want 0", got)
+				}
+				return
+			}
+			if tc.anyErr {
+				if err == nil {
+					t.Fatalf("getInt() = (%d, nil), want error", got)
+				}
+				if got != 0 {
+					t.Fatalf("getInt() = %d on error, want 0", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("getInt() unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("getInt() = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

@@ -414,8 +414,19 @@ func getString(item map[string]types.AttributeValue, key string) string {
 }
 
 func getInt(item map[string]types.AttributeValue, key string) (int, error) {
-	n, err := getInt64(item, key)
-	return int(n), err
+	av, ok := item[key]
+	if !ok {
+		return 0, nil
+	}
+	n, ok := av.(*types.AttributeValueMemberN)
+	if !ok {
+		return 0, fmt.Errorf("ddb: attribute %q is not a number", key)
+	}
+	v, err := strconv.Atoi(n.Value)
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
 }
 
 func getInt64(item map[string]types.AttributeValue, key string) (int64, error) {
