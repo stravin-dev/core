@@ -133,6 +133,12 @@
       "description": "Expected client-side cancellations (HTTP 499 / client_canceled) and rate-limit rejections (HTTP 429 / rate_limited) over the selected time range, separated from real server errors.",
       "fieldConfig": {
         "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          },
           "unit": "short"
         },
         "overrides": []
@@ -207,6 +213,12 @@
       "description": "Aggregate Git ingress request rate across all protocols and operations on stravin-edge.",
       "fieldConfig": {
         "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          },
           "unit": "reqps"
         },
         "overrides": []

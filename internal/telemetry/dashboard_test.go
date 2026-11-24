@@ -529,6 +529,72 @@ func TestGrafanaDashboards_StravinCoreAndLoadTester(t *testing.T) {
 	assertLoadgenDashboardRowsAndPanels(t, loadgenDash)
 }
 
+func assertSingleGreenBaseThreshold(t *testing.T, dashboard string, p grafanaPanel) {
+	t.Helper()
+	th := p.FieldConfig.Defaults.Thresholds
+	if th.Mode != "absolute" {
+		t.Errorf("%s stat panel %q (id=%d) thresholds.mode = %q, want %q", dashboard, p.Title, p.ID, th.Mode, "absolute")
+	}
+	if len(th.Steps) != 1 {
+		t.Errorf("%s stat panel %q (id=%d) has %d threshold steps, want 1 base step (got %+v)", dashboard, p.Title, p.ID, len(th.Steps), th.Steps)
+		return
+	}
+	if th.Steps[0].Color != "green" || th.Steps[0].Value != nil {
+		t.Errorf("%s stat panel %q (id=%d) threshold step = %+v, want {Color:\"green\", Value:nil}", dashboard, p.Title, p.ID, th.Steps[0])
+	}
+}
+
+func TestGrafanaDashboards_StatPanelThresholds(t *testing.T) {
+	cases := []struct {
+		filename             string
+		singleGreenStatPanel map[int]string
+	}{
+		{
+			filename: "stravin-core.json",
+			singleGreenStatPanel: map[int]string{
+				103: "Client Canceled (499) & Rate Limited (429)",
+				105: "Total Throughput (Edge req/s)",
+			},
+		},
+		{
+			filename: "stravin-loadgen.json",
+			singleGreenStatPanel: map[int]string{
+				2: "Total Ops/sec (Dev vs Agent)",
+				3: "Active Worker Threads",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		dash := loadDashboard(t, tc.filename)
+		found := make(map[int]bool, len(tc.singleGreenStatPanel))
+
+		for _, p := range flattenPanels(dash.Panels) {
+			if p.Type != "stat" {
+				continue
+			}
+			th := p.FieldConfig.Defaults.Thresholds
+			if th.Mode == "" || len(th.Steps) == 0 || th.Steps[0].Value != nil {
+				t.Errorf("%s stat panel %q (id=%d) must declare explicit thresholds with a null base step to avoid Grafana's default 80-red threshold",
+					tc.filename, p.Title, p.ID)
+			}
+			if wantTitle, ok := tc.singleGreenStatPanel[p.ID]; ok {
+				found[p.ID] = true
+				if p.Title != wantTitle {
+					t.Errorf("%s panel id=%d title = %q, want %q", tc.filename, p.ID, p.Title, wantTitle)
+				}
+				assertSingleGreenBaseThreshold(t, tc.filename, p)
+			}
+		}
+
+		for id, title := range tc.singleGreenStatPanel {
+			if !found[id] {
+				t.Errorf("%s missing expected stat panel id=%d (%q)", tc.filename, id, title)
+			}
+		}
+	}
+}
+
 func assertLoadgenOverviewSection(t *testing.T, sec dashboardSection) {
 	t.Helper()
 	requiredRangeScopedPanels := map[string]bool{
