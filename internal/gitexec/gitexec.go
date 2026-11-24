@@ -204,6 +204,8 @@ type Config struct {
 	MaxStderrBytes int
 	// Sandbox configures Linux namespace / cgroup v2 isolation.
 	Sandbox SandboxConfig
+	// Pack configures git pack-objects tuning flags passed to upload-pack.
+	Pack PackConfig
 	// SandboxConfigurator optionally overrides the platform default strategy.
 	SandboxConfigurator SandboxConfigurator
 	// Logger receives structured fallback and diagnostic logs.
@@ -218,6 +220,7 @@ type SubprocessExecutor struct {
 	allowedPATH    string
 	defaultTimeout time.Duration
 	maxStderrBytes int
+	pack           PackConfig
 	sandbox        SandboxConfigurator
 	logger         *slog.Logger
 	fallbackWarned atomic.Bool
@@ -237,6 +240,10 @@ func NewSubprocessExecutor(cfg Config) *SubprocessExecutor {
 	if maxStderr <= 0 {
 		maxStderr = DefaultMaxStderrBytes
 	}
+	pack := cfg.Pack
+	if pack == (PackConfig{}) {
+		pack = DefaultPackConfig()
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -250,6 +257,7 @@ func NewSubprocessExecutor(cfg Config) *SubprocessExecutor {
 		allowedPATH:    allowedPATH,
 		defaultTimeout: cfg.DefaultTimeout,
 		maxStderrBytes: maxStderr,
+		pack:           pack,
 		sandbox:        sb,
 		logger:         logger,
 	}
@@ -259,6 +267,9 @@ func NewSubprocessExecutor(cfg Config) *SubprocessExecutor {
 func (e *SubprocessExecutor) ExecUploadPack(ctx context.Context, req UploadPackRequest) error {
 	if strings.TrimSpace(req.RepoDir) == "" {
 		return ErrEmptyRepoDir
+	}
+	if err := e.pack.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 
 	var extraEnv []string
@@ -273,6 +284,10 @@ func (e *SubprocessExecutor) ExecUploadPack(ctx context.Context, req UploadPackR
 		"-c", "uploadpack.allowReachableSHA1InWant=true",
 		"-c", "uploadpack.allowAnySHA1InWant=true",
 		"-c", "uploadpack.allowFilter=true",
+		"-c", "pack.threads=" + strconv.Itoa(e.pack.Threads),
+		"-c", "pack.windowMemory=" + e.pack.WindowMemory,
+		"-c", "pack.compression=" + strconv.Itoa(e.pack.Compression),
+		"-c", "pack.allowPackReuse=" + e.pack.AllowReuse,
 	}
 	if req.BundleURI != "" {
 		if err := ValidateBundleURI(req.BundleURI); err != nil {

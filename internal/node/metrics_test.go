@@ -81,3 +81,61 @@ func TestRecordAuxIndexRefreshFailure_ExposesOTelAndPrometheusMetrics(t *testing
 		t.Fatalf("expected Prometheus body to contain %q, got:\n%s", wantProm, body)
 	}
 }
+
+func TestUploadPackQueueMetrics_ExposesOTelAndPrometheus(t *testing.T) {
+	ctx := context.Background()
+	prov, err := telemetry.NewInMemoryProvider("stravin-node")
+	if err != nil {
+		t.Fatalf("NewInMemoryProvider: %v", err)
+	}
+	defer func() { _ = prov.Shutdown(ctx) }()
+
+	m := NewMetrics(prov, "us-east-1")
+	m.RecordUploadPackQueueWait(ctx, 12*time.Millisecond)
+	m.RecordUploadPackQueueTimeout(ctx)
+	m.RecordUploadPackQueueTimeout(ctx)
+
+	var rm metricdata.ResourceMetrics
+	if err := prov.MetricReader.Collect(ctx, &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	var sawWait, sawTimeout bool
+	for _, sm := range rm.ScopeMetrics {
+		for _, item := range sm.Metrics {
+			switch item.Name {
+			case "stravin_node_upload_pack_queue_wait_seconds":
+				hist, ok := item.Data.(metricdata.Histogram[float64])
+				if !ok || len(hist.DataPoints) != 1 {
+					t.Fatalf("unexpected queue wait metric data: %T (%+v)", item.Data, item.Data)
+				}
+				if !slices.Equal(hist.DataPoints[0].Bounds, telemetry.DurationSecondsBuckets) {
+					t.Errorf("Bounds = %v, want %v", hist.DataPoints[0].Bounds, telemetry.DurationSecondsBuckets)
+				}
+				if hist.DataPoints[0].Count != 1 {
+					t.Errorf("Count = %d, want 1", hist.DataPoints[0].Count)
+				}
+				sawWait = true
+			case "stravin_node_upload_pack_queue_timeouts_total":
+				sum, ok := item.Data.(metricdata.Sum[int64])
+				if !ok || len(sum.DataPoints) != 1 {
+					t.Fatalf("unexpected queue timeout metric data: %T (%+v)", item.Data, item.Data)
+				}
+				if sum.DataPoints[0].Value != 2 {
+					t.Errorf("timeouts = %d, want 2", sum.DataPoints[0].Value)
+				}
+				sawTimeout = true
+			}
+		}
+	}
+	if !sawWait || !sawTimeout {
+		t.Fatalf("missing OTel metrics: sawWait=%v sawTimeout=%v", sawWait, sawTimeout)
+	}
+
+	rec := httptest.NewRecorder()
+	m.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	wantProm := `stravin_node_upload_pack_queue_timeouts_total{region="us-east-1"} 2`
+	if !strings.Contains(rec.Body.String(), wantProm) {
+		t.Fatalf("expected Prometheus body to contain %q, got:\n%s", wantProm, rec.Body.String())
+	}
+}

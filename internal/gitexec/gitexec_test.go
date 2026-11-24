@@ -224,6 +224,138 @@ func TestExecUploadPackPassesAllowReachableSHA1InWantBeforeSubcommand(t *testing
 	}
 }
 
+func TestExecUploadPackInjectsPackTuningFlagsBeforeSubcommand(t *testing.T) {
+	helperPath := filepath.Join(t.TempDir(), "dump-args.sh")
+	script := "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n"
+	if err := os.WriteFile(helperPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write helper script: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		pack      PackConfig
+		wantFlags []string
+	}{
+		{
+			name: "zero value uses defaults",
+			pack: PackConfig{},
+			wantFlags: []string{
+				"pack.threads=1",
+				"pack.windowMemory=256m",
+				"pack.compression=1",
+				"pack.allowPackReuse=multi",
+			},
+		},
+		{
+			name: "custom validated pack config",
+			pack: PackConfig{
+				Threads:      3,
+				WindowMemory: "128m",
+				Compression:  0,
+				AllowReuse:   "single",
+			},
+			wantFlags: []string{
+				"pack.threads=3",
+				"pack.windowMemory=128m",
+				"pack.compression=0",
+				"pack.allowPackReuse=single",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			execImpl := NewSubprocessExecutor(Config{
+				GitBinary: helperPath,
+				Pack:      tc.pack,
+				Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+			})
+			if err := execImpl.ExecUploadPack(context.Background(), UploadPackRequest{
+				RepoDir:      t.TempDir(),
+				StatelessRPC: true,
+				Stdout:       &stdout,
+			}); err != nil {
+				t.Fatalf("ExecUploadPack: %v", err)
+			}
+
+			args := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
+			subcmdIdx := -1
+			for i, a := range args {
+				if a == "upload-pack" {
+					subcmdIdx = i
+					break
+				}
+			}
+			if subcmdIdx == -1 {
+				t.Fatalf("upload-pack not found in args: %v", args)
+			}
+			for _, want := range tc.wantFlags {
+				found := false
+				for i := 0; i < subcmdIdx-1; i++ {
+					if args[i] == "-c" && args[i+1] == want {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("missing -c %s before upload-pack in args: %v", want, args)
+				}
+			}
+		})
+	}
+}
+
+func TestExecUploadPackRejectsInvalidPackConfig(t *testing.T) {
+	execImpl := NewSubprocessExecutor(Config{
+		Pack: PackConfig{
+			Threads:      1,
+			WindowMemory: "256m;evil",
+			Compression:  1,
+			AllowReuse:   "multi",
+		},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	err := execImpl.ExecUploadPack(context.Background(), UploadPackRequest{
+		RepoDir:      t.TempDir(),
+		StatelessRPC: true,
+	})
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("ExecUploadPack invalid pack config err = %v, want ErrInvalidRequest", err)
+	}
+}
+
+func TestExecUploadPackWithPackTuningRealGit(t *testing.T) {
+	requireGit(t)
+	bareDir, commitSHA := createBareRepoWithCommit(t)
+
+	for _, packCfg := range []PackConfig{
+		DefaultPackConfig(),
+		{Threads: 2, WindowMemory: "128m", Compression: 0, AllowReuse: "single"},
+	} {
+		reqBody := "0032want " + commitSHA + "\n00000009done\n"
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		execImpl := NewSubprocessExecutor(Config{
+			Pack:   packCfg,
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+		err := execImpl.ExecUploadPack(context.Background(), UploadPackRequest{
+			RepoDir:      bareDir,
+			StatelessRPC: true,
+			Stdin:        strings.NewReader(reqBody),
+			Stdout:       &stdout,
+			Stderr:       &stderr,
+		})
+		if err != nil {
+			t.Fatalf("ExecUploadPack(%+v) failed: %v (stderr: %s)", packCfg, err, stderr.String())
+		}
+		if !bytes.Contains(stdout.Bytes(), []byte("PACK")) {
+			t.Errorf("ExecUploadPack(%+v): expected PACK in output, got %d bytes", packCfg, stdout.Len())
+		}
+	}
+}
+
 func TestExecUploadPackAllowsReachableNonTipSHA1RealGit(t *testing.T) {
 	requireGit(t)
 	bareDir, commits := createBareRepoWithCommits(t, 2)

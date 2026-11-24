@@ -2,8 +2,10 @@ package gitexec
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,7 +25,157 @@ const (
 	DefaultPidsMax int64 = 64
 	// DefaultTimeout is the fallback subprocess execution timeout when not specified.
 	DefaultTimeout = 5 * time.Minute
+
+	// DefaultPackThreads bounds git pack-objects worker threads per upload-pack.
+	DefaultPackThreads = 1
+	// DefaultPackWindowMemory caps delta-search window memory per pack-objects thread.
+	DefaultPackWindowMemory = "256m"
+	// DefaultPackCompression sets fast zlib compression level (0..9) for on-the-fly packs.
+	DefaultPackCompression = 1
+	// DefaultPackAllowReuse enables multi-pack bitmap reuse during upload-pack.
+	DefaultPackAllowReuse = "multi"
 )
+
+var gitByteSizePattern = regexp.MustCompile(`^[1-9][0-9]*[kmgKMG]?$`)
+
+// PackConfig tunes git pack-objects execution during upload-pack.
+type PackConfig struct {
+	Threads      int
+	WindowMemory string
+	Compression  int
+	AllowReuse   string
+}
+
+// DefaultPackConfig returns safe, portable defaults for git pack-objects tuning.
+func DefaultPackConfig() PackConfig {
+	return PackConfig{
+		Threads:      DefaultPackThreads,
+		WindowMemory: DefaultPackWindowMemory,
+		Compression:  DefaultPackCompression,
+		AllowReuse:   DefaultPackAllowReuse,
+	}
+}
+
+// Validate checks that all PackConfig fields are within safe, allowlisted bounds.
+func (p PackConfig) Validate() error {
+	if p.Threads < 1 {
+		return fmt.Errorf("pack.threads must be >= 1, got %d", p.Threads)
+	}
+	if !gitByteSizePattern.MatchString(p.WindowMemory) {
+		return fmt.Errorf("pack.windowMemory %q must match ^[1-9][0-9]*[kmgKMG]?$", p.WindowMemory)
+	}
+	if p.Compression < 0 || p.Compression > 9 {
+		return fmt.Errorf("pack.compression must be in [0, 9], got %d", p.Compression)
+	}
+	switch p.AllowReuse {
+	case "single", "multi", "true", "false":
+	default:
+		return fmt.Errorf("pack.allowPackReuse %q must be one of single, multi, true, false", p.AllowReuse)
+	}
+	return nil
+}
+
+// ParsePackConfigFromEnv parses and strictly validates STRAVIN_GIT_PACK_* env vars.
+func ParsePackConfigFromEnv() (PackConfig, error) {
+	cfg := DefaultPackConfig()
+
+	if raw := strings.TrimSpace(os.Getenv("STRAVIN_GIT_PACK_THREADS")); raw != "" {
+		n, err := parsePackThreads(raw)
+		if err != nil {
+			return PackConfig{}, err
+		}
+		cfg.Threads = n
+	}
+	if raw := strings.TrimSpace(os.Getenv("STRAVIN_GIT_PACK_WINDOW_MEMORY")); raw != "" {
+		v, err := parsePackWindowMemory(raw)
+		if err != nil {
+			return PackConfig{}, err
+		}
+		cfg.WindowMemory = v
+	}
+	if raw := strings.TrimSpace(os.Getenv("STRAVIN_GIT_PACK_COMPRESSION")); raw != "" {
+		n, err := parsePackCompression(raw)
+		if err != nil {
+			return PackConfig{}, err
+		}
+		cfg.Compression = n
+	}
+	if raw := strings.TrimSpace(os.Getenv("STRAVIN_GIT_PACK_ALLOW_REUSE")); raw != "" {
+		v, err := parsePackAllowReuse(raw)
+		if err != nil {
+			return PackConfig{}, err
+		}
+		cfg.AllowReuse = v
+	}
+	return cfg, cfg.Validate()
+}
+
+func loadPackConfigFromEnv(logger *slog.Logger) PackConfig {
+	cfg := DefaultPackConfig()
+
+	if raw := strings.TrimSpace(os.Getenv("STRAVIN_GIT_PACK_THREADS")); raw != "" {
+		if n, err := parsePackThreads(raw); err == nil {
+			cfg.Threads = n
+		} else if logger != nil {
+			logger.Warn("gitexec: ignoring invalid STRAVIN_GIT_PACK_THREADS", "value", raw, "error", err)
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("STRAVIN_GIT_PACK_WINDOW_MEMORY")); raw != "" {
+		if v, err := parsePackWindowMemory(raw); err == nil {
+			cfg.WindowMemory = v
+		} else if logger != nil {
+			logger.Warn("gitexec: ignoring invalid STRAVIN_GIT_PACK_WINDOW_MEMORY", "value", raw, "error", err)
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("STRAVIN_GIT_PACK_COMPRESSION")); raw != "" {
+		if n, err := parsePackCompression(raw); err == nil {
+			cfg.Compression = n
+		} else if logger != nil {
+			logger.Warn("gitexec: ignoring invalid STRAVIN_GIT_PACK_COMPRESSION", "value", raw, "error", err)
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("STRAVIN_GIT_PACK_ALLOW_REUSE")); raw != "" {
+		if v, err := parsePackAllowReuse(raw); err == nil {
+			cfg.AllowReuse = v
+		} else if logger != nil {
+			logger.Warn("gitexec: ignoring invalid STRAVIN_GIT_PACK_ALLOW_REUSE", "value", raw, "error", err)
+		}
+	}
+	return cfg
+}
+
+func parsePackThreads(raw string) (int, error) {
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("invalid STRAVIN_GIT_PACK_THREADS %q: must be integer >= 1", raw)
+	}
+	return n, nil
+}
+
+func parsePackWindowMemory(raw string) (string, error) {
+	if !gitByteSizePattern.MatchString(raw) {
+		return "", fmt.Errorf("invalid STRAVIN_GIT_PACK_WINDOW_MEMORY %q: must match ^[1-9][0-9]*[kmgKMG]?$", raw)
+	}
+	return raw, nil
+}
+
+func parsePackCompression(raw string) (int, error) {
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 || n > 9 {
+		return 0, fmt.Errorf("invalid STRAVIN_GIT_PACK_COMPRESSION %q: must be integer in [0, 9]", raw)
+	}
+	return n, nil
+}
+
+func parsePackAllowReuse(raw string) (string, error) {
+	v := strings.ToLower(raw)
+	switch v {
+	case "single", "multi", "true", "false":
+		return v, nil
+	default:
+		return "", fmt.Errorf("invalid STRAVIN_GIT_PACK_ALLOW_REUSE %q: must be one of single, multi, true, false", raw)
+	}
+}
 
 // DefaultSandboxConfig returns secure Linux namespace and cgroup v2 defaults.
 func DefaultSandboxConfig() SandboxConfig {
@@ -87,6 +239,7 @@ func LoadConfigFromEnv(defaultTimeout time.Duration, logger *slog.Logger) Config
 	return Config{
 		DefaultTimeout: timeout,
 		Sandbox:        LoadSandboxConfigFromEnv(),
+		Pack:           loadPackConfigFromEnv(logger),
 		Logger:         logger,
 	}
 }
