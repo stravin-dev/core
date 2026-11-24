@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 type stubScenario struct {
@@ -115,6 +117,7 @@ func TestRunnerParallelDevAndAgentWorkersAndCancellation(t *testing.T) {
 	cfg.ThinkMin = 5 * time.Millisecond
 	cfg.ThinkMax = 15 * time.Millisecond
 	cfg.Duration = 120 * time.Millisecond
+	cfg.RampUp = 0
 
 	var logBuf bytes.Buffer
 	tel, exp, err := NewInMemoryTelemetry(&logBuf)
@@ -164,6 +167,7 @@ func TestRunnerFailFastOnUnexpectedError(t *testing.T) {
 	cfg.Seed = 1
 	cfg.ThinkMin = 5 * time.Second
 	cfg.ThinkMax = 10 * time.Second
+	cfg.RampUp = 0
 	cfg.FailFast = true
 
 	var logBuf bytes.Buffer
@@ -393,6 +397,7 @@ func TestRunnerProvidesIsolatedPerWorkerBaseCloneCache(t *testing.T) {
 	cfg.ThinkMin = 1 * time.Millisecond
 	cfg.ThinkMax = 2 * time.Millisecond
 	cfg.Duration = 80 * time.Millisecond
+	cfg.RampUp = 0
 
 	var logBuf bytes.Buffer
 	tel, _, err := NewInMemoryTelemetry(&logBuf)
@@ -430,5 +435,285 @@ func TestRunnerProvidesIsolatedPerWorkerBaseCloneCache(t *testing.T) {
 			t.Fatalf("workers %s and %s shared the same BaseCloneCache instance", workerKey, other)
 		}
 		seenPtrs[first] = workerKey
+	}
+}
+
+func TestBuildWorkerSchedule(t *testing.T) {
+	t.Run("single dev worker has zero delay", func(t *testing.T) {
+		slots := buildWorkerSchedule(1, 0, 5*time.Second)
+		if len(slots) != 1 {
+			t.Fatalf("len(slots) = %d, want 1", len(slots))
+		}
+		want := workerSlot{persona: PersonaDev, workerID: 0, delay: 0}
+		if slots[0] != want {
+			t.Fatalf("slots[0] = %+v, want %+v", slots[0], want)
+		}
+	})
+
+	t.Run("single agent worker has zero delay", func(t *testing.T) {
+		slots := buildWorkerSchedule(0, 1, 5*time.Second)
+		if len(slots) != 1 {
+			t.Fatalf("len(slots) = %d, want 1", len(slots))
+		}
+		want := workerSlot{persona: PersonaAgent, workerID: 0, delay: 0}
+		if slots[0] != want {
+			t.Fatalf("slots[0] = %+v, want %+v", slots[0], want)
+		}
+	})
+
+	t.Run("zero ramp-up gives zero delay for all workers", func(t *testing.T) {
+		slots := buildWorkerSchedule(2, 3, 0)
+		if len(slots) != 5 {
+			t.Fatalf("len(slots) = %d, want 5", len(slots))
+		}
+		for i, s := range slots {
+			if s.delay != 0 {
+				t.Errorf("slots[%d].delay = %v, want 0", i, s.delay)
+			}
+		}
+	})
+
+	t.Run("even slot spacing across 5s window", func(t *testing.T) {
+		slots := buildWorkerSchedule(2, 3, 5*time.Second)
+		if len(slots) != 5 {
+			t.Fatalf("len(slots) = %d, want 5", len(slots))
+		}
+		wantDelays := []time.Duration{0, 1 * time.Second, 2 * time.Second, 3 * time.Second, 4 * time.Second}
+		for i, want := range wantDelays {
+			if slots[i].delay != want {
+				t.Errorf("slots[%d].delay = %v, want %v", i, slots[i].delay, want)
+			}
+		}
+	})
+
+	t.Run("equal personas alternate cleanly", func(t *testing.T) {
+		slots := buildWorkerSchedule(3, 3, 6*time.Second)
+		want := []workerSlot{
+			{persona: PersonaDev, workerID: 0, delay: 0},
+			{persona: PersonaAgent, workerID: 0, delay: 1 * time.Second},
+			{persona: PersonaDev, workerID: 1, delay: 2 * time.Second},
+			{persona: PersonaAgent, workerID: 1, delay: 3 * time.Second},
+			{persona: PersonaDev, workerID: 2, delay: 4 * time.Second},
+			{persona: PersonaAgent, workerID: 2, delay: 5 * time.Second},
+		}
+		if len(slots) != len(want) {
+			t.Fatalf("len(slots) = %d, want %d", len(slots), len(want))
+		}
+		for i := range want {
+			if slots[i] != want[i] {
+				t.Errorf("slots[%d] = %+v, want %+v", i, slots[i], want[i])
+			}
+		}
+	})
+
+	t.Run("unequal personas interleave proportionally across full window", func(t *testing.T) {
+		slots := buildWorkerSchedule(2, 4, 6*time.Second)
+		want := []workerSlot{
+			{persona: PersonaDev, workerID: 0, delay: 0},
+			{persona: PersonaAgent, workerID: 0, delay: 1 * time.Second},
+			{persona: PersonaAgent, workerID: 1, delay: 2 * time.Second},
+			{persona: PersonaDev, workerID: 1, delay: 3 * time.Second},
+			{persona: PersonaAgent, workerID: 2, delay: 4 * time.Second},
+			{persona: PersonaAgent, workerID: 3, delay: 5 * time.Second},
+		}
+		if len(slots) != len(want) {
+			t.Fatalf("len(slots) = %d, want %d", len(slots), len(want))
+		}
+		for i := range want {
+			if slots[i] != want[i] {
+				t.Errorf("slots[%d] = %+v, want %+v", i, slots[i], want[i])
+			}
+		}
+	})
+}
+
+func TestRunnerRampUpStaggersWorkerStartTimes(t *testing.T) {
+	var mu sync.Mutex
+	firstStart := make(map[string]time.Duration)
+	var runStart time.Time
+
+	record := func(_ context.Context, env *ScenarioEnv) error {
+		key := fmt.Sprintf("%s-%d", env.Persona, env.WorkerID)
+		mu.Lock()
+		if _, exists := firstStart[key]; !exists {
+			firstStart[key] = time.Since(runStart)
+		}
+		mu.Unlock()
+		return nil
+	}
+
+	reg := NewRegistry()
+	reg.MustRegister(&stubScenario{name: "dev-ramp", persona: PersonaDev, weight: 10, fn: record})
+	reg.MustRegister(&stubScenario{name: "agent-ramp", persona: PersonaAgent, weight: 10, fn: record})
+
+	cfg := DefaultConfig()
+	cfg.Devs = 2
+	cfg.Agents = 2
+	cfg.Seed = 99
+	cfg.RampUp = 200 * time.Millisecond // 4 workers => 50ms slots: 0, 50ms, 100ms, 150ms
+	cfg.Duration = 260 * time.Millisecond
+	cfg.ThinkMin = 10 * time.Millisecond
+	cfg.ThinkMax = 10 * time.Millisecond
+
+	var logBuf bytes.Buffer
+	tel, _, err := NewInMemoryTelemetry(&logBuf)
+	if err != nil {
+		t.Fatalf("NewInMemoryTelemetry: %v", err)
+	}
+	defer func() { _ = tel.Shutdown(context.Background()) }()
+
+	runner, err := NewRunner(cfg, reg, tel, NewOracle())
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	runStart = time.Now()
+	res := runner.Run(context.Background())
+	if res.Oracle.HasFailures() {
+		t.Fatalf("unexpected failures: %+v", res.Failures)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(firstStart) != 4 {
+		t.Fatalf("expected all 4 workers to start, got %d: %v", len(firstStart), firstStart)
+	}
+	// Slot 0 = dev-0 (0ms), slot 1 = agent-0 (50ms), slot 2 = dev-1 (100ms), slot 3 = agent-1 (150ms).
+	if firstStart["agent-1"] < 120*time.Millisecond {
+		t.Errorf("last worker agent-1 started too early at %v (want >= 120ms); starts=%v", firstStart["agent-1"], firstStart)
+	}
+	if firstStart["dev-1"] < 70*time.Millisecond {
+		t.Errorf("slot-2 worker dev-1 started too early at %v (want >= 70ms); starts=%v", firstStart["dev-1"], firstStart)
+	}
+	if firstStart["agent-0"] < 25*time.Millisecond {
+		t.Errorf("slot-1 worker agent-0 started too early at %v (want >= 25ms); starts=%v", firstStart["agent-0"], firstStart)
+	}
+}
+
+func TestRunnerRampUpSingleWorkerStartsImmediately(t *testing.T) {
+	var runs atomic.Int64
+	reg := NewRegistry()
+	reg.MustRegister(&stubScenario{
+		name:    "dev-single",
+		persona: PersonaDev,
+		weight:  10,
+		fn: func(_ context.Context, _ *ScenarioEnv) error {
+			runs.Add(1)
+			return nil
+		},
+	})
+
+	cfg := DefaultConfig()
+	cfg.Devs = 1
+	cfg.Agents = 0
+	cfg.RampUp = 5 * time.Second
+	cfg.Duration = 60 * time.Millisecond
+	cfg.ThinkMin = 5 * time.Millisecond
+	cfg.ThinkMax = 5 * time.Millisecond
+
+	var logBuf bytes.Buffer
+	tel, _, err := NewInMemoryTelemetry(&logBuf)
+	if err != nil {
+		t.Fatalf("NewInMemoryTelemetry: %v", err)
+	}
+	defer func() { _ = tel.Shutdown(context.Background()) }()
+
+	runner, err := NewRunner(cfg, reg, tel, NewOracle())
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	runner.Run(context.Background())
+	if runs.Load() == 0 {
+		t.Fatal("expected single worker (N=1) to start immediately despite 5s ramp-up")
+	}
+}
+
+func TestRunnerMidRampCancellationSkipsWaitingWorkersAndActiveThreads(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var devRuns atomic.Int64
+	var agentRuns atomic.Int64
+
+	reg := NewRegistry()
+	reg.MustRegister(&stubScenario{
+		name:    "dev-cancel",
+		persona: PersonaDev,
+		weight:  10,
+		fn: func(_ context.Context, _ *ScenarioEnv) error {
+			devRuns.Add(1)
+			cancel()
+			return nil
+		},
+	})
+	reg.MustRegister(&stubScenario{
+		name:    "agent-cancel",
+		persona: PersonaAgent,
+		weight:  10,
+		fn: func(_ context.Context, _ *ScenarioEnv) error {
+			agentRuns.Add(1)
+			return nil
+		},
+	})
+
+	cfg := DefaultConfig()
+	cfg.Devs = 3
+	cfg.Agents = 3
+	cfg.RampUp = 10 * time.Second // slot = 1.66s; slot 0 is dev-0, all others wait >= 1.66s
+	cfg.ThinkMin = 5 * time.Millisecond
+	cfg.ThinkMax = 5 * time.Millisecond
+
+	var logBuf bytes.Buffer
+	tel, exp, err := NewInMemoryTelemetry(&logBuf)
+	if err != nil {
+		t.Fatalf("NewInMemoryTelemetry: %v", err)
+	}
+	defer func() { _ = tel.Shutdown(context.Background()) }()
+
+	runner, err := NewRunner(cfg, reg, tel, NewOracle())
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+
+	start := time.Now()
+	res := runner.Run(ctx)
+	elapsed := time.Since(start)
+
+	if elapsed > 1*time.Second {
+		t.Fatalf("mid-ramp cancellation took too long (%v); waiting workers should exit immediately", elapsed)
+	}
+	if res.Oracle.HasFailures() {
+		t.Fatalf("unexpected failures: %+v", res.Failures)
+	}
+	if devRuns.Load() != 1 {
+		t.Errorf("devRuns = %d, want 1 (only slot-0 dev-0)", devRuns.Load())
+	}
+	if agentRuns.Load() != 0 {
+		t.Errorf("agentRuns = %d, want 0 (agent workers cancelled during ramp-up)", agentRuns.Load())
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := exp.MetricReader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("MetricReader.Collect: %v", err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "stravin_loadgen_active_threads" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("active_threads data type = %T, want Sum[int64]", m.Data)
+			}
+			for _, dp := range sum.DataPoints {
+				if val, ok := dp.Attributes.Value("persona"); ok && val.AsString() == string(PersonaAgent) {
+					t.Errorf("unexpected active_threads data point for agent persona (value=%d); cancelled workers must not modify active_threads", dp.Value)
+				}
+				if dp.Value != 0 {
+					t.Errorf("active_threads final value = %d for attrs %v, want 0", dp.Value, dp.Attributes)
+				}
+			}
+		}
 	}
 }
