@@ -182,7 +182,10 @@ func (p *WireProxy) ProxyStream(
 
 func pumpStdin(ctx context.Context, stdin io.Reader, stream rpc.GitWireStream) error {
 	if stdin == nil {
-		return stream.Send(&rpc.Frame{EOF: true})
+		if sendErr := stream.Send(&rpc.Frame{EOF: true}); sendErr != nil && !errors.Is(sendErr, io.EOF) {
+			return sendErr
+		}
+		return nil
 	}
 	buf := make([]byte, wireChunkSize)
 	for {
@@ -194,11 +197,19 @@ func pumpStdin(ctx context.Context, stdin io.Reader, stream rpc.GitWireStream) e
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
 			if sendErr := stream.Send(&rpc.Frame{Data: chunk}); sendErr != nil {
+				// gRPC SendMsg returns io.EOF when the server terminates the stream;
+				// stop sending so stream.Recv surfaces the real gRPC status error.
+				if errors.Is(sendErr, io.EOF) {
+					return nil
+				}
 				return sendErr
 			}
 		}
 		if errors.Is(readErr, io.EOF) {
-			return stream.Send(&rpc.Frame{EOF: true})
+			if sendErr := stream.Send(&rpc.Frame{EOF: true}); sendErr != nil && !errors.Is(sendErr, io.EOF) {
+				return sendErr
+			}
+			return nil
 		}
 		if readErr != nil {
 			return readErr
