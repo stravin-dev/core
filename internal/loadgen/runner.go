@@ -142,7 +142,7 @@ func (r *Runner) runWorker(ctx context.Context, cancelRun context.CancelFunc, pe
 		if !ok {
 			return
 		}
-		repo := r.cfg.Repos[rng.IntN(len(r.cfg.Repos))]
+		repo := RepoName(rng.IntN(r.cfg.RepoCount))
 
 		r.executeScenario(ctx, cancelRun, persona, workerID, repo, workDir, baseClones, rng, gitClient, scenario)
 

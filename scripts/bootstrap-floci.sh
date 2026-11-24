@@ -11,7 +11,7 @@ BUCKET="${STRAVIN_S3_BUCKET:-git-objects-us-east-1}"
 TABLE="${STRAVIN_DDB_TABLE:-stravin-core}"
 KMS_ALIAS="${STRAVIN_KMS_ALIAS:-alias/stravin-local-dev}"
 TENANT="${STRAVIN_DEFAULT_TENANT:-local}"
-REPOS="${STRAVIN_DEFAULT_REPOS:-${STRAVIN_DEFAULT_REPO:-demo}}"
+REPOS="${STRAVIN_DEFAULT_REPOS:-${STRAVIN_DEFAULT_REPO:-demo,repo-1,repo-2,repo-3}}"
 
 echo "[floci-init] Bootstrapping Floci at ${AWS_ENDPOINT_URL} (region=${AWS_DEFAULT_REGION})"
 

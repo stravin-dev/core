@@ -97,7 +97,7 @@ export AWS_DEFAULT_REGION="us-east-1"
 CHAOS_RUN_SECONDS="${CHAOS_RUN_SECONDS:-25}"
 DEVS="${DEVS:-4}"
 AGENTS="${AGENTS:-6}"
-REPOS="${REPOS:-loadgen-1,loadgen-2,loadgen-3}"
+REPOS="${REPOS:-3}"
 SEED="${SEED:-42}"
 FLUSH_TIMEOUT="${FLUSH_TIMEOUT:-10s}"
 OTEL_ENDPOINT="${OTEL_ENDPOINT:-}"
@@ -142,13 +142,9 @@ wait_http "stravin-edge (via toxiproxy)" "http://127.0.0.1:18080/healthz"
 wait_http "stravin-pack" "http://127.0.0.1:8082/healthz"
 wait_http "stravin-hook" "http://127.0.0.1:8084/healthz"
 
-echo "[chaos-e2e] Seeding test repositories (${REPOS}) via stravin-admin..."
-IFS=',' read -r -a repo_list <<< "${REPOS}"
-for repo in "${repo_list[@]}"; do
-  repo_trimmed="$(echo "${repo}" | xargs)"
-  if [ -n "${repo_trimmed}" ]; then
-    ./bin/stravin-admin repo create --tenant local --repo "${repo_trimmed}" --idempotent >/dev/null
-  fi
+echo "[chaos-e2e] Seeding ${REPOS} test repositories (repo-1..repo-${REPOS}) via stravin-admin..."
+for i in $(seq 1 "${REPOS}"); do
+  ./bin/stravin-admin repo create --tenant local --repo "repo-${i}" --idempotent >/dev/null
 done
 
 echo "[chaos-e2e] Launching stravin-chaos against http://127.0.0.1:8474 (seed=${SEED})..."

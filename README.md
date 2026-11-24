@@ -13,7 +13,7 @@ docker compose up -d --build
 ```
 
 Services started:
-- **Floci** (`:4566`): Local S3, DynamoDB, DynamoDB Streams, and KMS emulator (`floci-init` creates `git-objects-us-east-1`, `stravin-core`, `alias/stravin-local-dev`, and seeds `local/demo`).
+- **Floci** (`:4566`): Local S3, DynamoDB, DynamoDB Streams, and KMS emulator (`floci-init` creates `git-objects-us-east-1`, `stravin-core`, `alias/stravin-local-dev`, and seeds `local/demo` and `local/repo-1`..`local/repo-3`).
 - **`stravin-edge`** (`:8080` Smart HTTP, `:2222` SSH): Stateless Git ingress proxy. Default local HTTP token: `stravin-local-dev-token` (tenant `local`).
 - **`stravin-node`** (`:8081` health/metrics, `:9090` gRPC): Git read/write engine with NVMe pack cache and Tier 1 Wasm hook runtime.
 - **`stravin-pack`** (`:8082`): Sharded pack compaction (`.midx` + `commit-graph`) and delayed GC daemon.
@@ -94,7 +94,7 @@ make build-chaos
 make chaos-up
 make chaos-up TELEMETRY=1
 
-# Run stravin-loadgen against the local stack (configurable DEVS, AGENTS, DURATION, HTTP_URL, AUTH_TOKEN, etc.)
+# Run stravin-loadgen against the local stack (configurable DEVS, AGENTS, REPOS, DURATION, HTTP_URL, AUTH_TOKEN, etc.)
 make load-test DEVS=4 AGENTS=6 DURATION=60s HTTP_URL=http://127.0.0.1:18080
 
 # Tear down the chaos stack and telemetry containers/volumes
@@ -118,12 +118,12 @@ Both `docker-compose.yml` and `docker-compose.chaos.yml` raise `stravin-edge` lo
   --http-url http://127.0.0.1:18080 \
   --ssh-addr 127.0.0.1:12222 \
   --ssh-key /path/to/id_ed25519 \
-  --tenant local --repos loadgen-1,loadgen-2,loadgen-3 \
+  --tenant local --repos 3 \
   --auth-token dev:stravin-local-dev-token \
   --scenarios ""
 ```
 
-Key flags: `--devs`, `--agents`, `--duration` (`0` = continuous until Ctrl+C), `--seed`, `--scenarios` (comma-separated filter; empty runs all 22), `--http-url`, `--ssh-addr`, `--ssh-key`, `--auth-token`, `--otel-endpoint`, `--flush-timeout`, `--max-retries`, `--fail-fast`.
+Key flags: `--devs`, `--agents`, `--repos` (number of target repositories `repo-1..repo-N`, default `3`), `--duration` (`0` = continuous until Ctrl+C), `--seed`, `--scenarios` (comma-separated filter; empty runs all 22), `--http-url`, `--ssh-addr`, `--ssh-key`, `--auth-token`, `--otel-endpoint`, `--flush-timeout`, `--max-retries`, `--fail-fast`.
 
 Registered scenarios (22 total):
 - **Developer (11)**: `dev_clone_and_read`, `dev_feature_branch_pr`, `dev_incremental_thin_pack`, `dev_rebase_and_force_push`, `dev_concurrent_main_push_retry`, `dev_tag_and_release`, `dev_large_binary_asset`, `dev_branch_cleanup_cycle`, `dev_shallow_clone_unshallow`, `dev_ssh_full_lifecycle`, `dev_noop_empty_push_and_fetch`.

@@ -28,13 +28,17 @@ func TestParseFlagsDefaults(t *testing.T) {
 	if cfg.Tenant != "loadgen" {
 		t.Errorf("Tenant = %q, want loadgen", cfg.Tenant)
 	}
+	if cfg.RepoCount != 3 {
+		t.Errorf("RepoCount = %d, want 3", cfg.RepoCount)
+	}
 	wantRepos := []string{"repo-1", "repo-2", "repo-3"}
-	if len(cfg.Repos) != len(wantRepos) {
-		t.Fatalf("Repos = %v, want %v", cfg.Repos, wantRepos)
+	gotRepos := cfg.RepoNames()
+	if len(gotRepos) != len(wantRepos) {
+		t.Fatalf("RepoNames() = %v, want %v", gotRepos, wantRepos)
 	}
 	for i, r := range wantRepos {
-		if cfg.Repos[i] != r {
-			t.Errorf("Repos[%d] = %q, want %q", i, cfg.Repos[i], r)
+		if gotRepos[i] != r {
+			t.Errorf("RepoNames()[%d] = %q, want %q", i, gotRepos[i], r)
 		}
 	}
 	if cfg.Seed != 0 {
@@ -83,7 +87,7 @@ func TestParseFlagsCustomValues(t *testing.T) {
 		"--admin-url=http://ctrl:8090",
 		"--admin-token=admin-secret",
 		"--tenant=acme",
-		"--repos=alpha, beta ,gamma",
+		"--repos=5",
 		"--seed=42",
 		"--duration=2m",
 		"--ramp-up=12s",
@@ -124,8 +128,18 @@ func TestParseFlagsCustomValues(t *testing.T) {
 	if cfg.MaxRetries != 5 || !cfg.FailFast {
 		t.Errorf("retries/failfast = %d/%v", cfg.MaxRetries, cfg.FailFast)
 	}
-	if len(cfg.Repos) != 3 || cfg.Repos[1] != "beta" {
-		t.Errorf("Repos = %v, want [alpha beta gamma]", cfg.Repos)
+	if cfg.RepoCount != 5 {
+		t.Errorf("RepoCount = %d, want 5", cfg.RepoCount)
+	}
+	wantRepos := []string{"repo-1", "repo-2", "repo-3", "repo-4", "repo-5"}
+	gotRepos := cfg.RepoNames()
+	if len(gotRepos) != len(wantRepos) {
+		t.Fatalf("RepoNames() = %v, want %v", gotRepos, wantRepos)
+	}
+	for i, want := range wantRepos {
+		if gotRepos[i] != want {
+			t.Errorf("RepoNames()[%d] = %q, want %q", i, gotRepos[i], want)
+		}
 	}
 	if len(cfg.Scenarios) != 2 || cfg.Scenarios[0] != "dev-push" || cfg.Scenarios[1] != "agent-clone" {
 		t.Errorf("Scenarios = %v, want [dev-push agent-clone]", cfg.Scenarios)
@@ -147,7 +161,8 @@ func TestConfigValidateErrors(t *testing.T) {
 		{name: "zero flush timeout", mutate: func(c *Config) { c.FlushTimeout = 0 }},
 		{name: "negative cmd timeout", mutate: func(c *Config) { c.CmdTimeout = -1 * time.Second }},
 		{name: "negative max retries", mutate: func(c *Config) { c.MaxRetries = -1 }},
-		{name: "empty repos", mutate: func(c *Config) { c.Repos = nil }},
+		{name: "zero repos", mutate: func(c *Config) { c.RepoCount = 0 }},
+		{name: "negative repos", mutate: func(c *Config) { c.RepoCount = -2 }},
 		{name: "empty tenant", mutate: func(c *Config) { c.Tenant = "" }},
 	}
 
@@ -204,5 +219,16 @@ func TestParseFlagsRampUpZeroDisablesRampUp(t *testing.T) {
 	}
 	if cfg.RampUp != 0 {
 		t.Fatalf("RampUp = %v, want 0", cfg.RampUp)
+	}
+}
+
+func TestParseFlagsRejectsInvalidRepos(t *testing.T) {
+	for _, arg := range []string{"--repos=0", "--repos=-1", "--repos=repo-1,repo-2"} {
+		t.Run(arg, func(t *testing.T) {
+			var stderr bytes.Buffer
+			if _, err := ParseFlags([]string{arg}, &stderr); err == nil {
+				t.Fatalf("ParseFlags(%q) expected error, got nil", arg)
+			}
+		})
 	}
 }

@@ -264,7 +264,7 @@ func newTestEnv(t *testing.T, root string, persona loadgen.Persona, workerID int
 	cfg.HTTPURL = "file://" + root
 	cfg.SSHAddr = "file://" + root
 	cfg.Tenant = "loadgen"
-	cfg.Repos = []string{"repo-1"}
+	cfg.RepoCount = 1
 	cfg.MaxRetries = 5
 	return &loadgen.ScenarioEnv{
 		Config:      cfg,
