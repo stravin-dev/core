@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"stravin.dev/core/internal/gitexec"
+	"stravin.dev/core/internal/lease"
 	"stravin.dev/core/internal/rpc"
 	"stravin.dev/core/internal/storage/ddb"
 	"stravin.dev/core/internal/storage/s3"
@@ -356,7 +358,7 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 			TenantID(string(repo.TenantID)).
 			RepoID(string(repo.RepoID)).
 			HomeRegion(string(syncRes.Meta.HomeRegion)).
-			FailoverEpoch(int64(syncRes.Meta.FailoverEpoch)).
+			FailoverEpoch(epochToInt64(syncRes.Meta.FailoverEpoch)).
 			GitOperation("fetch").
 			Build()...,
 	))
@@ -641,4 +643,13 @@ func recordSpanError(span trace.Span, err error) {
 	safeErr := sanitizeError(err)
 	span.RecordError(safeErr)
 	span.SetStatus(otelcodes.Error, safeErr.Error())
+}
+
+// epochToInt64 converts a uint64 lease.Epoch to int64 for telemetry span
+// attributes, clamping values above math.MaxInt64 instead of overflowing.
+func epochToInt64(epoch lease.Epoch) int64 {
+	if epoch > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(epoch)
 }
