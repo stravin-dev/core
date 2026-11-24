@@ -57,6 +57,12 @@
       "description": "Current operations per second comparing Developer and AI Agent personas.",
       "fieldConfig": {
         "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          },
           "unit": "ops"
         },
         "overrides": []
@@ -87,6 +93,12 @@
       "description": "Active concurrent worker goroutines by persona.",
       "fieldConfig": {
         "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          },
           "unit": "short"
         },
         "overrides": []
