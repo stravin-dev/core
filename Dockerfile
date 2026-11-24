@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-edge ./cmd
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-hook ./cmd/stravin-hook \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-admin ./cmd/stravin-admin
 
-FROM alpine:3.21 AS runtime-base
+FROM alpine:3.22 AS runtime-base
 RUN apk add --no-cache ca-certificates \
  && addgroup -S stravin \
  && adduser -S -G stravin stravin
