@@ -362,6 +362,7 @@ func (h *ReceivePackHandler) HandleReceivePack(ctx context.Context, meta rpc.Req
 	ddbSpan.End()
 
 	// 9. Install committed pack into local warm NVMe cache.
+	installedPack := false
 	if needsPack {
 		if err := h.cache.InstallPack(repo, packSHA256, completedPack, idxBytes); err != nil {
 			h.logger.WarnContext(ctx, "node: warm cache install after commit failed",
@@ -370,10 +371,15 @@ func (h *ReceivePackHandler) HandleReceivePack(ctx context.Context, meta rpc.Req
 				"pack_id", packSHA256,
 				"error", err,
 			)
-		} else if h.metrics != nil {
-			h.metrics.RecordCacheBytes(ctx, h.cache.Stats().TotalBytes)
+		} else {
+			installedPack = true
+			if h.metrics != nil {
+				h.metrics.RecordCacheBytes(ctx, h.cache.Stats().TotalBytes)
+			}
 		}
 	}
+
+	h.materializer.RecordLocalPush(repo, repoMeta.RefVersion, repoMeta.ManifestVersion, cmds, installedPack)
 
 	// 10. ACK client with report-status ok <ref>.
 	statuses := make([]refStatus, 0, len(cmds))

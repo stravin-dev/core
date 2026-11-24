@@ -18,7 +18,7 @@ const (
 	oidC = "3333333333333333333333333333333333333333"
 )
 
-func TestBuildPushTransaction_CreateUpdateDeleteAndNoMeta(t *testing.T) {
+func TestBuildPushTransaction_CreateUpdateDeleteAndMetaVersionBump(t *testing.T) {
 	repo := mustRepoKey(t, "acme", "core")
 	now := time.Date(2026, 11, 21, 18, 0, 0, 0, time.UTC)
 	ulid := "01ARZ3NDEKTSV4RRFFQ69G5FAV"
@@ -45,9 +45,9 @@ func TestBuildPushTransaction_CreateUpdateDeleteAndNoMeta(t *testing.T) {
 		t.Fatalf("BuildPushTransaction: %v", err)
 	}
 
-	// 3 refs * 2 (RS + RH) + 1 MS = 7 items.
-	if len(items) != 7 {
-		t.Fatalf("got %d tx items, want 7", len(items))
+	// 3 refs * 2 (RS + RH) + 1 MS + 1 META = 8 items.
+	if len(items) != 8 {
+		t.Fatalf("got %d tx items, want 8", len(items))
 	}
 
 	// Verify refIndex maps the 3 RS item positions (0, 2, 4).
@@ -90,20 +90,23 @@ func TestBuildPushTransaction_CreateUpdateDeleteAndNoMeta(t *testing.T) {
 		t.Fatalf("expected ACTIVE manifest Put at index 6, got %+v", items[6])
 	}
 
-	// Verify META is NEVER touched in push transactions.
-	for i, it := range items {
-		var sk string
-		switch {
-		case it.Put != nil:
-			sk = getString(it.Put.Item, AttrSK)
-		case it.Update != nil:
-			sk = getString(it.Update.Key, AttrSK)
-		case it.Delete != nil:
-			sk = getString(it.Delete.Key, AttrSK)
-		}
-		if sk == "META" {
-			t.Fatalf("tx item %d illegally touches META", i)
-		}
+	// Verify META item atomically bumps ref_version and manifest_version.
+	metaKey, err := MetaKey(repo)
+	if err != nil {
+		t.Fatalf("MetaKey: %v", err)
+	}
+	metaUpd := items[7].Update
+	if metaUpd == nil {
+		t.Fatalf("expected META Update at index 7, got %+v", items[7])
+	}
+	if getString(metaUpd.Key, AttrPK) != metaKey.PK || getString(metaUpd.Key, AttrSK) != metaKey.SK {
+		t.Fatalf("META update key = (%q, %q), want (%q, %q)", getString(metaUpd.Key, AttrPK), getString(metaUpd.Key, AttrSK), metaKey.PK, metaKey.SK)
+	}
+	if got := aws.ToString(metaUpd.UpdateExpression); got != "ADD ref_version :one, manifest_version :one" {
+		t.Fatalf("META UpdateExpression = %q, want %q", got, "ADD ref_version :one, manifest_version :one")
+	}
+	if one, err := getUint64(metaUpd.ExpressionAttributeValues, ":one"); err != nil || one != 1 {
+		t.Fatalf("META :one = %d (err=%v), want 1", one, err)
 	}
 }
 
@@ -122,12 +125,15 @@ func TestBuildPushTransaction_DeleteOnlyNoPack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildPushTransaction delete-only: %v", err)
 	}
-	// Only RS delete + RH put, no MS item.
-	if len(items) != 2 {
-		t.Fatalf("got %d tx items, want 2", len(items))
+	// RS delete + RH put + META ref_version bump, no MS item.
+	if len(items) != 3 {
+		t.Fatalf("got %d tx items, want 3", len(items))
 	}
-	if items[0].Delete == nil || items[1].Put == nil {
-		t.Fatalf("expected RS Delete + RH Put, got %+v", items)
+	if items[0].Delete == nil || items[1].Put == nil || items[2].Update == nil {
+		t.Fatalf("expected RS Delete + RH Put + META Update, got %+v", items)
+	}
+	if got := aws.ToString(items[2].Update.UpdateExpression); got != "ADD ref_version :one" {
+		t.Fatalf("META UpdateExpression = %q, want %q", got, "ADD ref_version :one")
 	}
 }
 

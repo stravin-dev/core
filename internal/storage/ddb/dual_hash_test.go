@@ -109,8 +109,8 @@ func TestValidateOIDDualHashAndPushTransactionSHA256(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildPushTransaction(sha256): %v", err)
 	}
-	if len(items) != 4 {
-		t.Fatalf("got %d transact items, want 4", len(items))
+	if len(items) != 5 {
+		t.Fatalf("got %d transact items, want 5", len(items))
 	}
 	// Verify prev_oid on create uses 64-zero SHA-256 null OID.
 	if got := getString(items[0].Put.Item, "prev_oid"); got != ZeroOIDSHA256 {

@@ -15,14 +15,16 @@ import (
 
 // RepoMeta represents the per-repository META routing and fencing item.
 type RepoMeta struct {
-	Repo           tenant.RepoKey
-	HomeRegion     lease.Region
-	FailoverEpoch  lease.Epoch
-	RefShards      int
-	ManifestShards int
-	WriteState     lease.Mode
-	DefaultBranch  string
-	ObjectFormat   ObjectFormat
+	Repo            tenant.RepoKey
+	HomeRegion      lease.Region
+	FailoverEpoch   lease.Epoch
+	RefShards       int
+	ManifestShards  int
+	WriteState      lease.Mode
+	DefaultBranch   string
+	ObjectFormat    ObjectFormat
+	RefVersion      uint64
+	ManifestVersion uint64
 }
 
 // EffectiveObjectFormat returns the repository's object format, defaulting to sha1
@@ -154,16 +156,18 @@ func (r *Repository) UpdateMeta(ctx context.Context, meta RepoMeta, expectedEpoc
 
 func marshalRepoMeta(key Key, meta RepoMeta) map[string]types.AttributeValue {
 	item := map[string]types.AttributeValue{
-		AttrPK:            attrS(key.PK),
-		AttrSK:            attrS(key.SK),
-		"tenant_id":       attrS(string(meta.Repo.TenantID)),
-		"repo_id":         attrS(string(meta.Repo.RepoID)),
-		"home_region":     attrS(string(meta.HomeRegion)),
-		"failover_epoch":  attrNUint64(uint64(meta.FailoverEpoch)),
-		"ref_shards":      attrNInt(meta.RefShards),
-		"manifest_shards": attrNInt(meta.ManifestShards),
-		"write_state":     attrS(string(meta.WriteState)),
-		"object_format":   attrS(string(meta.EffectiveObjectFormat())),
+		AttrPK:             attrS(key.PK),
+		AttrSK:             attrS(key.SK),
+		"tenant_id":        attrS(string(meta.Repo.TenantID)),
+		"repo_id":          attrS(string(meta.Repo.RepoID)),
+		"home_region":      attrS(string(meta.HomeRegion)),
+		"failover_epoch":   attrNUint64(uint64(meta.FailoverEpoch)),
+		"ref_shards":       attrNInt(meta.RefShards),
+		"manifest_shards":  attrNInt(meta.ManifestShards),
+		"write_state":      attrS(string(meta.WriteState)),
+		"object_format":    attrS(string(meta.EffectiveObjectFormat())),
+		"ref_version":      attrNUint64(meta.RefVersion),
+		"manifest_version": attrNUint64(meta.ManifestVersion),
 	}
 	if meta.DefaultBranch != "" {
 		item["default_branch"] = attrS(meta.DefaultBranch)
@@ -184,15 +188,25 @@ func unmarshalRepoMeta(repo tenant.RepoKey, item map[string]types.AttributeValue
 	if err != nil {
 		return RepoMeta{}, err
 	}
+	refVersion, err := getUint64(item, "ref_version")
+	if err != nil {
+		return RepoMeta{}, err
+	}
+	manifestVersion, err := getUint64(item, "manifest_version")
+	if err != nil {
+		return RepoMeta{}, err
+	}
 	objFormat := NormalizeObjectFormat(ObjectFormat(getString(item, "object_format")))
 	return RepoMeta{
-		Repo:           repo,
-		HomeRegion:     lease.Region(getString(item, "home_region")),
-		FailoverEpoch:  lease.Epoch(epoch),
-		RefShards:      refShards,
-		ManifestShards: manifestShards,
-		WriteState:     lease.Mode(getString(item, "write_state")),
-		DefaultBranch:  getString(item, "default_branch"),
-		ObjectFormat:   objFormat,
+		Repo:            repo,
+		HomeRegion:      lease.Region(getString(item, "home_region")),
+		FailoverEpoch:   lease.Epoch(epoch),
+		RefShards:       refShards,
+		ManifestShards:  manifestShards,
+		WriteState:      lease.Mode(getString(item, "write_state")),
+		DefaultBranch:   getString(item, "default_branch"),
+		ObjectFormat:    objFormat,
+		RefVersion:      refVersion,
+		ManifestVersion: manifestVersion,
 	}, nil
 }

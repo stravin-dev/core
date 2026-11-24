@@ -181,7 +181,7 @@ func (r *Repository) PublishCompactedPacks(ctx context.Context, repo tenant.Repo
 	}
 
 	now := r.clock.Now().UTC()
-	txItems := make([]types.TransactWriteItem, 0, len(packs))
+	txItems := make([]types.TransactWriteItem, 0, len(packs)+1)
 	for _, p := range packs {
 		p.Repo = repo
 		p.Status = PackStatusActive
@@ -204,13 +204,7 @@ func (r *Repository) PublishCompactedPacks(ctx context.Context, repo tenant.Repo
 		})
 	}
 
-	_, err := r.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-		TransactItems: txItems,
-	})
-	if err != nil {
-		return classifyTransactionError(err, nil)
-	}
-	return nil
+	return r.commitManifestBatchWithVersionBump(ctx, repo, txItems)
 }
 
 // SupersedePacks executes Phase 2 of two-phase compaction: atomically marking
@@ -229,7 +223,7 @@ func (r *Repository) SupersedePacks(ctx context.Context, repo tenant.RepoKey, ma
 		return fmt.Errorf("%w: supersede batch %d exceeds DynamoDB 100-item limit", ErrInvalidInput, len(packs))
 	}
 
-	txItems := make([]types.TransactWriteItem, 0, len(packs))
+	txItems := make([]types.TransactWriteItem, 0, len(packs)+1)
 	for _, p := range packs {
 		key, err := ManifestKey(repo, p.ULID, p.PackID, manifestShards)
 		if err != nil {
@@ -252,11 +246,46 @@ func (r *Repository) SupersedePacks(ctx context.Context, repo tenant.RepoKey, ma
 		})
 	}
 
-	_, err := r.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+	return r.commitManifestBatchWithVersionBump(ctx, repo, txItems)
+}
+
+func (r *Repository) commitManifestBatchWithVersionBump(ctx context.Context, repo tenant.RepoKey, txItems []types.TransactWriteItem) error {
+	metaKey, err := MetaKey(repo)
+	if err != nil {
+		return err
+	}
+	bumpInTx := len(txItems) <= 99
+	if bumpInTx {
+		txItems = append(txItems, types.TransactWriteItem{
+			Update: &types.Update{
+				TableName:        aws.String(r.tableName),
+				Key:              metaKey.AttributeMap(),
+				UpdateExpression: aws.String("ADD manifest_version :one"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":one": attrNUint64(1),
+				},
+			},
+		})
+	}
+
+	_, err = r.client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
 		TransactItems: txItems,
 	})
 	if err != nil {
 		return classifyTransactionError(err, nil)
+	}
+	if !bumpInTx {
+		_, err = r.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName:        aws.String(r.tableName),
+			Key:              metaKey.AttributeMap(),
+			UpdateExpression: aws.String("ADD manifest_version :one"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":one": attrNUint64(1),
+			},
+		})
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
