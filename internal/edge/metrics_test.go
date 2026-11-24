@@ -239,12 +239,12 @@ func TestEdgePackCacheAndIngressMetrics(t *testing.T) {
 
 	// 4. Resolver META cache miss then hit.
 	rk := tenant.RepoKey{TenantID: "acme", RepoID: "core"}
-	metaStore := &fakeMetaStore{
+	metaStore := &stubMetaStore{
 		metas: map[tenant.RepoKey]ddb.RepoMeta{
 			rk: {Repo: rk, HomeRegion: "us-east-1", WriteState: lease.ModeActive},
 		},
 	}
-	leaseStore := &fakeLeaseStore{}
+	leaseStore := &stubLeaseStore{}
 	resolver, err := NewResolver("us-east-1", metaStore, lease.NewStoreVerifier(leaseStore, clk, 0), time.Minute, clk)
 	if err != nil {
 		t.Fatalf("NewResolver: %v", err)
