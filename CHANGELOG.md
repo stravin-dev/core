@@ -1,3 +1,25 @@
+# [1.10.0](https://github.com/stravin-dev/core/compare/v1.9.8...v1.10.0) (2026-11-24)
+
+
+### Bug Fixes
+
+* **deps:** bump google.golang.org/grpc to v1.83.1 ([17d37a4](https://github.com/stravin-dev/core/commit/17d37a42df2440a2821da342053e2ed630d7ecdf)), closes [#4](https://github.com/stravin-dev/core/issues/4) [#21](https://github.com/stravin-dev/core/issues/21) [#22](https://github.com/stravin-dev/core/issues/22) [#24](https://github.com/stravin-dev/core/issues/24) [#23](https://github.com/stravin-dev/core/issues/23)
+* **deps:** bump google.golang.org/grpc to v1.83.1 ([#172](https://github.com/stravin-dev/core/issues/172)) ([b0e0042](https://github.com/stravin-dev/core/commit/b0e004210b81afde41d78e370f4d1399723f4f79))
+* **observability:** remove default 80-threshold red color change on Grafana throughput stat panels ([#169](https://github.com/stravin-dev/core/issues/169)) ([c7a365f](https://github.com/stravin-dev/core/commit/c7a365f163b91b46674d2db7eef3ecbc973946f5))
+* **observability:** set explicit base threshold on non-error Grafana stat panels ([fe2034b](https://github.com/stravin-dev/core/commit/fe2034b3a89cc8d31b5d2abd9ad0fe1140668c6b)), closes [#168](https://github.com/stravin-dev/core/issues/168)
+
+
+### Features
+
+* **loadgen:** add 5s staggered ramp-up across evenly spaced worker start slots ([140c600](https://github.com/stravin-dev/core/commit/140c600fbdbbd5b10c9b4ca858a797fcaada4d98))
+* **loadgen:** add 5s staggered ramp-up across evenly spaced worker start slots ([#170](https://github.com/stravin-dev/core/issues/170)) ([6c93084](https://github.com/stravin-dev/core/commit/6c93084a6179f03cc40a15ad8ca5a9fb91430eb9))
+
+
+### Performance Improvements
+
+* **loadgen:** run on-demand synchronous git gc on idle worker base clones ([06ba8c2](https://github.com/stravin-dev/core/commit/06ba8c2ff98950314dbf30c580d203f0b24871ea))
+* **loadgen:** run on-demand synchronous git gc on idle worker base clones ([#174](https://github.com/stravin-dev/core/issues/174)) ([cc215bd](https://github.com/stravin-dev/core/commit/cc215bdec0cd8ea3cfe77eecf74daf168c081f13))
+
 ## [1.9.8](https://github.com/stravin-dev/core/compare/v1.9.7...v1.9.8) (2026-11-24)
 
 
