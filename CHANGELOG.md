@@ -1,3 +1,13 @@
+## [1.10.3](https://github.com/stravin-dev/core/compare/v1.10.2...v1.10.3) (2026-11-24)
+
+
+### Bug Fixes
+
+* **ddb:** use strconv.Atoi in getInt to prevent unsafe int64 narrowing ([3f5e97e](https://github.com/stravin-dev/core/commit/3f5e97e9ca87bffe31771e3a4b676d124187b317))
+* **ddb:** use strconv.Atoi in getInt to resolve CodeQL alert [#9](https://github.com/stravin-dev/core/issues/9) ([#178](https://github.com/stravin-dev/core/issues/178)) ([e8d0d47](https://github.com/stravin-dev/core/commit/e8d0d47ee681e313bec468c3aabb4499da6f5bd0))
+* **hooks/wasm:** clamp memoryLimitMB before uint32 conversion ([3506d51](https://github.com/stravin-dev/core/commit/3506d512ecb71dbd04fe5876183751c368aa78a0))
+* **hooks/wasm:** return early on upper memory bound for CodeQL guard ([6f2d7a2](https://github.com/stravin-dev/core/commit/6f2d7a2d064a7c103d1d843704f4b5297974132b))
+
 ## [1.10.2](https://github.com/stravin-dev/core/compare/v1.10.1...v1.10.2) (2026-11-24)
 
 
