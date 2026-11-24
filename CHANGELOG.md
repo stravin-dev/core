@@ -1,3 +1,11 @@
+# [1.9.0](https://github.com/stravin-dev/core/compare/v1.8.1...v1.9.0) (2026-11-24)
+
+
+### Features
+
+* **node,gitexec:** add configurable upload-pack concurrency and pack-objects tuning ([8d71127](https://github.com/stravin-dev/core/commit/8d71127f65ec3a2b896e3034ad7a0b6ec59cc990))
+* **node,gitexec:** add configurable upload-pack concurrency and pack-objects tuning ([#144](https://github.com/stravin-dev/core/issues/144)) ([b716fc6](https://github.com/stravin-dev/core/commit/b716fc6a6a29614713b7f00588447b7e2cbde82b))
+
 ## [1.8.1](https://github.com/stravin-dev/core/compare/v1.8.0...v1.8.1) (2026-11-23)
 
 
