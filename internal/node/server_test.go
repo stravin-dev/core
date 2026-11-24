@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1595,5 +1596,92 @@ func TestServer_UploadPackSyncRunsBeforeSlotAcquire(t *testing.T) {
 	if metaStore.GetMetaCalls() <= callsBefore {
 		t.Errorf("GetMetaCalls did not increase (%d -> %d): expected SyncAndPin before acquireUploadPackSlot",
 			callsBefore, metaStore.GetMetaCalls())
+	}
+}
+
+func TestEpochToInt64(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   lease.Epoch
+		want int64
+	}{
+		{name: "zero", in: 0, want: 0},
+		{name: "typical", in: 42, want: 42},
+		{name: "max_int64", in: lease.Epoch(math.MaxInt64), want: math.MaxInt64},
+		{name: "max_int64_plus_one", in: lease.Epoch(math.MaxInt64) + 1, want: math.MaxInt64},
+		{name: "max_uint64", in: lease.Epoch(math.MaxUint64), want: math.MaxInt64},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := epochToInt64(tc.in); got != tc.want {
+				t.Fatalf("epochToInt64(%d) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadAuthoritativeRefsClampsOverflowFailoverEpoch(t *testing.T) {
+	ctx := context.Background()
+	rk := tenant.RepoKey{TenantID: "t-overflow", RepoID: "r-overflow"}
+
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	metaStore := newFakeMetadataStore()
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  lease.Epoch(math.MaxUint64),
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	})
+	metaStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: strings.Repeat("a", 40)},
+	})
+
+	tp, err := telemetry.NewInMemoryProvider("stravin-node")
+	if err != nil {
+		t.Fatalf("NewInMemoryProvider: %v", err)
+	}
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:      metaStore,
+		Packs:     newFakePackFetcher(),
+		Cache:     c,
+		Telemetry: tp,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	if _, _, err := mat.LoadAuthoritativeRefs(ctx, rk); err != nil {
+		t.Fatalf("LoadAuthoritativeRefs: %v", err)
+	}
+
+	var found bool
+	for _, s := range tp.SpanExporter.GetSpans() {
+		if s.Name != "ddb.query_refs" {
+			continue
+		}
+		for _, attr := range s.Attributes {
+			if attr.Key == telemetry.AttrFailoverEpoch {
+				found = true
+				if got := attr.Value.AsInt64(); got != math.MaxInt64 {
+					t.Fatalf("ddb.query_refs %s = %d, want %d", telemetry.AttrFailoverEpoch, got, int64(math.MaxInt64))
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected ddb.query_refs span with %s attribute", telemetry.AttrFailoverEpoch)
 	}
 }

@@ -325,7 +325,7 @@ func (h *ReceivePackHandler) HandleReceivePack(ctx context.Context, meta rpc.Req
 			TenantID(string(repo.TenantID)).
 			RepoID(string(repo.RepoID)).
 			HomeRegion(string(repoMeta.HomeRegion)).
-			FailoverEpoch(int64(currentLease.Epoch)).
+			FailoverEpoch(epochToInt64(currentLease.Epoch)).
 			Build()...,
 	))
 	if packSHA256 != "" {
@@ -435,7 +435,7 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 			TenantID(string(repo.TenantID)).
 			RepoID(string(repo.RepoID)).
 			HomeRegion(string(repoMeta.HomeRegion)).
-			FailoverEpoch(int64(repoMeta.FailoverEpoch)).
+			FailoverEpoch(epochToInt64(repoMeta.FailoverEpoch)).
 			Build()...,
 	))
 	defer span.End()
@@ -650,7 +650,7 @@ func (c *pushOverlapCoordinator) Execute(ctx context.Context, req pushOverlapReq
 					TenantID(string(req.Repo.TenantID)).
 					RepoID(string(req.Repo.RepoID)).
 					HomeRegion(string(req.Meta.HomeRegion)).
-					FailoverEpoch(int64(req.Meta.FailoverEpoch)).
+					FailoverEpoch(epochToInt64(req.Meta.FailoverEpoch)).
 					Build()...,
 			))
 			defer hookSpan.End()

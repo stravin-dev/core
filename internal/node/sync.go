@@ -295,7 +295,7 @@ func (m *Materializer) loadAuthoritativeRefsUncached(ctx context.Context, repo t
 			TenantID(string(repo.TenantID)).
 			RepoID(string(repo.RepoID)).
 			HomeRegion(string(meta.HomeRegion)).
-			FailoverEpoch(int64(meta.FailoverEpoch)).
+			FailoverEpoch(epochToInt64(meta.FailoverEpoch)).
 			Build()...,
 	))
 	refs, err := m.meta.ListRefs(refCtx, repo, meta.RefShards)
