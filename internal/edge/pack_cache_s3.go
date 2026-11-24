@@ -30,6 +30,7 @@ type S3PackCacheConfig struct {
 	MaxEntryBytes int
 	TTL           time.Duration
 	Now           func() time.Time
+	Metrics       *Metrics
 }
 
 // S3PackCache stores large full-clone pack responses in S3 (Floci locally)
@@ -41,6 +42,7 @@ type S3PackCache struct {
 	maxEntryBytes int
 	ttl           time.Duration
 	now           func() time.Time
+	metrics       *Metrics
 }
 
 var _ PackResponseCache = (*S3PackCache)(nil)
@@ -77,6 +79,7 @@ func NewS3PackCache(cfg S3PackCacheConfig) (*S3PackCache, error) {
 		maxEntryBytes: maxEntry,
 		ttl:           ttl,
 		now:           nowFn,
+		metrics:       cfg.Metrics,
 	}, nil
 }
 
@@ -94,6 +97,10 @@ func (c *S3PackCache) Get(ctx context.Context, key string) ([]byte, bool, error)
 	if c == nil {
 		return nil, false, nil
 	}
+	start := time.Now()
+	defer func() {
+		c.metrics.RecordPackCacheOpDuration(ctx, "s3", "get", time.Since(start))
+	}()
 	objKey := c.objectKey(key)
 	out, err := c.client.GetObject(ctx, &awss3.GetObjectInput{
 		Bucket: aws.String(c.bucket),
@@ -101,23 +108,30 @@ func (c *S3PackCache) Get(ctx context.Context, key string) ([]byte, bool, error)
 	})
 	if err != nil {
 		if isS3NotFound(err) {
+			c.metrics.RecordPackCacheLookup(ctx, "s3", "miss")
 			return nil, false, nil
 		}
+		c.metrics.RecordPackCacheLookup(ctx, "s3", "error")
 		return nil, false, fmt.Errorf("edge: s3 pack cache get %s: %w", objKey, err)
 	}
 	defer func() { _ = out.Body.Close() }()
 
 	if c.ttl > 0 && out.LastModified != nil && c.now().Sub(*out.LastModified) > c.ttl {
+		c.metrics.RecordPackCacheLookup(ctx, "s3", "miss")
 		return nil, false, nil
 	}
 
 	data, err := io.ReadAll(io.LimitReader(out.Body, int64(c.maxEntryBytes)+1))
 	if err != nil {
+		c.metrics.RecordPackCacheLookup(ctx, "s3", "error")
 		return nil, false, fmt.Errorf("edge: s3 pack cache read %s: %w", objKey, err)
 	}
 	if len(data) == 0 || len(data) > c.maxEntryBytes {
+		c.metrics.RecordPackCacheLookup(ctx, "s3", "miss")
 		return nil, false, nil
 	}
+	c.metrics.RecordPackCacheLookup(ctx, "s3", "hit")
+	c.metrics.RecordPackCacheBytes(ctx, "s3", "hit_served", int64(len(data)))
 	return data, true, nil
 }
 
@@ -127,8 +141,13 @@ func (c *S3PackCache) Set(ctx context.Context, key string, data []byte, _ time.D
 		return nil
 	}
 	if len(data) > c.maxEntryBytes {
+		c.metrics.RecordPackCacheWrite(ctx, "s3", "too_large")
 		return ErrPackCacheEntryTooLarge
 	}
+	start := time.Now()
+	defer func() {
+		c.metrics.RecordPackCacheOpDuration(ctx, "s3", "set", time.Since(start))
+	}()
 	objKey := c.objectKey(key)
 	_, err := c.client.PutObject(ctx, &awss3.PutObjectInput{
 		Bucket:        aws.String(c.bucket),
@@ -138,8 +157,11 @@ func (c *S3PackCache) Set(ctx context.Context, key string, data []byte, _ time.D
 		ContentType:   aws.String("application/octet-stream"),
 	})
 	if err != nil {
+		c.metrics.RecordPackCacheWrite(ctx, "s3", "error")
 		return fmt.Errorf("edge: s3 pack cache put %s: %w", objKey, err)
 	}
+	c.metrics.RecordPackCacheWrite(ctx, "s3", "ok")
+	c.metrics.RecordPackCacheBytes(ctx, "s3", "written", int64(len(data)))
 	return nil
 }
 

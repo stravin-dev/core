@@ -49,6 +49,7 @@ type Resolver struct {
 	leaseVerifier lease.Verifier
 	ttl           time.Duration
 	clock         lease.Clock
+	metrics       *Metrics
 
 	mu    sync.RWMutex
 	cache map[tenant.RepoKey]cachedMeta
@@ -81,6 +82,13 @@ func NewResolver(localRegion lease.Region, metaStore MetaStore, leaseVerifier le
 	}, nil
 }
 
+// SetMetrics attaches edge metrics for recording META cache hit/miss outcomes.
+func (r *Resolver) SetMetrics(m *Metrics) {
+	r.mu.Lock()
+	r.metrics = m
+	r.mu.Unlock()
+}
+
 // LocalRegion returns the edge instance's configured region.
 func (r *Resolver) LocalRegion() lease.Region {
 	return r.localRegion
@@ -95,10 +103,13 @@ func (r *Resolver) ResolveRead(ctx context.Context, repo tenant.RepoKey) (ddb.Re
 	now := r.clock.Now()
 	r.mu.RLock()
 	entry, ok := r.cache[repo]
+	metrics := r.metrics
 	r.mu.RUnlock()
 	if ok && now.Before(entry.expiresAt) {
+		metrics.RecordMetaCacheLookup(ctx, true)
 		return entry.meta, nil
 	}
+	metrics.RecordMetaCacheLookup(ctx, false)
 
 	meta, err := r.metaStore.GetMeta(ctx, repo)
 	if err != nil {

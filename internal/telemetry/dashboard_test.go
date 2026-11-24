@@ -261,6 +261,7 @@ func assertCoreDashboardRowsAndGrid(t *testing.T, dash grafanaDashboard) {
 		"Node & Cache Layer",
 		"Compaction & GC Layer",
 		"Control Plane & Recovery Layer",
+		"Async Webhooks Layer",
 	}
 	wantAllRows := append([]string{"Overview"}, append(append([]string{}, wantMetricRows...), "Logs & Trace Correlation")...)
 
@@ -343,6 +344,8 @@ func assertCoreDashboardRowsAndGrid(t *testing.T, dash grafanaDashboard) {
 		joined := strings.Join(nodeExprs, "\n")
 		for _, tok := range []string{
 			"stravin_node_aux_index_refresh_failures_total",
+			"stravin_node_upload_pack_queue_wait_seconds_bucket",
+			"stravin_node_upload_pack_queue_timeouts_total",
 			"stravin_cache_active_packs",
 			"stravin_cache_pending_prune_packs",
 			"stravin_cache_repo_active_packs_max",
@@ -488,6 +491,14 @@ func TestGrafanaDashboards_StravinCoreAndLoadTester(t *testing.T) {
 		// Edge Layer (stravin-edge)
 		"stravin_edge_requests_total",
 		"stravin_edge_request_duration_seconds_bucket",
+		"stravin_edge_pack_cache_lookups_total",
+		"stravin_edge_pack_cache_writes_total",
+		"stravin_edge_pack_cache_op_duration_seconds_bucket",
+		"stravin_edge_pack_cache_bytes_total",
+		"stravin_edge_valkey_pool_dials_total",
+		"stravin_edge_meta_cache_lookups_total",
+		"stravin_edge_active_clones",
+		"stravin_edge_info_refs_retries_total",
 		// Node & Cache Layer (stravin-node)
 		"stravin_node_requests_total",
 		"stravin_node_request_duration_seconds_bucket",
@@ -496,6 +507,8 @@ func TestGrafanaDashboards_StravinCoreAndLoadTester(t *testing.T) {
 		"stravin_node_cache_bytes_used",
 		"stravin_node_s3_pack_fetches_total",
 		"stravin_node_aux_index_refresh_failures_total",
+		"stravin_node_upload_pack_queue_wait_seconds_bucket",
+		"stravin_node_upload_pack_queue_timeouts_total",
 		"stravin_cache_active_packs",
 		"stravin_cache_pending_prune_packs",
 		"stravin_cache_repo_active_packs_max",
@@ -520,6 +533,10 @@ func TestGrafanaDashboards_StravinCoreAndLoadTester(t *testing.T) {
 		"stravin_ctrl_scrub_duration_seconds_bucket",
 		"stravin_ctrl_recovery_runs_total",
 		"stravin_ctrl_recovery_refs_published_total",
+		// Async Webhooks Layer (stravin-hook)
+		"stravin_hook_deliveries_total",
+		"stravin_hook_delivery_duration_seconds_bucket",
+		"stravin_hook_stream_records_total",
 	}, `{service_name=~"stravin-.*"}`)
 	assertCoreDashboardRowsAndGrid(t, coreDash)
 

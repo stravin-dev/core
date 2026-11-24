@@ -294,8 +294,10 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				stdin = bytes.NewReader(reqBytes)
 			case completeEOF:
+				h.metrics.RecordPackCacheLookup(ctx, "singleflight", "bypass")
 				stdin = bytes.NewReader(reqBytes)
 			default:
+				h.metrics.RecordPackCacheLookup(ctx, "singleflight", "bypass")
 				stdin = io.MultiReader(bytes.NewReader(reqBytes), stdin)
 			}
 		}
@@ -309,6 +311,7 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			timer.Stop()
 		case <-timer.C:
 			exitCode, err = h.proxy.ProxyStream(proxyCtx, peer, rpcMeta, stdin, stdout, nil)
+			h.metrics.RecordInfoRefsRetry(ctx, err == nil && exitCode == 0)
 		}
 	}
 	if err != nil {

@@ -106,11 +106,17 @@ func run() error {
 	}
 	dlqSink := async.NewMultiDLQSink(async.NewLoggingDLQSink(logger), ddbDLQ)
 
+	hookMetrics, err := async.NewMetrics(telProvider)
+	if err != nil {
+		return fmt.Errorf("init hook metrics: %w", err)
+	}
+
 	dispatcher, err := async.NewWebhookDispatcher(async.DispatcherConfig{
 		Webhooks:             ddbRepo,
 		Cipher:               cipher,
 		DLQ:                  dlqSink,
 		Telemetry:            telProvider,
+		Metrics:              hookMetrics,
 		Logger:               logger,
 		RequestTimeout:       requestTimeout,
 		MaxAttempts:          maxAttempts,
@@ -128,6 +134,8 @@ func run() error {
 		Streams:      streamsClient,
 		Checkpoints:  ddbRepo,
 		Observers:    []async.EventObserver{dispatcher},
+		Telemetry:    telProvider,
+		Metrics:      hookMetrics,
 		Logger:       logger,
 	})
 	if err != nil {

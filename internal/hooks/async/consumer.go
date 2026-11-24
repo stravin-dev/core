@@ -15,6 +15,7 @@ import (
 	streamtypes "github.com/aws/aws-sdk-go-v2/service/dynamodbstreams/types"
 
 	"stravin.dev/core/internal/storage/ddb"
+	"stravin.dev/core/internal/telemetry"
 )
 
 const (
@@ -54,6 +55,8 @@ type ConsumerConfig struct {
 	Streams      StreamsAPI
 	Checkpoints  ddb.CheckpointRepository
 	Observers    []EventObserver
+	Telemetry    *telemetry.Provider
+	Metrics      *Metrics
 	Logger       *slog.Logger
 }
 
@@ -68,6 +71,7 @@ type Consumer struct {
 	streams      StreamsAPI
 	checkpoints  ddb.CheckpointRepository
 	observers    []EventObserver
+	metrics      *Metrics
 	logger       *slog.Logger
 
 	mu           sync.Mutex
@@ -110,6 +114,15 @@ func NewConsumer(cfg ConsumerConfig) (*Consumer, error) {
 		}
 	}
 
+	metrics := cfg.Metrics
+	if metrics == nil {
+		var err error
+		metrics, err = NewMetrics(cfg.Telemetry)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &Consumer{
 		tableName:    cfg.TableName,
 		consumerID:   cfg.ConsumerID,
@@ -119,6 +132,7 @@ func NewConsumer(cfg ConsumerConfig) (*Consumer, error) {
 		streams:      cfg.Streams,
 		checkpoints:  cfg.Checkpoints,
 		observers:    observers,
+		metrics:      metrics,
 		logger:       cfg.Logger,
 		iterators:    make(map[string]string),
 		closedShards: make(map[string]bool),
@@ -294,6 +308,7 @@ func (c *Consumer) pollShard(ctx context.Context, streamARN, shardID string) err
 		}
 		ev, ok, parseErr := ParseRefHistoryRecord(rec)
 		if parseErr != nil {
+			c.metrics.RecordStreamRecord(ctx, "error")
 			c.logger.WarnContext(ctx, "skipping malformed Ref History stream record",
 				"shard_id", shardID,
 				"sequence_number", lastSeq,
@@ -306,9 +321,11 @@ func (c *Consumer) pollShard(ctx context.Context, streamARN, shardID string) err
 		}
 		for _, obs := range c.observers {
 			if err := obs.OnEvent(ctx, ev); err != nil {
+				c.metrics.RecordStreamRecord(ctx, "error")
 				return fmt.Errorf("async: observer dispatch seq=%s: %w", ev.SequenceNumber, err)
 			}
 		}
+		c.metrics.RecordStreamRecord(ctx, "ok")
 	}
 
 	if lastSeq != "" && hasNonCheckpoint {

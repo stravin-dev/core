@@ -30,6 +30,7 @@ type ValkeyPackCacheConfig struct {
 	ReadTimeout   time.Duration
 	WriteTimeout  time.Duration
 	PoolSize      int
+	Metrics       *Metrics
 }
 
 // ValkeyPackCache implements PackResponseCache over Valkey's RESP2 protocol
@@ -41,6 +42,7 @@ type ValkeyPackCache struct {
 	dialTimeout   time.Duration
 	readTimeout   time.Duration
 	writeTimeout  time.Duration
+	metrics       *Metrics
 
 	mu     sync.Mutex
 	closed bool
@@ -86,6 +88,7 @@ func NewValkeyPackCache(cfg ValkeyPackCacheConfig) (*ValkeyPackCache, error) {
 		dialTimeout:   dialTimeout,
 		readTimeout:   readTimeout,
 		writeTimeout:  writeTimeout,
+		metrics:       cfg.Metrics,
 		pool:          make(chan net.Conn, poolSize),
 	}, nil
 }
@@ -115,22 +118,35 @@ func (c *ValkeyPackCache) Get(ctx context.Context, key string) ([]byte, bool, er
 	if c == nil {
 		return nil, false, nil
 	}
+	start := time.Now()
+	defer func() {
+		c.metrics.RecordPackCacheOpDuration(ctx, "valkey", "get", time.Since(start))
+	}()
 	fullKey := c.keyPrefix + key
 	for attempt := range 2 {
 		conn, fromPool, err := c.acquireConn(ctx)
 		if err != nil {
+			c.metrics.RecordPackCacheLookup(ctx, "valkey", "error")
 			return nil, false, err
 		}
 		data, hit, err := c.doGet(ctx, conn, fullKey)
 		if err == nil {
 			c.releaseConn(conn)
+			if hit {
+				c.metrics.RecordPackCacheLookup(ctx, "valkey", "hit")
+				c.metrics.RecordPackCacheBytes(ctx, "valkey", "hit_served", int64(len(data)))
+			} else {
+				c.metrics.RecordPackCacheLookup(ctx, "valkey", "miss")
+			}
 			return data, hit, nil
 		}
 		_ = conn.Close()
 		if !fromPool || attempt == 1 || ctx.Err() != nil {
+			c.metrics.RecordPackCacheLookup(ctx, "valkey", "error")
 			return nil, false, err
 		}
 	}
+	c.metrics.RecordPackCacheLookup(ctx, "valkey", "miss")
 	return nil, false, nil
 }
 
@@ -141,8 +157,13 @@ func (c *ValkeyPackCache) Set(ctx context.Context, key string, data []byte, ttl 
 		return nil
 	}
 	if len(data) > c.maxEntryBytes {
+		c.metrics.RecordPackCacheWrite(ctx, "valkey", "too_large")
 		return ErrPackCacheEntryTooLarge
 	}
+	start := time.Now()
+	defer func() {
+		c.metrics.RecordPackCacheOpDuration(ctx, "valkey", "set", time.Since(start))
+	}()
 	fullKey := c.keyPrefix + key
 	ttlSecs := int64(ttl / time.Second)
 	if ttl > 0 && ttlSecs < 1 {
@@ -152,15 +173,19 @@ func (c *ValkeyPackCache) Set(ctx context.Context, key string, data []byte, ttl 
 	for attempt := range 2 {
 		conn, fromPool, err := c.acquireConn(ctx)
 		if err != nil {
+			c.metrics.RecordPackCacheWrite(ctx, "valkey", "error")
 			return err
 		}
 		err = c.doSet(ctx, conn, fullKey, data, ttlSecs)
 		if err == nil {
 			c.releaseConn(conn)
+			c.metrics.RecordPackCacheWrite(ctx, "valkey", "ok")
+			c.metrics.RecordPackCacheBytes(ctx, "valkey", "written", int64(len(data)))
 			return nil
 		}
 		_ = conn.Close()
 		if !fromPool || attempt == 1 || ctx.Err() != nil {
+			c.metrics.RecordPackCacheWrite(ctx, "valkey", "error")
 			return err
 		}
 	}
@@ -172,12 +197,14 @@ func (c *ValkeyPackCache) acquireConn(ctx context.Context) (net.Conn, bool, erro
 	closed := c.closed
 	c.mu.Unlock()
 	if closed {
+		c.metrics.RecordValkeyPoolDial(ctx, "error", false)
 		return nil, false, errors.New("edge: valkey pack cache closed")
 	}
 
 	select {
 	case conn, ok := <-c.pool:
 		if ok && conn != nil {
+			c.metrics.RecordValkeyPoolDial(ctx, "ok", true)
 			return conn, true, nil
 		}
 	default:
@@ -186,8 +213,10 @@ func (c *ValkeyPackCache) acquireConn(ctx context.Context) (net.Conn, bool, erro
 	dialer := net.Dialer{Timeout: c.dialTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", c.addr)
 	if err != nil {
+		c.metrics.RecordValkeyPoolDial(ctx, "error", false)
 		return nil, false, fmt.Errorf("edge: dial valkey %s: %w", c.addr, err)
 	}
+	c.metrics.RecordValkeyPoolDial(ctx, "ok", false)
 	return conn, false, nil
 }
 

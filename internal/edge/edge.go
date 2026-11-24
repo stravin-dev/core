@@ -38,6 +38,7 @@ type ServerConfig struct {
 	Proxy                    *WireProxy
 	PackCache                *PackCacheCoordinator
 	Telemetry                *telemetry.Provider
+	Metrics                  *Metrics
 	Logger                   *slog.Logger
 }
 
@@ -65,9 +66,16 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cfg.Logger = slog.Default()
 	}
 
-	metrics, err := NewMetrics(cfg.Telemetry)
-	if err != nil {
-		return nil, err
+	metrics := cfg.Metrics
+	if metrics == nil {
+		var err error
+		metrics, err = NewMetrics(cfg.Telemetry)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if cfg.Resolver != nil {
+		cfg.Resolver.SetMetrics(metrics)
 	}
 	httpHandler, err := NewHTTPHandler(cfg.Authenticator, cfg.Limiter, cfg.Resolver, cfg.Router, cfg.Proxy, metrics, cfg.Logger)
 	if err != nil {
