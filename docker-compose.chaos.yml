@@ -8,6 +8,11 @@ services:
     environment:
       FLOCI_SERVICES: "s3,dynamodb,dynamodbstreams,kms"
       FLOCI_DEFAULT_REGION: "us-east-1"
+      FLOCI_STORAGE_MODE: "memory"
+      FLOCI_STORAGE_SERVICES_S3_MODE: "persistent"
+      FLOCI_STORAGE_PERSISTENT_PATH: "/app/data"
+    volumes:
+      - floci-data:/app/data
     healthcheck:
       test: ["CMD", "/usr/local/bin/healthcheck.sh"]
       interval: 2s
@@ -361,6 +366,7 @@ services:
       - stravin-net
 
 volumes:
+  floci-data:
   node-nvme-cache:
 
 networks:

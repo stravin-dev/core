@@ -6,6 +6,11 @@ services:
     environment:
       FLOCI_SERVICES: "s3,sqs,dynamodb,dynamodbstreams,kms"
       FLOCI_DEFAULT_REGION: "us-east-1"
+      FLOCI_STORAGE_MODE: "memory"
+      FLOCI_STORAGE_SERVICES_S3_MODE: "persistent"
+      FLOCI_STORAGE_PERSISTENT_PATH: "/app/data"
+    volumes:
+      - floci-region-a-data:/app/data
     healthcheck:
       test: ["CMD", "/usr/local/bin/healthcheck.sh"]
       interval: 2s
@@ -22,6 +27,11 @@ services:
     environment:
       FLOCI_SERVICES: "s3,sqs,dynamodb,dynamodbstreams,kms"
       FLOCI_DEFAULT_REGION: "us-west-2"
+      FLOCI_STORAGE_MODE: "memory"
+      FLOCI_STORAGE_SERVICES_S3_MODE: "persistent"
+      FLOCI_STORAGE_PERSISTENT_PATH: "/app/data"
+    volumes:
+      - floci-region-b-data:/app/data
     healthcheck:
       test: ["CMD", "/usr/local/bin/healthcheck.sh"]
       interval: 2s
@@ -460,6 +470,8 @@ services:
       - stravin-multi-region-net
 
 volumes:
+  floci-region-a-data:
+  floci-region-b-data:
   node-a-nvme-cache:
   node-b-nvme-cache:
 
