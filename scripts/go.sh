@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Transparent Go toolchain wrapper.
 # Uses host `go` when available; otherwise falls back to a pinned Docker
-# golang:1.25-bookworm container (glibc + gcc for `go test -race`) with
+# golang:1.26-bookworm container (glibc + gcc for `go test -race`) with
 # persistent GOMODCACHE and GOCACHE named volumes.
 
 if command -v go >/dev/null 2>&1 && [ "${STRAVIN_FORCE_DOCKER_GO:-0}" != "1" ]; then
@@ -15,7 +15,7 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-GO_IMAGE="${STRAVIN_GO_IMAGE:-golang:1.25-bookworm}"
+GO_IMAGE="${STRAVIN_GO_IMAGE:-golang:1.26-bookworm}"
 MOD_VOL="${STRAVIN_GO_MOD_VOLUME:-stravin-go-mod-cache}"
 BUILD_VOL="${STRAVIN_GO_BUILD_VOLUME:-stravin-go-build-cache}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
