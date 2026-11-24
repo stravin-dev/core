@@ -239,14 +239,20 @@ func assertCoreDashboardRowsAndGrid(t *testing.T, dash grafanaDashboard) {
 	assertNoGridOverlaps(t, dash.Panels, "stravin-core top-level")
 
 	hasLoadgenLink := false
+	hasValkeyLink := false
 	for _, link := range dash.Links {
 		if strings.Contains(link.URL, "stravin-loadgen") {
 			hasLoadgenLink = true
-			break
+		}
+		if strings.Contains(link.URL, "stravin-valkey") {
+			hasValkeyLink = true
 		}
 	}
 	if !hasLoadgenLink {
 		t.Error("stravin-core dashboard missing cross-link to stravin-loadgen")
+	}
+	if !hasValkeyLink {
+		t.Error("stravin-core dashboard missing cross-link to stravin-valkey")
 	}
 
 	sections := extractSections(dash.Panels)
@@ -350,7 +356,7 @@ func assertCoreDashboardRowsAndGrid(t *testing.T, dash grafanaDashboard) {
 	}
 }
 
-var counterSelectorRe = regexp.MustCompile(`stravin_[a-z0-9_]+_total(?:\{[^}]*\})?`)
+var counterSelectorRe = regexp.MustCompile(`(?:stravin|redis)_[a-z0-9_]+_total(?:\{[^}]*\})?`)
 
 func assertNoUnboundedCounters(t *testing.T, dashboard, panelTitle, expr string) {
 	t.Helper()
@@ -563,6 +569,13 @@ func TestGrafanaDashboards_StatPanelThresholds(t *testing.T) {
 				3: "Active Worker Threads",
 			},
 		},
+		{
+			filename: "stravin-valkey.json",
+			singleGreenStatPanel: map[int]string{
+				104: "Commands/sec",
+				106: "Connected Clients",
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -629,14 +642,20 @@ func assertLoadgenDashboardRowsAndPanels(t *testing.T, dash grafanaDashboard) {
 	assertNoGridOverlaps(t, dash.Panels, "stravin-loadgen top-level")
 
 	hasCoreLink := false
+	hasValkeyLink := false
 	for _, link := range dash.Links {
 		if strings.Contains(link.URL, "stravin-core") {
 			hasCoreLink = true
-			break
+		}
+		if strings.Contains(link.URL, "stravin-valkey") {
+			hasValkeyLink = true
 		}
 	}
 	if !hasCoreLink {
 		t.Error("stravin-loadgen dashboard missing cross-link to stravin-core")
+	}
+	if !hasValkeyLink {
+		t.Error("stravin-loadgen dashboard missing cross-link to stravin-valkey")
 	}
 
 	sections := extractSections(dash.Panels)
@@ -820,7 +839,226 @@ func TestOTelAndLGTMConfigs_TracesMetricsLogsPipelines(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read prometheus.yml: %v", err)
 	}
-	if !strings.Contains(string(promRaw), "service.name") {
-		t.Error("prometheus.yml must promote service.name OTLP resource attribute")
+	promCfg := string(promRaw)
+	for _, tok := range []string{
+		"service.name",
+		"job_name: valkey",
+		"valkey-exporter:9121",
+	} {
+		if !strings.Contains(promCfg, tok) {
+			t.Errorf("prometheus.yml missing required setting %q", tok)
+		}
+	}
+}
+
+func TestGrafanaDashboards_StravinValkey(t *testing.T) {
+	dash := loadDashboard(t, "stravin-valkey.json")
+
+	if dash.UID != "stravin-valkey" {
+		t.Errorf("dashboard uid = %q, want %q", dash.UID, "stravin-valkey")
+	}
+	if strings.TrimSpace(dash.Title) == "" {
+		t.Error("expected non-empty dashboard title")
+	}
+	if dash.SchemaVersion == 0 {
+		t.Error("expected non-zero schemaVersion")
+	}
+	if len(dash.Panels) == 0 {
+		t.Fatal("expected at least one panel")
+	}
+
+	assertNoGridOverlaps(t, dash.Panels, "stravin-valkey top-level")
+
+	hasCoreLink, hasLoadgenLink := false, false
+	for _, link := range dash.Links {
+		if strings.Contains(link.URL, "stravin-core") {
+			hasCoreLink = true
+		}
+		if strings.Contains(link.URL, "stravin-loadgen") {
+			hasLoadgenLink = true
+		}
+	}
+	if !hasCoreLink {
+		t.Error("stravin-valkey dashboard missing cross-link to stravin-core")
+	}
+	if !hasLoadgenLink {
+		t.Error("stravin-valkey dashboard missing cross-link to stravin-loadgen")
+	}
+
+	allPanels := flattenPanels(dash.Panels)
+	seenIDs := make(map[int]bool, len(allPanels))
+	var allExprs []string
+	for _, p := range allPanels {
+		if p.ID <= 0 {
+			t.Errorf("panel %q has invalid id %d", p.Title, p.ID)
+		}
+		if seenIDs[p.ID] {
+			t.Errorf("duplicate panel id %d (%q)", p.ID, p.Title)
+		}
+		seenIDs[p.ID] = true
+		if strings.TrimSpace(p.Title) == "" || strings.TrimSpace(p.Type) == "" {
+			t.Errorf("panel id=%d must have non-empty title and type", p.ID)
+		}
+		if p.Type == "row" {
+			continue
+		}
+		if p.Datasource.UID != "" && !allowedDatasourceUIDs[p.Datasource.UID] {
+			t.Errorf("panel %q references unknown datasource uid %q", p.Title, p.Datasource.UID)
+		}
+		for _, tgt := range p.Targets {
+			if !allowedDatasourceUIDs[tgt.Datasource.UID] {
+				t.Errorf("panel %q target %q references unknown datasource uid %q", p.Title, tgt.RefID, tgt.Datasource.UID)
+			}
+			allExprs = append(allExprs, tgt.Expr)
+		}
+	}
+
+	joinedExprs := strings.Join(allExprs, "\n")
+	for _, m := range []string{
+		"redis_up",
+		"redis_memory_used_bytes",
+		"redis_memory_max_bytes",
+		"redis_memory_used_rss_bytes",
+		"redis_mem_fragmentation_ratio",
+		"redis_evicted_keys_total",
+		"redis_expired_keys_total",
+		"redis_db_keys",
+		"redis_db_keys_expiring",
+		"redis_keyspace_hits_total",
+		"redis_keyspace_misses_total",
+		"redis_commands_processed_total",
+		"redis_commands_total",
+		"redis_commands_duration_seconds_total",
+		"redis_net_input_bytes_total",
+		"redis_net_output_bytes_total",
+		"redis_connected_clients",
+		"redis_blocked_clients",
+		"redis_rejected_connections_total",
+		"redis_cpu_sys_seconds_total",
+		"redis_cpu_user_seconds_total",
+		"redis_uptime_in_seconds",
+	} {
+		if !strings.Contains(joinedExprs, m) {
+			t.Errorf("stravin-valkey dashboard missing required metric %q", m)
+		}
+	}
+
+	sections := extractSections(dash.Panels)
+	wantDetailRows := []string{
+		"Memory & Eviction",
+		"Throughput, Hit Rate & Commands",
+		"Connections & Health",
+	}
+	wantAllRows := append([]string{"Overview"}, wantDetailRows...)
+	if len(sections) < len(wantAllRows) {
+		t.Fatalf("stravin-valkey has %d row sections, want at least %d", len(sections), len(wantAllRows))
+	}
+
+	if !strings.Contains(sections[0].row.Title, "Overview") {
+		t.Errorf("stravin-valkey first row = %q, want Overview row at top", sections[0].row.Title)
+	}
+	if sections[0].row.Collapsed {
+		t.Error("stravin-valkey Overview row must be expanded (collapsed=false)")
+	}
+	if sections[0].row.GridPos.Y != 0 {
+		t.Errorf("stravin-valkey Overview row gridPos.y = %d, want 0", sections[0].row.GridPos.Y)
+	}
+
+	foundRows := make(map[string]dashboardSection, len(sections))
+	for _, sec := range sections {
+		if sec.row.GridPos.W != 24 || sec.row.GridPos.X != 0 || sec.row.GridPos.H != 1 {
+			t.Errorf("row %q gridPos = %+v, want w=24 x=0 h=1", sec.row.Title, sec.row.GridPos)
+		}
+		if len(sec.row.Panels) > 0 {
+			assertNoGridOverlaps(t, sec.row.Panels, "row "+sec.row.Title)
+		}
+		for _, wantPrefix := range wantAllRows {
+			if strings.Contains(sec.row.Title, wantPrefix) {
+				foundRows[wantPrefix] = sec
+			}
+		}
+	}
+	for _, wantRow := range wantAllRows {
+		if _, ok := foundRows[wantRow]; !ok {
+			t.Errorf("stravin-valkey missing row section matching %q", wantRow)
+		}
+	}
+
+	if overviewSec, ok := foundRows["Overview"]; ok {
+		if len(overviewSec.panels) != 6 {
+			t.Errorf("stravin-valkey Overview row has %d panels, want 6 KPI stat panels", len(overviewSec.panels))
+		}
+		requiredRangeScoped := map[string]bool{
+			"Keyspace Hit Ratio %": false,
+			"Evicted Keys":         false,
+		}
+		thresholdedHealth := 0
+		for _, p := range overviewSec.panels {
+			if p.Type != "stat" {
+				t.Errorf("stravin-valkey Overview panel %q type = %q, want stat", p.Title, p.Type)
+			}
+			hasGreen, hasRed := false, false
+			for _, step := range p.FieldConfig.Defaults.Thresholds.Steps {
+				if step.Color == "green" {
+					hasGreen = true
+				}
+				if step.Color == "red" {
+					hasRed = true
+				}
+			}
+			if hasGreen && hasRed {
+				thresholdedHealth++
+			}
+			_, mustScope := requiredRangeScoped[p.Title]
+			if mustScope {
+				requiredRangeScoped[p.Title] = true
+			}
+			for _, tgt := range p.Targets {
+				assertNoUnboundedCounters(t, "stravin-valkey", p.Title, tgt.Expr)
+				if mustScope {
+					assertRangeScopedCounterExpr(t, "stravin-valkey", p.Title, tgt.Expr)
+				}
+			}
+		}
+		for title, found := range requiredRangeScoped {
+			if !found {
+				t.Errorf("stravin-valkey Overview row missing expected range-scoped stat panel %q", title)
+			}
+		}
+		if thresholdedHealth < 4 {
+			t.Errorf("stravin-valkey Overview row has %d panels with green/red health thresholds, want at least 4", thresholdedHealth)
+		}
+	}
+
+	validFourUpX := map[int]bool{0: true, 6: true, 12: true, 18: true}
+	for _, detailRow := range wantDetailRows {
+		sec, ok := foundRows[detailRow]
+		if !ok {
+			continue
+		}
+		if len(sec.panels) == 0 || len(sec.panels)%4 != 0 {
+			t.Errorf("row %q has %d panels, want a non-zero multiple of 4", sec.row.Title, len(sec.panels))
+		}
+		byY := make(map[int]map[int]bool)
+		for _, p := range sec.panels {
+			if p.GridPos.W != 6 {
+				t.Errorf("row %q panel %q gridPos.w = %d, want 6", sec.row.Title, p.Title, p.GridPos.W)
+			}
+			if !validFourUpX[p.GridPos.X] {
+				t.Errorf("row %q panel %q gridPos.x = %d, want one of {0, 6, 12, 18}", sec.row.Title, p.Title, p.GridPos.X)
+			}
+			if p.GridPos.H != 8 {
+				t.Errorf("row %q panel %q gridPos.h = %d, want 8", sec.row.Title, p.Title, p.GridPos.H)
+			}
+			if byY[p.GridPos.Y] == nil {
+				byY[p.GridPos.Y] = make(map[int]bool)
+			}
+			byY[p.GridPos.Y][p.GridPos.X] = true
+		}
+		for y, xs := range byY {
+			if len(xs) != 4 {
+				t.Errorf("row %q line y=%d has %d panels across, want 4", sec.row.Title, y, len(xs))
+			}
+		}
 	}
 }

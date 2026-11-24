@@ -41,6 +41,13 @@
       "title": "Stravin Load Tester",
       "type": "link",
       "url": "/d/stravin-loadgen"
+    },
+    {
+      "icon": "dashboard",
+      "targetBlank": false,
+      "title": "Stravin Valkey",
+      "type": "link",
+      "url": "/d/stravin-valkey"
     }
   ],
   "panels": [

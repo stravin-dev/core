@@ -41,6 +41,13 @@
       "title": "Stravin Core",
       "type": "link",
       "url": "/d/stravin-core"
+    },
+    {
+      "icon": "dashboard",
+      "targetBlank": false,
+      "title": "Stravin Valkey",
+      "type": "link",
+      "url": "/d/stravin-valkey"
     }
   ],
   "panels": [
