@@ -37,13 +37,9 @@ func cloneFresh(ctx context.Context, env *loadgen.ScenarioEnv, scenario, remoteU
 	}); err != nil {
 		return nil, err
 	}
-	g := env.Git.WithWorkDir(destDir)
 	name := fmt.Sprintf("Stravin %s %d", env.Persona, env.WorkerID)
 	email := fmt.Sprintf("%s-%d@loadgen.stravin.local", env.Persona, env.WorkerID)
-	if err := g.ConfigUser(ctx, name, email); err != nil {
-		return nil, err
-	}
-	return g, nil
+	return env.Git.WithWorkDir(destDir).WithAuthor(name, email), nil
 }
 
 func hasHead(ctx context.Context, g *loadgen.GitClient) bool {

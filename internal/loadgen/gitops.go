@@ -77,6 +77,37 @@ func (g *GitClient) WithWorkDir(dir string) *GitClient {
 	}
 }
 
+// WithAuthor returns a shallow copy of GitClient with git author/committer
+// environment variables set in ExtraEnv (replacing any prior values for those keys).
+func (g *GitClient) WithAuthor(name, email string) *GitClient {
+	extra := make([]string, 0, len(g.opts.ExtraEnv)+4)
+	for _, kv := range g.opts.ExtraEnv {
+		if isAuthorEnvVar(kv) {
+			continue
+		}
+		extra = append(extra, kv)
+	}
+	extra = append(extra,
+		"GIT_AUTHOR_NAME="+name,
+		"GIT_AUTHOR_EMAIL="+email,
+		"GIT_COMMITTER_NAME="+name,
+		"GIT_COMMITTER_EMAIL="+email,
+	)
+	opts := g.opts
+	opts.ExtraEnv = extra
+	return &GitClient{
+		workDir: g.workDir,
+		opts:    opts,
+	}
+}
+
+func isAuthorEnvVar(kv string) bool {
+	return strings.HasPrefix(kv, "GIT_AUTHOR_NAME=") ||
+		strings.HasPrefix(kv, "GIT_AUTHOR_EMAIL=") ||
+		strings.HasPrefix(kv, "GIT_COMMITTER_NAME=") ||
+		strings.HasPrefix(kv, "GIT_COMMITTER_EMAIL=")
+}
+
 // Run executes a git command with context cancellation and structured error capture.
 func (g *GitClient) Run(ctx context.Context, args ...string) (string, error) {
 	op := "git"
@@ -237,11 +268,72 @@ func (g *GitClient) LsRemote(ctx context.Context, repoURL string, patterns ...st
 
 // RevParse resolves rev to a trimmed commit SHA.
 func (g *GitClient) RevParse(ctx context.Context, rev string) (string, error) {
+	if rev == "HEAD" && ctx.Err() == nil {
+		if sha, ok := resolveHeadSHA(g.workDir); ok {
+			return sha, nil
+		}
+	}
 	out, err := g.Run(ctx, "rev-parse", rev)
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// resolveHeadSHA resolves HEAD directly from .git/HEAD and loose ref files
+// without spawning a git subprocess. Returns ("", false) for unborn refs,
+// packed-refs, reftables, worktree .git files, or any non-standard layout so
+// callers fall back cleanly to `git rev-parse HEAD`.
+func resolveHeadSHA(workDir string) (string, bool) {
+	if workDir == "" {
+		return "", false
+	}
+	gitDir := filepath.Clean(filepath.Join(workDir, ".git"))
+	headPath := filepath.Join(gitDir, "HEAD")
+	headBytes, err := os.ReadFile(headPath) //#nosec G304 -- workDir is a loadgen-managed local repository directory
+	if err != nil {
+		return "", false
+	}
+	head := strings.TrimSpace(string(headBytes))
+	if strings.HasPrefix(head, "ref: ") {
+		refRel := strings.TrimSpace(strings.TrimPrefix(head, "ref: "))
+		cleanRef := filepath.Clean(filepath.FromSlash(refRel))
+		if refRel == "" || filepath.IsAbs(cleanRef) || strings.HasPrefix(cleanRef, "..") {
+			return "", false
+		}
+		refPath := filepath.Clean(filepath.Join(gitDir, cleanRef))
+		if !strings.HasPrefix(refPath, gitDir+string(filepath.Separator)) {
+			return "", false
+		}
+		refBytes, refErr := os.ReadFile(refPath) //#nosec G304,G703 -- refPath is verified to stay within .git inside workDir
+		if refErr != nil {
+			return "", false
+		}
+		oid := strings.TrimSpace(string(refBytes))
+		if isValidHexOID(oid) {
+			return oid, true
+		}
+		return "", false
+	}
+	if isValidHexOID(head) {
+		return head, true
+	}
+	return "", false
+}
+
+func isValidHexOID(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isDigit := c >= '0' && c <= '9'
+		isHexLower := c >= 'a' && c <= 'f'
+		if !isDigit && !isHexLower {
+			return false
+		}
+	}
+	return true
 }
 
 // Fsck runs git fsck --full --strict in workDir.
