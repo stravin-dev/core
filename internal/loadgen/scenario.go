@@ -47,16 +47,18 @@ func scenarioRequiresSSH(s Scenario) bool {
 // Each worker owns its own isolated BaseCloneCache under its private WorkDir;
 // base clones and .git directories are never shared across workers.
 type BaseCloneCache struct {
-	mu      sync.Mutex
-	rootDir string
-	clones  map[string]string
+	mu           sync.Mutex
+	rootDir      string
+	clones       map[string]string
+	gcThresholds GCThresholds
 }
 
 // NewBaseCloneCache creates a BaseCloneCache rooted at rootDir.
 func NewBaseCloneCache(rootDir string) *BaseCloneCache {
 	return &BaseCloneCache{
-		rootDir: filepath.Clean(rootDir),
-		clones:  make(map[string]string),
+		rootDir:      filepath.Clean(rootDir),
+		clones:       make(map[string]string),
+		gcThresholds: DefaultGCThresholds(),
 	}
 }
 

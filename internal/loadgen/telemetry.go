@@ -48,6 +48,7 @@ type Telemetry struct {
 	unexpectedErrors metric.Int64Counter
 	fsckFailures     metric.Int64Counter
 	activeThreads    metric.Int64UpDownCounter
+	gcRuns           metric.Int64Counter
 
 	forceFlushFns []func(context.Context) error
 	shutdownFns   []func(context.Context) error
@@ -307,6 +308,13 @@ func buildTelemetry(
 	if err != nil {
 		return nil, err
 	}
+	gcRuns, err := meter.Int64Counter(
+		"stravin_loadgen_gc_runs_total",
+		metric.WithDescription("Total on-demand synchronous git gc runs on idle worker base clones"),
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	jsonHandler := &traceCorrelatedHandler{
 		inner: slog.NewJSONHandler(logWriter, &slog.HandlerOptions{Level: slog.LevelInfo}),
@@ -329,6 +337,7 @@ func buildTelemetry(
 		unexpectedErrors: unexpectedErrors,
 		fsckFailures:     fsckFailures,
 		activeThreads:    activeThreads,
+		gcRuns:           gcRuns,
 		forceFlushFns:    forceFlushFns,
 		shutdownFns:      shutdownFns,
 	}, nil
@@ -378,6 +387,18 @@ func (t *Telemetry) RecordFsckFailure(ctx context.Context, scenario string) {
 func (t *Telemetry) AddActiveThreads(ctx context.Context, persona Persona, delta int64) {
 	t.activeThreads.Add(ctx, delta, metric.WithAttributes(
 		attribute.String("persona", string(persona)),
+	))
+}
+
+// RecordGC increments stravin_loadgen_gc_runs_total for an on-demand base-clone GC run.
+func (t *Telemetry) RecordGC(ctx context.Context, persona Persona, trigger GCTrigger, outcome string) {
+	if t == nil || t.gcRuns == nil {
+		return
+	}
+	t.gcRuns.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("persona", string(persona)),
+		attribute.String("trigger", string(trigger)),
+		attribute.String("outcome", outcome),
 	))
 }
 
