@@ -6,6 +6,7 @@ package ctrl
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -217,4 +218,13 @@ func (m *Metrics) recordRecoveryRefPublished(ctx context.Context, region lease.R
 	m.recoveryRefsPublished.Add(ctx, 1, metric.WithAttributes(
 		telemetry.AttrRegion.String(string(region)),
 	))
+}
+
+// epochToInt64 converts a uint64 lease.Epoch to int64 for OpenTelemetry span
+// attributes, saturating at math.MaxInt64 to prevent signed integer overflow.
+func epochToInt64(epoch lease.Epoch) int64 {
+	if epoch > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(epoch)
 }

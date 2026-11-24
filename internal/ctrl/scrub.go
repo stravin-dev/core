@@ -206,7 +206,7 @@ func (c *scrubRepoCommand) Execute(ctx context.Context) (ScrubReport, error) {
 			TenantID(string(req.Repo.TenantID)).
 			RepoID(string(req.Repo.RepoID)).
 			HomeRegion(string(meta.HomeRegion)).
-			FailoverEpoch(int64(meta.FailoverEpoch)).
+			FailoverEpoch(epochToInt64(meta.FailoverEpoch)).
 			Build()...,
 	))
 	defer span.End()

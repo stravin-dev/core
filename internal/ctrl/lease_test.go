@@ -3,6 +3,7 @@ package ctrl
 import (
 	"context"
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -303,4 +304,59 @@ func TestLeaseManager_RunCancelsCleanly(t *testing.T) {
 	if !mgr.Status().Initialized {
 		t.Fatalf("expected lease to be initialized by Run loop")
 	}
+}
+
+func TestLeaseManager_OverflowEpochClampedInSpan(t *testing.T) {
+	clk := &fakeClock{now: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)}
+	store := newMemLeaseStore(clk)
+	rk, err := tenant.NewRepoKey("acme", "overflow")
+	if err != nil {
+		t.Fatalf("NewRepoKey: %v", err)
+	}
+	store.metas[rk.String()] = ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+	}
+
+	tel, err := telemetry.NewInMemoryProvider("stravin-ctrl")
+	if err != nil {
+		t.Fatalf("NewInMemoryProvider: %v", err)
+	}
+	defer func() { _ = tel.Shutdown(context.Background()) }()
+
+	metrics, err := NewMetrics(tel)
+	if err != nil {
+		t.Fatalf("NewMetrics: %v", err)
+	}
+
+	mgr, err := NewLeaseManager(LeaseManagerConfig{
+		Leases:   store,
+		Meta:     store,
+		Region:   "us-east-1",
+		HolderID: "ctrl-1",
+		Clock:    clk,
+		Metrics:  metrics,
+	})
+	if err != nil {
+		t.Fatalf("NewLeaseManager: %v", err)
+	}
+
+	overflowEpoch := lease.Epoch(math.MaxInt64) + 1
+	if _, err := mgr.FenceRegion(context.Background(), FenceRequest{
+		TargetMode: lease.ModeDraining,
+		MinEpoch:   overflowEpoch,
+	}); err != nil {
+		t.Fatalf("FenceRegion: %v", err)
+	}
+	assertSpanFailoverEpoch(t, tel.SpanExporter.GetSpans(), "ctrl.failover.transition", math.MaxInt64)
+
+	tel.SpanExporter.Reset()
+	if _, err := mgr.UpdateRepoEpoch(context.Background(), rk, lease.Epoch(math.MaxUint64), lease.ModeDraining); err != nil {
+		t.Fatalf("UpdateRepoEpoch: %v", err)
+	}
+	assertSpanFailoverEpoch(t, tel.SpanExporter.GetSpans(), "ctrl.failover.transition", math.MaxInt64)
 }
