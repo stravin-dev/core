@@ -1,3 +1,11 @@
+## [1.9.7](https://github.com/stravin-dev/core/compare/v1.9.6...v1.9.7) (2026-11-24)
+
+
+### Performance Improvements
+
+* **loadgen:** reuse per-worker base clone with detached worktrees per scenario ([2707909](https://github.com/stravin-dev/core/commit/27079090a5d7273b19ea38b79990643703297178)), closes [#161](https://github.com/stravin-dev/core/issues/161)
+* **loadgen:** reuse per-worker base clone with detached worktrees per scenario ([#163](https://github.com/stravin-dev/core/issues/163)) ([a74302e](https://github.com/stravin-dev/core/commit/a74302e652047fc0d85aa2d0c69e1c0a5b2b6400))
+
 ## [1.9.6](https://github.com/stravin-dev/core/compare/v1.9.5...v1.9.6) (2026-11-24)
 
 
