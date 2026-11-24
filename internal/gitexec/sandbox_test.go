@@ -141,8 +141,8 @@ func TestDefaultPackConfig(t *testing.T) {
 	if cfg.Compression != 1 {
 		t.Errorf("Compression = %d, want 1", cfg.Compression)
 	}
-	if cfg.AllowReuse != "multi" {
-		t.Errorf("AllowReuse = %q, want multi", cfg.AllowReuse)
+	if cfg.AllowReuse != "single" {
+		t.Errorf("AllowReuse = %q, want single", cfg.AllowReuse)
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("DefaultPackConfig().Validate() = %v, want nil", err)
@@ -174,7 +174,7 @@ func TestParsePackConfigFromEnv(t *testing.T) {
 		t.Setenv("STRAVIN_GIT_PACK_THREADS", "4")
 		t.Setenv("STRAVIN_GIT_PACK_WINDOW_MEMORY", "512M")
 		t.Setenv("STRAVIN_GIT_PACK_COMPRESSION", "0")
-		t.Setenv("STRAVIN_GIT_PACK_ALLOW_REUSE", "SINGLE")
+		t.Setenv("STRAVIN_GIT_PACK_ALLOW_REUSE", "MULTI")
 
 		got, err := ParsePackConfigFromEnv()
 		if err != nil {
@@ -184,7 +184,7 @@ func TestParsePackConfigFromEnv(t *testing.T) {
 			Threads:      4,
 			WindowMemory: "512M",
 			Compression:  0,
-			AllowReuse:   "single",
+			AllowReuse:   "multi",
 		}
 		if got != want {
 			t.Errorf("got %+v, want %+v", got, want)

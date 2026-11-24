@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -243,7 +245,7 @@ func TestExecUploadPackInjectsPackTuningFlagsBeforeSubcommand(t *testing.T) {
 				"pack.threads=1",
 				"pack.windowMemory=256m",
 				"pack.compression=1",
-				"pack.allowPackReuse=multi",
+				"pack.allowPackReuse=single",
 			},
 		},
 		{
@@ -252,13 +254,13 @@ func TestExecUploadPackInjectsPackTuningFlagsBeforeSubcommand(t *testing.T) {
 				Threads:      3,
 				WindowMemory: "128m",
 				Compression:  0,
-				AllowReuse:   "single",
+				AllowReuse:   "multi",
 			},
 			wantFlags: []string{
 				"pack.threads=3",
 				"pack.windowMemory=128m",
 				"pack.compression=0",
-				"pack.allowPackReuse=single",
+				"pack.allowPackReuse=multi",
 			},
 		},
 	}
@@ -353,6 +355,121 @@ func TestExecUploadPackWithPackTuningRealGit(t *testing.T) {
 		if !bytes.Contains(stdout.Bytes(), []byte("PACK")) {
 			t.Errorf("ExecUploadPack(%+v): expected PACK in output, got %d bytes", packCfg, stdout.Len())
 		}
+	}
+}
+
+func TestExecUploadPackCloneMultiPackMIDXBitmapDefaultConfigRealGit(t *testing.T) {
+	requireGit(t)
+
+	workDir := filepath.Join(t.TempDir(), "work")
+	bareDir := filepath.Join(t.TempDir(), "repo.git")
+	cloneDir := filepath.Join(t.TempDir(), "clone.git")
+
+	runGit := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = []string{
+			"PATH=" + os.Getenv("PATH"),
+			"HOME=/nonexistent",
+			"GIT_CONFIG_NOSYSTEM=1",
+			"GIT_CONFIG_GLOBAL=/dev/null",
+			"GIT_AUTHOR_NAME=Stravin Test",
+			"GIT_AUTHOR_EMAIL=test@stravin.dev",
+			"GIT_COMMITTER_NAME=Stravin Test",
+			"GIT_COMMITTER_EMAIL=test@stravin.dev",
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v in %s failed: %v\n%s", args, dir, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir workDir: %v", err)
+	}
+	runGit(workDir, "init", "-b", "main")
+	runGit(filepath.Dir(bareDir), "init", "--bare", "-b", "main", bareDir)
+	runGit(workDir, "remote", "add", "origin", bareDir)
+
+	var tipSHA string
+	for i := 1; i <= 3; i++ {
+		name := "file-" + strconv.Itoa(i) + ".txt"
+		content := strings.Repeat("stravin multi-pack bitmap line "+strconv.Itoa(i)+"\n", 32)
+		if err := os.WriteFile(filepath.Join(workDir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		runGit(workDir, "add", name)
+		runGit(workDir, "commit", "-m", "commit "+strconv.Itoa(i))
+		tipSHA = runGit(workDir, "rev-parse", "HEAD")
+		// Push with transfer.unpackLimit=1 so each push lands as a separate packfile.
+		runGit(workDir, "push", "--receive-pack=git -c transfer.unpackLimit=1 receive-pack", "origin", "main")
+	}
+
+	packDir := filepath.Join(bareDir, "objects", "pack")
+	packs, err := filepath.Glob(filepath.Join(packDir, "pack-*.pack"))
+	if err != nil || len(packs) < 2 {
+		t.Fatalf("expected >= 2 packfiles for multi-pack MIDX+bitmap test, got %v (err=%v)", packs, err)
+	}
+
+	execImpl := NewSubprocessExecutor(Config{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	if err := execImpl.ExecRepack(context.Background(), RepackRequest{
+		RepoDir:     bareDir,
+		WriteMIDX:   true,
+		WriteBitmap: true,
+	}); err != nil {
+		t.Fatalf("ExecRepack WriteMIDX+WriteBitmap: %v", err)
+	}
+
+	bitmaps, err := filepath.Glob(filepath.Join(packDir, "multi-pack-index-*.bitmap"))
+	if err != nil || len(bitmaps) == 0 {
+		t.Fatalf("expected multi-pack-index .bitmap, got %v (err=%v)", bitmaps, err)
+	}
+	runGit(bareDir, "--git-dir", bareDir, "multi-pack-index", "verify")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var gitProtocol string
+		if r.Header.Get("Git-Protocol") == "version=2" {
+			gitProtocol = "version=2"
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repo.git/info/refs" && r.URL.Query().Get("service") == "git-upload-pack":
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+			_, _ = io.WriteString(w, "001e# service=git-upload-pack\n0000")
+			if err := execImpl.ExecUploadPack(r.Context(), UploadPackRequest{
+				RepoDir:       bareDir,
+				AdvertiseRefs: true,
+				StatelessRPC:  true,
+				GitProtocol:   gitProtocol,
+				Stdout:        w,
+			}); err != nil {
+				t.Errorf("ExecUploadPack advertise-refs: %v", err)
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/repo.git/git-upload-pack":
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+			if err := execImpl.ExecUploadPack(r.Context(), UploadPackRequest{
+				RepoDir:      bareDir,
+				StatelessRPC: true,
+				GitProtocol:  gitProtocol,
+				Stdin:        r.Body,
+				Stdout:       w,
+			}); err != nil {
+				t.Errorf("ExecUploadPack upload-pack: %v", err)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	runGit(filepath.Dir(cloneDir), "clone", "--bare", srv.URL+"/repo.git", cloneDir)
+	runGit(cloneDir, "--git-dir", cloneDir, "fsck", "--full", "--strict")
+	if gotTip := runGit(cloneDir, "--git-dir", cloneDir, "rev-parse", "refs/heads/main"); gotTip != tipSHA {
+		t.Fatalf("cloned refs/heads/main = %s, want %s", gotTip, tipSHA)
 	}
 }
 

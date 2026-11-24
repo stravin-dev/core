@@ -32,8 +32,9 @@ const (
 	DefaultPackWindowMemory = "256m"
 	// DefaultPackCompression sets fast zlib compression level (0..9) for on-the-fly packs.
 	DefaultPackCompression = 1
-	// DefaultPackAllowReuse enables multi-pack bitmap reuse during upload-pack.
-	DefaultPackAllowReuse = "multi"
+	// DefaultPackAllowReuse enables single-pack bitmap reuse during upload-pack
+	// (avoiding Git 2.47.3 pack.allowPackReuse=multi missing-object drops with MIDX bitmaps).
+	DefaultPackAllowReuse = "single"
 )
 
 var gitByteSizePattern = regexp.MustCompile(`^[1-9][0-9]*[kmgKMG]?$`)

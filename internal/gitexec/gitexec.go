@@ -726,7 +726,7 @@ func (e *SubprocessExecutor) buildCmd(
 	stderr io.Writer,
 	sysProcAttr *syscall.SysProcAttr,
 ) *exec.Cmd {
-	// #nosec G204 -- gitBinary is configured by the service; args are built with mandatory -c lockdown flags
+	// #nosec G204,G702 -- gitBinary is configured by the service; args are built with mandatory -c lockdown flags and validated inputs
 	cmd := exec.CommandContext(ctx, e.gitBinary, args...)
 	cmd.Dir = workDir
 	cmd.Env = env
