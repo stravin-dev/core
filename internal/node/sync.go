@@ -38,6 +38,13 @@ type MetadataStore interface {
 	QueryManifestShard(ctx context.Context, repo tenant.RepoKey, shard int, afterULID string, activeOnly bool) ([]ddb.PackManifest, error)
 }
 
+// RefGetter is an optional narrow DynamoDB single-ref read seam used by
+// receive-pack update/delete pushes to avoid full ListRefs scans.
+// *ddb.Repository satisfies this interface directly.
+type RefGetter interface {
+	GetRef(ctx context.Context, repo tenant.RepoKey, refName string, refShards int) (ddb.RefState, error)
+}
+
 // PackFetcher is the narrow S3 read seam used by Materializer.
 // *s3.Store satisfies this interface directly.
 type PackFetcher interface {
@@ -110,6 +117,7 @@ type Materializer struct {
 	maxConcurrency         int
 	pruneReconcileInterval time.Duration
 	auxRefreshInterval     time.Duration
+	refFlights             *refLoadFlightGroup
 
 	reconcileMu   sync.Mutex
 	lastReconcile map[tenant.RepoKey]time.Time
@@ -183,6 +191,7 @@ func NewMaterializer(cfg MaterializerConfig) (*Materializer, error) {
 		maxConcurrency:         maxConc,
 		pruneReconcileInterval: reconcileInterval,
 		auxRefreshInterval:     auxInterval,
+		refFlights:             newRefLoadFlightGroup(),
 		lastReconcile:          make(map[tenant.RepoKey]time.Time),
 		lastSync:               make(map[tenant.RepoKey]repoSyncSnapshot),
 		refState:               make(map[tenant.RepoKey]reftableSyncState),
@@ -243,8 +252,18 @@ func (m *Materializer) LoadRepoMeta(ctx context.Context, repo tenant.RepoKey) (d
 }
 
 // LoadAuthoritativeRefs reads META and all ref shards (RS#{s}) strictly from
-// DynamoDB without touching local disk or S3.
+// DynamoDB without touching local disk or S3. Concurrent callers for the same
+// repository coalesce via linearizable generation-batched singleflight.
 func (m *Materializer) LoadAuthoritativeRefs(ctx context.Context, repo tenant.RepoKey) (ddb.RepoMeta, []ddb.RefState, error) {
+	if err := repo.Validate(); err != nil {
+		return ddb.RepoMeta{}, nil, err
+	}
+	return m.refFlights.Do(ctx, repo, func(flightCtx context.Context) (ddb.RepoMeta, []ddb.RefState, error) {
+		return m.loadAuthoritativeRefsUncached(flightCtx, repo)
+	})
+}
+
+func (m *Materializer) loadAuthoritativeRefsUncached(ctx context.Context, repo tenant.RepoKey) (ddb.RepoMeta, []ddb.RefState, error) {
 	meta, err := m.LoadRepoMeta(ctx, repo)
 	if err != nil {
 		return ddb.RepoMeta{}, nil, err
@@ -270,32 +289,93 @@ func (m *Materializer) LoadAuthoritativeRefs(ctx context.Context, repo tenant.Re
 	return meta, refs, nil
 }
 
-// SyncPacksAndPin synchronizes active manifest packs from DynamoDB/S3 into the
-// warm NVMe cache and returns a pinned RepoHandle without querying ref shards
-// or materializing local reftable refs. Callers MUST invoke Handle.Release().
-func (m *Materializer) SyncPacksAndPin(ctx context.Context, repo tenant.RepoKey, repoMeta ddb.RepoMeta) (*cache.RepoHandle, error) {
-	if err := repo.Validate(); err != nil {
-		return nil, err
+// LoadAuthoritativeRefsForCommands loads META and the authoritative ref state
+// needed to validate cmds. When no command creates a new ref and the metadata
+// store implements RefGetter, it fetches only the specific refs in cmds via
+// GetRef (avoiding a full ListRefs scan). The returned bool reports whether
+// the full repository ref set was loaded (for ref/directory collision checks).
+func (m *Materializer) LoadAuthoritativeRefsForCommands(
+	ctx context.Context,
+	repo tenant.RepoKey,
+	cmds []ddb.RefUpdate,
+) (ddb.RepoMeta, []ddb.RefState, bool, error) {
+	anyCreate := false
+	for _, c := range cmds {
+		if c.IsCreate() {
+			anyCreate = true
+			break
+		}
 	}
 
-	handle, err := m.cache.Materialize(ctx, repo, func(syncCtx context.Context, repoPath string) error {
-		fetched, _, pruned, syncErr := m.syncManifestPacks(syncCtx, repo, repoMeta)
-		if syncErr != nil {
-			return syncErr
-		}
-		if fetched > 0 || pruned > 0 {
-			m.scheduleAuxIndexRefresh(repo, repoPath, true, m.hasMaterializedRefs(repo))
-		}
-		return nil
-	})
+	getter, hasGetRef := m.meta.(RefGetter)
+	if anyCreate || !hasGetRef {
+		meta, refs, err := m.LoadAuthoritativeRefs(ctx, repo)
+		return meta, refs, true, err
+	}
+
+	meta, err := m.LoadRepoMeta(ctx, repo)
 	if err != nil {
-		return nil, err
+		return ddb.RepoMeta{}, nil, false, err
+	}
+	if len(cmds) == 0 {
+		return meta, nil, false, nil
 	}
 
-	if m.metrics != nil {
-		m.metrics.RecordCacheBytes(ctx, m.cache.Stats().TotalBytes)
+	if len(cmds) == 1 {
+		rs, getErr := getter.GetRef(ctx, repo, cmds[0].RefName, meta.RefShards)
+		if getErr != nil {
+			if errors.Is(getErr, ddb.ErrNotFound) {
+				return meta, nil, false, nil
+			}
+			return ddb.RepoMeta{}, nil, false, fmt.Errorf("node: get ref %s for %s: %w", cmds[0].RefName, repo, getErr)
+		}
+		return meta, []ddb.RefState{rs}, false, nil
 	}
-	return handle, nil
+
+	qCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make([]ddb.RefState, len(cmds))
+	found := make([]bool, len(cmds))
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	for i, c := range cmds {
+		i, refName := i, c.RefName
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rs, getErr := getter.GetRef(qCtx, repo, refName, meta.RefShards)
+			if getErr != nil {
+				if errors.Is(getErr, ddb.ErrNotFound) {
+					return
+				}
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("node: get ref %s for %s: %w", refName, repo, getErr)
+				}
+				errMu.Unlock()
+				cancel()
+				return
+			}
+			results[i] = rs
+			found[i] = true
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return ddb.RepoMeta{}, nil, false, firstErr
+	}
+
+	refs := make([]ddb.RefState, 0, len(cmds))
+	for i, ok := range found {
+		if ok {
+			refs = append(refs, results[i])
+		}
+	}
+	return meta, refs, false, nil
 }
 
 // SyncAndPin runs the full read-path synchronization pipeline under linearizable
@@ -383,31 +463,76 @@ func (m *Materializer) loadLastSync(repo tenant.RepoKey) (ddb.RepoMeta, []ddb.Re
 	return snap.meta, cp
 }
 
+func (m *Materializer) queryManifestShardWithTrace(ctx context.Context, repo tenant.RepoKey, shard int) ([]ddb.PackManifest, error) {
+	afterULID := m.cache.Watermark(repo, shard)
+
+	qCtx, qSpan := m.tracer.Start(ctx, "ddb.query_manifest", trace.WithAttributes(
+		telemetry.NewSpanAttrs().
+			TenantID(string(repo.TenantID)).
+			RepoID(string(repo.RepoID)).
+			ManifestShard(shard).
+			Build()...,
+	))
+	entries, qErr := m.meta.QueryManifestShard(qCtx, repo, shard, afterULID, false)
+	if qErr != nil {
+		qSpan.RecordError(qErr)
+		qSpan.SetStatus(codes.Error, qErr.Error())
+		qSpan.End()
+		return nil, fmt.Errorf("node: query manifest shard %d for %s: %w", shard, repo, qErr)
+	}
+	qSpan.End()
+	return entries, nil
+}
+
 func (m *Materializer) syncManifestPacks(ctx context.Context, repo tenant.RepoKey, meta ddb.RepoMeta) (fetched, cached, pruned int, err error) {
+	shardEntries := make([][]ddb.PackManifest, meta.ManifestShards)
+	if meta.ManifestShards <= 1 {
+		for shard := 0; shard < meta.ManifestShards; shard++ {
+			entries, qErr := m.queryManifestShardWithTrace(ctx, repo, shard)
+			if qErr != nil {
+				return 0, 0, 0, qErr
+			}
+			shardEntries[shard] = entries
+		}
+	} else {
+		qCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		var (
+			wg       sync.WaitGroup
+			errMu    sync.Mutex
+			firstErr error
+		)
+		for shard := 0; shard < meta.ManifestShards; shard++ {
+			shard := shard
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				entries, qErr := m.queryManifestShardWithTrace(qCtx, repo, shard)
+				if qErr != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = qErr
+					}
+					errMu.Unlock()
+					cancel()
+					return
+				}
+				shardEntries[shard] = entries
+			}()
+		}
+		wg.Wait()
+		if firstErr != nil {
+			return 0, 0, 0, firstErr
+		}
+	}
+
 	maxULIDByShard := make(map[int]string, meta.ManifestShards)
 	missingSet := make(map[string]struct{})
 	var missingOrder []string
 
 	for shard := 0; shard < meta.ManifestShards; shard++ {
-		afterULID := m.cache.Watermark(repo, shard)
-
-		qCtx, qSpan := m.tracer.Start(ctx, "ddb.query_manifest", trace.WithAttributes(
-			telemetry.NewSpanAttrs().
-				TenantID(string(repo.TenantID)).
-				RepoID(string(repo.RepoID)).
-				ManifestShard(shard).
-				Build()...,
-		))
-		entries, qErr := m.meta.QueryManifestShard(qCtx, repo, shard, afterULID, false)
-		if qErr != nil {
-			qSpan.RecordError(qErr)
-			qSpan.SetStatus(codes.Error, qErr.Error())
-			qSpan.End()
-			return 0, 0, 0, fmt.Errorf("node: query manifest shard %d for %s: %w", shard, repo, qErr)
-		}
-		qSpan.End()
-
-		for _, pm := range entries {
+		for _, pm := range shardEntries[shard] {
 			if pm.ULID > maxULIDByShard[shard] {
 				maxULIDByShard[shard] = pm.ULID
 			}
@@ -679,13 +804,6 @@ func (m *Materializer) deleteRefState(repo tenant.RepoKey) {
 	m.refStateMu.Lock()
 	delete(m.refState, repo)
 	m.refStateMu.Unlock()
-}
-
-func (m *Materializer) hasMaterializedRefs(repo tenant.RepoKey) bool {
-	m.refStateMu.Lock()
-	defer m.refStateMu.Unlock()
-	st, ok := m.refState[repo]
-	return ok && len(st.refs) > 0
 }
 
 // materializeReftableRefs synchronizes the bare repo's reftable refs and HEAD

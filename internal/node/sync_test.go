@@ -31,14 +31,18 @@ import (
 )
 
 type fakeMetadataStore struct {
-	mu               sync.Mutex
-	metas            map[tenant.RepoKey]ddb.RepoMeta
-	refs             map[tenant.RepoKey][]ddb.RefState
-	manifestsByShard map[tenant.RepoKey]map[int][]ddb.PackManifest
-	seenWatermarks   []string
-	getMetaCalls     int
-	listRefsCalls    int
-	err              error
+	mu                 sync.Mutex
+	metas              map[tenant.RepoKey]ddb.RepoMeta
+	refs               map[tenant.RepoKey][]ddb.RefState
+	manifestsByShard   map[tenant.RepoKey]map[int][]ddb.PackManifest
+	seenWatermarks     []string
+	getMetaCalls       int
+	listRefsCalls      int
+	getRefCalls        int
+	queryManifestCalls int
+	listRefsHook       func(ctx context.Context, repo tenant.RepoKey)
+	queryManifestHook  func(ctx context.Context, shard int)
+	err                error
 }
 
 func newFakeMetadataStore() *fakeMetadataStore {
@@ -97,7 +101,13 @@ func (f *fakeMetadataStore) GetMeta(_ context.Context, repo tenant.RepoKey) (ddb
 	return m, nil
 }
 
-func (f *fakeMetadataStore) ListRefs(_ context.Context, repo tenant.RepoKey, _ int) ([]ddb.RefState, error) {
+func (f *fakeMetadataStore) ListRefs(ctx context.Context, repo tenant.RepoKey, _ int) ([]ddb.RefState, error) {
+	f.mu.Lock()
+	hook := f.listRefsHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook(ctx, repo)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.listRefsCalls++
@@ -107,6 +117,21 @@ func (f *fakeMetadataStore) ListRefs(_ context.Context, repo tenant.RepoKey, _ i
 	refs := append([]ddb.RefState(nil), f.refs[repo]...)
 	sort.Slice(refs, func(i, j int) bool { return refs[i].RefName < refs[j].RefName })
 	return refs, nil
+}
+
+func (f *fakeMetadataStore) GetRef(_ context.Context, repo tenant.RepoKey, refName string, _ int) (ddb.RefState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getRefCalls++
+	if f.err != nil {
+		return ddb.RefState{}, f.err
+	}
+	for _, r := range f.refs[repo] {
+		if r.RefName == refName {
+			return r, nil
+		}
+	}
+	return ddb.RefState{}, ddb.ErrNotFound
 }
 
 func (f *fakeMetadataStore) GetMetaCalls() int {
@@ -121,9 +146,28 @@ func (f *fakeMetadataStore) ListRefsCalls() int {
 	return f.listRefsCalls
 }
 
-func (f *fakeMetadataStore) QueryManifestShard(_ context.Context, repo tenant.RepoKey, shard int, afterULID string, activeOnly bool) ([]ddb.PackManifest, error) {
+func (f *fakeMetadataStore) GetRefCalls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.getRefCalls
+}
+
+func (f *fakeMetadataStore) QueryManifestCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.queryManifestCalls
+}
+
+func (f *fakeMetadataStore) QueryManifestShard(ctx context.Context, repo tenant.RepoKey, shard int, afterULID string, activeOnly bool) ([]ddb.PackManifest, error) {
+	f.mu.Lock()
+	hook := f.queryManifestHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook(ctx, shard)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queryManifestCalls++
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -1862,63 +1906,165 @@ func TestMaterializer_ReftableSyncStateSkipsSubprocessesWhenUnchanged(t *testing
 	}
 }
 
-func TestMaterializer_SyncPacksAndPinSkipsRefsAndReftable(t *testing.T) {
+func TestMaterializer_LoadAuthoritativeRefsLinearizableCoalescing(t *testing.T) {
 	ctx := context.Background()
-	rk, _ := tenant.NewRepoKey("acme", "packs-only")
+	rk, _ := tenant.NewRepoKey("acme", "coalesce-refs")
 	c, err := cache.New(cache.Config{Root: t.TempDir()})
 	if err != nil {
 		t.Fatalf("cache.New: %v", err)
 	}
 
-	_, pack1Bytes, idx1Bytes := buildSyntheticCommitPackForSync(t, pack.SHA1, "p1\n", "commit 1\n")
-	pack1 := strings.Repeat("a", 64)
-
+	oid1 := strings.Repeat("1", 40)
+	oid2 := strings.Repeat("2", 40)
 	meta := ddb.RepoMeta{
-		Repo:           rk,
-		HomeRegion:     "us-east-1",
-		FailoverEpoch:  1,
-		RefShards:      1,
-		ManifestShards: 1,
-		WriteState:     lease.ModeActive,
-		DefaultBranch:  "refs/heads/main",
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1,
+		RefShards: 2, ManifestShards: 1, WriteState: lease.ModeActive, DefaultBranch: "refs/heads/main",
 	}
 	metaStore := newFakeMetadataStore()
 	metaStore.PutMeta(meta)
-	metaStore.AddManifest(rk, 0, ddb.PackManifest{
-		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FD1", PackID: pack1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
-	})
-	packStore := newFakePackFetcher()
-	packStore.Put(pack1, pack1Bytes, idx1Bytes)
+	metaStore.SetRefs(rk, []ddb.RefState{{Repo: rk, RefName: "refs/heads/main", OID: oid1}})
 
-	spyExec := newSpyBareRepoExecutor()
+	flight1Entered := make(chan struct{})
+	releaseFlight1 := make(chan struct{})
+	var callNum atomic.Int32
+	metaStore.listRefsHook = func(_ context.Context, _ tenant.RepoKey) {
+		if callNum.Add(1) == 1 {
+			close(flight1Entered)
+			<-releaseFlight1
+		}
+	}
+
 	mat, err := NewMaterializer(MaterializerConfig{
-		Meta:        metaStore,
-		Packs:       packStore,
-		Cache:       c,
-		GitExecutor: spyExec,
+		Meta:  metaStore,
+		Packs: newFakePackFetcher(),
+		Cache: c,
 	})
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
 	t.Cleanup(mat.Close)
 
-	handle, err := mat.SyncPacksAndPin(ctx, rk, meta)
-	if err != nil {
-		t.Fatalf("SyncPacksAndPin: %v", err)
-	}
-	defer handle.Release()
+	// Start Flight 1.
+	flight1Done := make(chan []ddb.RefState, 1)
+	go func() {
+		_, refs, loadErr := mat.LoadAuthoritativeRefs(ctx, rk)
+		if loadErr != nil {
+			t.Errorf("flight 1 LoadAuthoritativeRefs: %v", loadErr)
+		}
+		flight1Done <- refs
+	}()
+	<-flight1Entered
 
-	if !c.HasPack(rk, pack1) {
-		t.Fatal("expected pack1 installed in cache")
+	// Commit new ref while Flight 1 is in-flight.
+	metaStore.SetRefs(rk, []ddb.RefState{{Repo: rk, RefName: "refs/heads/main", OID: oid2}})
+
+	// Launch 4 concurrent readers after the commit; they must NOT join Flight 1,
+	// and must coalesce into a single Flight 2 that observes oid2.
+	const readers = 4
+	var wg sync.WaitGroup
+	results := make([][]ddb.RefState, readers)
+	for i := 0; i < readers; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, refs, loadErr := mat.LoadAuthoritativeRefs(ctx, rk)
+			if loadErr != nil {
+				t.Errorf("reader %d LoadAuthoritativeRefs: %v", i, loadErr)
+				return
+			}
+			results[i] = refs
+		}()
 	}
-	if metaStore.GetMetaCalls() != 0 {
-		t.Errorf("GetMetaCalls = %d, want 0", metaStore.GetMetaCalls())
+
+	// Give readers a moment to enqueue into the next-generation batch.
+	time.Sleep(25 * time.Millisecond)
+	close(releaseFlight1)
+
+	<-flight1Done
+	wg.Wait()
+
+	for i, refs := range results {
+		if len(refs) != 1 || refs[0].OID != oid2 {
+			t.Fatalf("reader %d saw stale refs %+v, want oid2=%s", i, refs, oid2)
+		}
 	}
-	if metaStore.ListRefsCalls() != 0 {
-		t.Errorf("ListRefsCalls = %d, want 0", metaStore.ListRefsCalls())
+	// Expect exactly 2 ListRefs calls total: Flight 1 + one coalesced Flight 2.
+	if got := metaStore.ListRefsCalls(); got != 2 {
+		t.Fatalf("ListRefsCalls = %d, want 2 (1 for flight 1 + 1 coalesced flight 2)", got)
 	}
-	if spyExec.initBareCalls.Load() != 0 || spyExec.forEachRefCalls.Load() != 0 || spyExec.updateRefCalls.Load() != 0 || spyExec.symbolicRefCalls.Load() != 0 {
-		t.Errorf("expected 0 git ref subprocesses, got init:%d foreach:%d update:%d symref:%d",
-			spyExec.initBareCalls.Load(), spyExec.forEachRefCalls.Load(), spyExec.updateRefCalls.Load(), spyExec.symbolicRefCalls.Load())
+}
+
+func TestMaterializer_SyncManifestPacksParallelShards(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	rk, _ := tenant.NewRepoKey("acme", "parallel-manifest")
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+
+	const numShards = 4
+	meta := ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1,
+		RefShards: 1, ManifestShards: numShards, WriteState: lease.ModeActive, DefaultBranch: "refs/heads/main",
+	}
+	metaStore := newFakeMetadataStore()
+	metaStore.PutMeta(meta)
+	packStore := newFakePackFetcher()
+
+	packIDs := make([]string, numShards)
+	for s := 0; s < numShards; s++ {
+		_, pb, ib := buildSyntheticCommitPackForSync(t, pack.SHA1, fmt.Sprintf("shard-%d\n", s), fmt.Sprintf("commit %d\n", s))
+		pid := strings.Repeat(fmt.Sprintf("%x", s+1), 64)
+		packIDs[s] = pid
+		packStore.Put(pid, pb, ib)
+		metaStore.AddManifest(rk, s, ddb.PackManifest{
+			Repo: rk, ULID: fmt.Sprintf("01ARZ3NDEKTSV4RRFFQ69G5FD%d", s), PackID: pid, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+		})
+	}
+
+	// Barrier proves all 4 shards are queried concurrently; sequential execution will deadlock until ctx expires.
+	var arrived atomic.Int32
+	allArrived := make(chan struct{})
+	metaStore.queryManifestHook = func(qCtx context.Context, _ int) {
+		if arrived.Add(1) == numShards {
+			close(allArrived)
+		}
+		select {
+		case <-allArrived:
+		case <-qCtx.Done():
+		}
+	}
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:                   metaStore,
+		Packs:                  packStore,
+		Cache:                  c,
+		PruneReconcileInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	res, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin: %v", err)
+	}
+	defer res.Handle.Release()
+
+	if arrived.Load() < numShards {
+		t.Fatalf("expected all %d manifest shards to query concurrently, got %d", numShards, arrived.Load())
+	}
+	for s, pid := range packIDs {
+		if !c.HasPack(rk, pid) {
+			t.Fatalf("expected shard %d pack %s installed in cache", s, pid)
+		}
+		wantWM := fmt.Sprintf("01ARZ3NDEKTSV4RRFFQ69G5FD%d", s)
+		if gotWM := c.Watermark(rk, s); gotWM != wantWM {
+			t.Fatalf("shard %d watermark = %q, want %q", s, gotWM, wantWM)
+		}
 	}
 }

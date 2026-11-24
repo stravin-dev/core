@@ -1398,3 +1398,290 @@ func TestReceivePack_SingleListRefsAndNoReftableMaterialization(t *testing.T) {
 			spyExec.initBareCalls.Load(), spyExec.forEachRefCalls.Load(), spyExec.updateRefCalls.Load(), spyExec.symbolicRefCalls.Load())
 	}
 }
+
+func TestReceivePackHandler_UpdateFastPathSkipsListRefsAndSyncAndPin(t *testing.T) {
+	rk, _ := tenant.NewRepoKey("acme", "push-fastpath")
+	ddbStore := newFakePushStore()
+	ddbStore.PutMeta(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1,
+		RefShards: 4, ManifestShards: 2, WriteState: lease.ModeActive, DefaultBranch: "refs/heads/main",
+	})
+
+	baseCommitOID, baseBlobOID, basePackBytes := buildSyntheticCommitPack(t, "base-content\n", "base commit\n", nil)
+	baseParsed, err := pack.Parse(bytes.NewReader(basePackBytes), pack.ParseOptions{})
+	if err != nil {
+		t.Fatalf("parse base pack: %v", err)
+	}
+	baseIdxBytes, err := pack.BuildIdx(baseParsed)
+	if err != nil {
+		t.Fatalf("build base idx: %v", err)
+	}
+	basePackSum := sha256.Sum256(basePackBytes)
+	basePackID := hex.EncodeToString(basePackSum[:])
+
+	ddbStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: baseCommitOID.String(), PackID: basePackID},
+	})
+	s3Store := newFakeS3WriteStore()
+	s3Store.Put(basePackID, basePackBytes, baseIdxBytes)
+
+	nvmeCache, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	// Pre-warm local NVMe cache with base pack.
+	if err := nvmeCache.InstallPack(rk, basePackID, basePackBytes, baseIdxBytes); err != nil {
+		t.Fatalf("InstallPack: %v", err)
+	}
+
+	leaseBox := &fakeRegionalLeaseStore{
+		lease: ddb.RegionalWriteLease{
+			Region: "us-east-1", Epoch: 1, Mode: lease.ModeActive,
+			HolderID: "ctrl-1", ExpiresAt: time.Now().UTC().Add(5 * time.Minute),
+		},
+	}
+	refresher, err := NewLeaseRefresher(LeaseRefresherConfig{Store: leaseBox, Region: "us-east-1"})
+	if err != nil {
+		t.Fatalf("NewLeaseRefresher: %v", err)
+	}
+	if err := refresher.RefreshOnce(context.Background()); err != nil {
+		t.Fatalf("RefreshOnce: %v", err)
+	}
+
+	spyExec := newSpyBareRepoExecutor()
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta: ddbStore, Packs: s3Store, Cache: nvmeCache, GitExecutor: spyExec,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	wh, err := NewReceivePackHandler(ReceivePackConfig{
+		Materializer: mat, Cache: nvmeCache, Packs: s3Store,
+		Committer: ddbStore, LeaseRefresher: refresher, Region: "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("NewReceivePackHandler: %v", err)
+	}
+	srv, err := NewServer(ServerConfig{
+		Materializer: mat, GitExecutor: spyExec, WriteHandler: wh,
+		LeaseRefresher: refresher, Region: "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	client := startBufconnNode(t, srv)
+
+	// Build a thin pack delta referencing baseBlobOID (which is in warm local cache).
+	newCommitOID, thinPackBytes := buildSyntheticThinPack(t, []byte("base-content\n"), baseBlobOID, baseCommitOID)
+	wire := buildPushWirePayload(
+		[]ddb.RefUpdate{{RefName: "refs/heads/main", OldOID: baseCommitOID.String(), NewOID: newCommitOID.String()}},
+		"report-status side-band-64k",
+		thinPackBytes,
+	)
+	outCtx := metadata.AppendToOutgoingContext(context.Background(), HeaderStatelessRPC, "true")
+	resp, exitCode, err := sendReceivePack(t, outCtx, client, rk, "", wire)
+	if err != nil {
+		t.Fatalf("sendReceivePack: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("exitCode = %d, want 0", exitCode)
+	}
+	band1, _ := splitSideBandResponse(t, resp)
+	lines := decodePktLines(t, band1)
+	if len(lines) != 2 || lines[1] != "ok refs/heads/main\n" {
+		t.Fatalf("unexpected report-status lines: %q", lines)
+	}
+	if got := ddbStore.ListRefsCalls(); got != 0 {
+		t.Errorf("ListRefsCalls = %d, want 0 (update push must use GetRef)", got)
+	}
+	if got := ddbStore.GetRefCalls(); got != 1 {
+		t.Errorf("GetRefCalls = %d, want 1", got)
+	}
+	if got := ddbStore.QueryManifestCalls(); got != 0 {
+		t.Errorf("QueryManifestCalls = %d, want 0 (warm local pin must skip SyncAndPin)", got)
+	}
+
+	// Verify SyncAndPin immediately after push sees the newly committed SHA (0 stale reads).
+	syncRes, err := mat.SyncAndPin(context.Background(), rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin after push: %v", err)
+	}
+	defer syncRes.Handle.Release()
+	if len(syncRes.Refs) != 1 || syncRes.Refs[0].OID != newCommitOID.String() {
+		t.Fatalf("SyncAndPin refs = %+v, want %s", syncRes.Refs, newCommitOID.String())
+	}
+}
+
+func TestReceivePackHandler_UpdateMissingBaseFallsBackToSyncAndPin(t *testing.T) {
+	rk, _ := tenant.NewRepoKey("acme", "push-fallback")
+	ddbStore := newFakePushStore()
+	ddbStore.PutMeta(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1,
+		RefShards: 2, ManifestShards: 1, WriteState: lease.ModeActive, DefaultBranch: "refs/heads/main",
+	})
+
+	baseCommitOID, baseBlobOID, basePackBytes := buildSyntheticCommitPack(t, "base-content\n", "base commit\n", nil)
+	baseParsed, err := pack.Parse(bytes.NewReader(basePackBytes), pack.ParseOptions{})
+	if err != nil {
+		t.Fatalf("parse base pack: %v", err)
+	}
+	baseIdxBytes, err := pack.BuildIdx(baseParsed)
+	if err != nil {
+		t.Fatalf("build base idx: %v", err)
+	}
+	basePackSum := sha256.Sum256(basePackBytes)
+	basePackID := hex.EncodeToString(basePackSum[:])
+
+	ddbStore.SetRefs(rk, []ddb.RefState{
+		{Repo: rk, RefName: "refs/heads/main", OID: baseCommitOID.String(), PackID: basePackID},
+	})
+	ddbStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FD1", PackID: basePackID, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	s3Store := newFakeS3WriteStore()
+	s3Store.Put(basePackID, basePackBytes, baseIdxBytes)
+
+	// Cold cache: base pack is ONLY in S3/manifest, NOT in local NVMe cache.
+	nvmeCache, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	leaseBox := &fakeRegionalLeaseStore{
+		lease: ddb.RegionalWriteLease{
+			Region: "us-east-1", Epoch: 1, Mode: lease.ModeActive,
+			HolderID: "ctrl-1", ExpiresAt: time.Now().UTC().Add(5 * time.Minute),
+		},
+	}
+	refresher, err := NewLeaseRefresher(LeaseRefresherConfig{Store: leaseBox, Region: "us-east-1"})
+	if err != nil {
+		t.Fatalf("NewLeaseRefresher: %v", err)
+	}
+	if err := refresher.RefreshOnce(context.Background()); err != nil {
+		t.Fatalf("RefreshOnce: %v", err)
+	}
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta: ddbStore, Packs: s3Store, Cache: nvmeCache,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	wh, err := NewReceivePackHandler(ReceivePackConfig{
+		Materializer: mat, Cache: nvmeCache, Packs: s3Store,
+		Committer: ddbStore, LeaseRefresher: refresher, Region: "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("NewReceivePackHandler: %v", err)
+	}
+	srv, err := NewServer(ServerConfig{
+		Materializer: mat, GitExecutor: newSpyBareRepoExecutor(), WriteHandler: wh,
+		LeaseRefresher: refresher, Region: "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	client := startBufconnNode(t, srv)
+
+	newCommitOID, thinPackBytes := buildSyntheticThinPack(t, []byte("base-content\n"), baseBlobOID, baseCommitOID)
+	wire := buildPushWirePayload(
+		[]ddb.RefUpdate{{RefName: "refs/heads/main", OldOID: baseCommitOID.String(), NewOID: newCommitOID.String()}},
+		"report-status side-band-64k",
+		thinPackBytes,
+	)
+	outCtx := metadata.AppendToOutgoingContext(context.Background(), HeaderStatelessRPC, "true")
+	resp, exitCode, err := sendReceivePack(t, outCtx, client, rk, "", wire)
+	if err != nil {
+		t.Fatalf("sendReceivePack: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("exitCode = %d, want 0", exitCode)
+	}
+	band1, _ := splitSideBandResponse(t, resp)
+	lines := decodePktLines(t, band1)
+	if len(lines) != 2 || lines[1] != "ok refs/heads/main\n" {
+		t.Fatalf("unexpected report-status lines: %q", lines)
+	}
+	if got := ddbStore.QueryManifestCalls(); got == 0 {
+		t.Errorf("expected SyncAndPin fallback to query manifest shards, got 0")
+	}
+}
+
+func TestReceivePackHandler_UpdateNonExistentRefViaGetRefRejectedAsStale(t *testing.T) {
+	rk, _ := tenant.NewRepoKey("acme", "push-getref-notfound")
+	ddbStore := newFakePushStore()
+	ddbStore.PutMeta(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1,
+		RefShards: 2, ManifestShards: 1, WriteState: lease.ModeActive, DefaultBranch: "refs/heads/main",
+	})
+	s3Store := newFakeS3WriteStore()
+	nvmeCache, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	leaseBox := &fakeRegionalLeaseStore{
+		lease: ddb.RegionalWriteLease{
+			Region: "us-east-1", Epoch: 1, Mode: lease.ModeActive,
+			HolderID: "ctrl-1", ExpiresAt: time.Now().UTC().Add(5 * time.Minute),
+		},
+	}
+	refresher, err := NewLeaseRefresher(LeaseRefresherConfig{Store: leaseBox, Region: "us-east-1"})
+	if err != nil {
+		t.Fatalf("NewLeaseRefresher: %v", err)
+	}
+	if err := refresher.RefreshOnce(context.Background()); err != nil {
+		t.Fatalf("RefreshOnce: %v", err)
+	}
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta: ddbStore, Packs: s3Store, Cache: nvmeCache,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+	wh, err := NewReceivePackHandler(ReceivePackConfig{
+		Materializer: mat, Cache: nvmeCache, Packs: s3Store,
+		Committer: ddbStore, LeaseRefresher: refresher, Region: "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("NewReceivePackHandler: %v", err)
+	}
+	srv, err := NewServer(ServerConfig{
+		Materializer: mat, GitExecutor: newSpyBareRepoExecutor(), WriteHandler: wh,
+		LeaseRefresher: refresher, Region: "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	client := startBufconnNode(t, srv)
+
+	oldOID := strings.Repeat("a", 40)
+	// Delete of a non-existent ref (no create, no pack): must use GetRef -> ErrNotFound -> stale old_oid.
+	wire := buildPushWirePayload(
+		[]ddb.RefUpdate{{RefName: "refs/heads/missing", OldOID: oldOID, NewOID: ddb.ZeroOID}},
+		"report-status side-band-64k",
+		nil,
+	)
+	outCtx := metadata.AppendToOutgoingContext(context.Background(), HeaderStatelessRPC, "true")
+	resp, exitCode, err := sendReceivePack(t, outCtx, client, rk, "", wire)
+	if err != nil {
+		t.Fatalf("sendReceivePack: %v", err)
+	}
+	if exitCode != 0 {
+		t.Fatalf("exitCode = %d, want 0", exitCode)
+	}
+	band1, _ := splitSideBandResponse(t, resp)
+	lines := decodePktLines(t, band1)
+	if len(lines) != 2 || lines[1] != "ng refs/heads/missing stale old_oid\n" {
+		t.Fatalf("unexpected report-status lines: %q", lines)
+	}
+	if got := ddbStore.ListRefsCalls(); got != 0 {
+		t.Errorf("ListRefsCalls = %d, want 0", got)
+	}
+	if got := ddbStore.GetRefCalls(); got != 1 {
+		t.Errorf("GetRefCalls = %d, want 1", got)
+	}
+}

@@ -14,7 +14,7 @@ import (
 	"stravin.dev/core/internal/telemetry"
 )
 
-const wireChunkSize = 32 * 1024
+const wireChunkSize = 256 * 1024
 
 // NodeDialer returns an rpc.GitWireClient for a target stravin-node peer address.
 type NodeDialer interface {

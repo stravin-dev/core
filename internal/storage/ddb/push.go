@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -353,7 +354,10 @@ func (r *Repository) GetRef(ctx context.Context, repo tenant.RepoKey, refName st
 	return unmarshalRefState(repo, out.Item)
 }
 
+const maxConcurrentRefShardQueries = 16
+
 // ListRefs queries all ref shards [0, refShards) and returns refs sorted by RefName.
+// When refShards > 1, shards are queried concurrently with bounded parallelism.
 func (r *Repository) ListRefs(ctx context.Context, repo tenant.RepoKey, refShards int) ([]RefState, error) {
 	if err := repo.Validate(); err != nil {
 		return nil, err
@@ -363,42 +367,111 @@ func (r *Repository) ListRefs(ctx context.Context, repo tenant.RepoKey, refShard
 	}
 
 	var refs []RefState
-	for shard := 0; shard < refShards; shard++ {
-		pk, err := RefStateShardPK(repo, shard)
+	if refShards == 1 {
+		shardRefs, err := r.queryRefShard(ctx, repo, 0)
 		if err != nil {
 			return nil, err
 		}
-		var startKey map[string]types.AttributeValue
-		for {
-			out, err := r.client.Query(ctx, &dynamodb.QueryInput{
-				TableName:              aws.String(r.tableName),
-				KeyConditionExpression: aws.String("PK = :pk AND begins_with(SK, :prefix)"),
-				ExpressionAttributeValues: map[string]types.AttributeValue{
-					":pk":     attrS(pk),
-					":prefix": attrS("REF#"),
-				},
-				ExclusiveStartKey: startKey,
-			})
-			if err != nil {
-				return nil, err
+		refs = shardRefs
+	} else {
+		qCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		semSize := refShards
+		if semSize > maxConcurrentRefShardQueries {
+			semSize = maxConcurrentRefShardQueries
+		}
+		sem := make(chan struct{}, semSize)
+		perShard := make([][]RefState, refShards)
+		var (
+			wg       sync.WaitGroup
+			errMu    sync.Mutex
+			firstErr error
+		)
+		recordErr := func(err error) {
+			errMu.Lock()
+			if firstErr == nil {
+				firstErr = err
 			}
-			for _, item := range out.Items {
-				rs, err := unmarshalRefState(repo, item)
-				if err != nil {
-					return nil, err
+			errMu.Unlock()
+			cancel()
+		}
+
+		for shard := 0; shard < refShards; shard++ {
+			shard := shard
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-qCtx.Done():
+					recordErr(qCtx.Err())
+					return
 				}
-				refs = append(refs, rs)
-			}
-			if len(out.LastEvaluatedKey) == 0 {
-				break
-			}
-			startKey = out.LastEvaluatedKey
+				shardRefs, err := r.queryRefShard(qCtx, repo, shard)
+				if err != nil {
+					recordErr(err)
+					return
+				}
+				perShard[shard] = shardRefs
+			}()
+		}
+		wg.Wait()
+		if firstErr != nil {
+			return nil, firstErr
+		}
+
+		total := 0
+		for _, s := range perShard {
+			total += len(s)
+		}
+		refs = make([]RefState, 0, total)
+		for _, s := range perShard {
+			refs = append(refs, s...)
 		}
 	}
 
 	sort.Slice(refs, func(i, j int) bool {
 		return refs[i].RefName < refs[j].RefName
 	})
+	return refs, nil
+}
+
+func (r *Repository) queryRefShard(ctx context.Context, repo tenant.RepoKey, shard int) ([]RefState, error) {
+	pk, err := RefStateShardPK(repo, shard)
+	if err != nil {
+		return nil, err
+	}
+	var (
+		refs     []RefState
+		startKey map[string]types.AttributeValue
+	)
+	for {
+		out, err := r.client.Query(ctx, &dynamodb.QueryInput{
+			TableName:              aws.String(r.tableName),
+			KeyConditionExpression: aws.String("PK = :pk AND begins_with(SK, :prefix)"),
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":pk":     attrS(pk),
+				":prefix": attrS("REF#"),
+			},
+			ExclusiveStartKey: startKey,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range out.Items {
+			rs, err := unmarshalRefState(repo, item)
+			if err != nil {
+				return nil, err
+			}
+			refs = append(refs, rs)
+		}
+		if len(out.LastEvaluatedKey) == 0 {
+			break
+		}
+		startKey = out.LastEvaluatedKey
+	}
 	return refs, nil
 }
 

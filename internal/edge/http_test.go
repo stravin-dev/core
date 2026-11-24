@@ -1020,3 +1020,56 @@ func TestHTTPHandler_ClientCanceledClassifiedAs499(t *testing.T) {
 		})
 	})
 }
+
+type countingFlushRecorder struct {
+	*httptest.ResponseRecorder
+	flushes int
+}
+
+func (c *countingFlushRecorder) Flush() {
+	c.flushes++
+	c.ResponseRecorder.Flush()
+}
+
+func TestSmartHTTPStreamWriter_FlushCoalescing(t *testing.T) {
+	rec := &countingFlushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	sw := &smartHTTPStreamWriter{
+		w:           rec,
+		contentType: "application/x-git-upload-pack-result",
+	}
+
+	// 1. First write always flushes immediately even if large.
+	chunk64K := bytes.Repeat([]byte("a"), 64*1024)
+	if _, err := sw.Write(chunk64K); err != nil {
+		t.Fatalf("Write 1: %v", err)
+	}
+	if rec.flushes != 1 {
+		t.Fatalf("flushes after first write = %d, want 1", rec.flushes)
+	}
+
+	// 2. Next three 64 KiB writes accumulate 192 KiB (< 256 KiB): 0 additional flushes.
+	for i := 0; i < 3; i++ {
+		if _, err := sw.Write(chunk64K); err != nil {
+			t.Fatalf("Write bulk %d: %v", i, err)
+		}
+	}
+	if rec.flushes != 1 {
+		t.Fatalf("flushes after 192 KiB unflushed = %d, want 1", rec.flushes)
+	}
+
+	// 3. Fourth 64 KiB write hits 256 KiB threshold: triggers 1 flush.
+	if _, err := sw.Write(chunk64K); err != nil {
+		t.Fatalf("Write bulk 4: %v", err)
+	}
+	if rec.flushes != 2 {
+		t.Fatalf("flushes after 256 KiB threshold = %d, want 2", rec.flushes)
+	}
+
+	// 4. Small pkt-line chunk (< 32 KiB) flushes immediately.
+	if _, err := sw.Write([]byte("0008NAK\n")); err != nil {
+		t.Fatalf("Write small: %v", err)
+	}
+	if rec.flushes != 3 {
+		t.Fatalf("flushes after small chunk = %d, want 3", rec.flushes)
+	}
+}

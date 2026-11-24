@@ -276,3 +276,86 @@ func TestRepository_ConditionalErrorsMapped(t *testing.T) {
 		t.Fatalf("ReleaseShardLease = %v, want ErrLeaseLost", err)
 	}
 }
+
+func TestRepository_ListRefsParallelShardsDeterministicSort(t *testing.T) {
+	repo := mustRepoKey(t, "acme", "parallel-refs")
+	const refShards = 4
+	nowStr := time.Date(2026, 11, 21, 18, 0, 0, 0, time.UTC).Format(time.RFC3339Nano)
+
+	pkToShard := make(map[string]int, refShards)
+	for s := 0; s < refShards; s++ {
+		pk, err := RefStateShardPK(repo, s)
+		if err != nil {
+			t.Fatalf("RefStateShardPK: %v", err)
+		}
+		pkToShard[pk] = s
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Barrier proves all 4 shards are queried concurrently; sequential queries will time out.
+	arrivedCh := make(chan struct{}, refShards)
+	allArrived := make(chan struct{})
+	go func() {
+		for i := 0; i < refShards; i++ {
+			select {
+			case <-arrivedCh:
+			case <-ctx.Done():
+				return
+			}
+		}
+		close(allArrived)
+	}()
+
+	api := &stubAPI{
+		queryFn: func(qCtx context.Context, in *dynamodb.QueryInput) (*dynamodb.QueryOutput, error) {
+			pk := getString(in.ExpressionAttributeValues, ":pk")
+			shard, ok := pkToShard[pk]
+			if !ok {
+				return nil, errors.New("unexpected pk " + pk)
+			}
+			arrivedCh <- struct{}{}
+			select {
+			case <-allArrived:
+			case <-qCtx.Done():
+				return nil, qCtx.Err()
+			}
+			// Return refs in reverse shard order so sorting is exercised.
+			refName := "refs/heads/branch-" + string(rune('d'-shard))
+			return &dynamodb.QueryOutput{
+				Items: []map[string]types.AttributeValue{
+					{
+						AttrPK:          attrS(pk),
+						AttrSK:          attrS("REF#" + refName),
+						"ref_name":      attrS(refName),
+						"oid":           attrS(oidA),
+						"prev_oid":      attrS(ZeroOID),
+						"pack_id":       attrS("pack-1"),
+						"updated_at":    attrS(nowStr),
+						"epoch":         attrNUint64(1),
+						"origin_region": attrS("us-east-1"),
+					},
+				},
+			}, nil
+		},
+	}
+
+	r, err := NewRepository(api, "stravin-core")
+	if err != nil {
+		t.Fatalf("NewRepository: %v", err)
+	}
+	refs, err := r.ListRefs(ctx, repo, refShards)
+	if err != nil {
+		t.Fatalf("ListRefs: %v", err)
+	}
+	want := []string{"refs/heads/branch-a", "refs/heads/branch-b", "refs/heads/branch-c", "refs/heads/branch-d"}
+	if len(refs) != len(want) {
+		t.Fatalf("len(refs) = %d, want %d", len(refs), len(want))
+	}
+	for i, w := range want {
+		if refs[i].RefName != w {
+			t.Fatalf("refs[%d].RefName = %q, want %q", i, refs[i].RefName, w)
+		}
+	}
+}
