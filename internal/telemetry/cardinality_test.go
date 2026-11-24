@@ -176,3 +176,22 @@ func TestGuardedMeter_RejectPolicyDropsRecording(t *testing.T) {
 		}
 	}
 }
+
+func TestGuardedMeter_InstrumentsDelegateEnabled(t *testing.T) {
+	ctx := context.Background()
+	prov, err := telemetry.NewInMemoryProvider("stravin-edge")
+	if err != nil {
+		t.Fatalf("NewInMemoryProvider: %v", err)
+	}
+	defer func() { _ = prov.Shutdown(ctx) }()
+
+	meter := prov.Meter("stravin.edge")
+	ic, err := meter.Int64Counter("test_ic")
+	if err != nil || !ic.Enabled(ctx) {
+		t.Fatalf("Int64Counter.Enabled = %v, err = %v; want true, nil", ic != nil && ic.Enabled(ctx), err)
+	}
+	fg, err := meter.Float64Gauge("test_fg")
+	if err != nil || !fg.Enabled(ctx) {
+		t.Fatalf("Float64Gauge.Enabled = %v, err = %v; want true, nil", fg != nil && fg.Enabled(ctx), err)
+	}
+}

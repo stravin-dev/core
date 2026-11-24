@@ -37,7 +37,7 @@ lint: vet
 	@if command -v gofmt >/dev/null 2>&1; then \
 		unformatted="$$(gofmt -l .)"; \
 	else \
-		unformatted="$$(docker run --rm -v "$(CURDIR):/workspace" -w /workspace $${STRAVIN_GO_IMAGE:-golang:1.25-bookworm} gofmt -l .)"; \
+		unformatted="$$(docker run --rm -v "$(CURDIR):/workspace" -w /workspace $${STRAVIN_GO_IMAGE:-golang:1.26-bookworm} gofmt -l .)"; \
 	fi; \
 	if [ -n "$$unformatted" ]; then \
 		echo "Unformatted Go files:"; \
