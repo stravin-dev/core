@@ -210,3 +210,144 @@ func TestGitClientBuildEnvSSHConnectTimeout(t *testing.T) {
 		})
 	}
 }
+
+func TestGitClientWithAuthorEnvPropagationAndOverride(t *testing.T) {
+	ctx := context.Background()
+	workDir := filepath.Join(t.TempDir(), "author-env")
+	if err := os.MkdirAll(workDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	base := NewGitClient(workDir, GitOptions{
+		ExtraEnv: []string{
+			"CUSTOM_VAR=keep",
+			"GIT_AUTHOR_NAME=Old Name",
+			"GIT_COMMITTER_EMAIL=old@example.com",
+		},
+	})
+	g := base.WithAuthor("Stravin Agent 7", "agent-7@loadgen.stravin.local")
+
+	// Verify parent ExtraEnv was not mutated.
+	if len(base.opts.ExtraEnv) != 3 || base.opts.ExtraEnv[1] != "GIT_AUTHOR_NAME=Old Name" {
+		t.Fatalf("base ExtraEnv mutated: %v", base.opts.ExtraEnv)
+	}
+
+	// Verify overriding author replaces prior author/committer vars without duplicates.
+	g2 := g.WithAuthor("Override User", "override@stravin.local")
+	wantVars := map[string]string{
+		"CUSTOM_VAR":          "keep",
+		"GIT_AUTHOR_NAME":     "Override User",
+		"GIT_AUTHOR_EMAIL":    "override@stravin.local",
+		"GIT_COMMITTER_NAME":  "Override User",
+		"GIT_COMMITTER_EMAIL": "override@stravin.local",
+	}
+	seen := make(map[string]int, len(wantVars))
+	for _, kv := range g2.opts.ExtraEnv {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			t.Fatalf("malformed env entry %q", kv)
+		}
+		seen[k]++
+		if want, exists := wantVars[k]; exists && v != want {
+			t.Errorf("%s = %q, want %q", k, v, want)
+		}
+	}
+	for k := range wantVars {
+		if seen[k] != 1 {
+			t.Errorf("env var %s count = %d, want 1 (ExtraEnv=%v)", k, seen[k], g2.opts.ExtraEnv)
+		}
+	}
+
+	// Verify git commit succeeds without git config user.name/user.email.
+	if _, err := g.Run(ctx, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	if err := g.WriteFile("note.txt", []byte("hello\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.AddAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Commit(ctx, "env author commit"); err != nil {
+		t.Fatalf("Commit with WithAuthor failed: %v", err)
+	}
+	authorOut, err := g.Run(ctx, "log", "-1", "--format=%an <%ae> | %cn <%ce>")
+	if err != nil {
+		t.Fatalf("git log: %v", err)
+	}
+	wantAuthor := "Stravin Agent 7 <agent-7@loadgen.stravin.local> | Stravin Agent 7 <agent-7@loadgen.stravin.local>"
+	if strings.TrimSpace(authorOut) != wantAuthor {
+		t.Fatalf("commit identity = %q, want %q", strings.TrimSpace(authorOut), wantAuthor)
+	}
+}
+
+func TestGitClientRevParseHeadFastPathAndFallbacks(t *testing.T) {
+	ctx := context.Background()
+	workDir := filepath.Join(t.TempDir(), "revparse")
+	if err := os.MkdirAll(workDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	g := NewGitClient(workDir, GitOptions{}).WithAuthor("Test User", "test@stravin.local")
+	if _, err := g.Run(ctx, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+
+	// 1. Unborn HEAD: fast path returns false and fallback git rev-parse HEAD fails.
+	if sha, ok := resolveHeadSHA(workDir); ok {
+		t.Fatalf("expected unborn HEAD fast path miss, got %q", sha)
+	}
+	if _, err := g.RevParse(ctx, "HEAD"); err == nil {
+		t.Fatal("expected RevParse(HEAD) error on unborn repo")
+	}
+
+	// 2. Symbolic ref HEAD -> refs/heads/main (loose ref fast path).
+	if err := g.WriteFile("a.txt", []byte("one\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.AddAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Commit(ctx, "first"); err != nil {
+		t.Fatal(err)
+	}
+	wantSHAOut, err := g.Run(ctx, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD: %v", err)
+	}
+	wantSHA := strings.TrimSpace(wantSHAOut)
+
+	fastSHA, ok := resolveHeadSHA(workDir)
+	if !ok || fastSHA != wantSHA {
+		t.Fatalf("resolveHeadSHA(symbolic) = (%q, %v), want (%q, true)", fastSHA, ok, wantSHA)
+	}
+	gotSHA, err := g.RevParse(ctx, "HEAD")
+	if err != nil || gotSHA != wantSHA {
+		t.Fatalf("RevParse(HEAD) = (%q, %v), want (%q, nil)", gotSHA, err, wantSHA)
+	}
+
+	// 3. Packed refs fallback: pack-refs --all removes loose ref; fast path misses, RevParse still succeeds.
+	if _, err := g.Run(ctx, "pack-refs", "--all"); err != nil {
+		t.Fatalf("git pack-refs: %v", err)
+	}
+	if sha, ok := resolveHeadSHA(workDir); ok {
+		t.Fatalf("expected packed-refs fast path miss, got %q", sha)
+	}
+	gotPacked, err := g.RevParse(ctx, "HEAD")
+	if err != nil || gotPacked != wantSHA {
+		t.Fatalf("RevParse(HEAD) packed-refs fallback = (%q, %v), want (%q, nil)", gotPacked, err, wantSHA)
+	}
+
+	// 4. Detached HEAD fast path.
+	if _, err := g.Run(ctx, "checkout", "--detach", wantSHA); err != nil {
+		t.Fatalf("git checkout --detach: %v", err)
+	}
+	detachedSHA, ok := resolveHeadSHA(workDir)
+	if !ok || detachedSHA != wantSHA {
+		t.Fatalf("resolveHeadSHA(detached) = (%q, %v), want (%q, true)", detachedSHA, ok, wantSHA)
+	}
+	gotDetached, err := g.RevParse(ctx, "HEAD")
+	if err != nil || gotDetached != wantSHA {
+		t.Fatalf("RevParse(HEAD) detached = (%q, %v), want (%q, nil)", gotDetached, err, wantSHA)
+	}
+}

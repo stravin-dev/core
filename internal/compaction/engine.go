@@ -137,6 +137,11 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	}, nil
 }
 
+// MaxBatchSize returns the configured maximum number of input packs compacted in a single batch.
+func (e *Engine) MaxBatchSize() int {
+	return e.maxBatchSize
+}
+
 // CompactShard claims the shard lease, runs the requested Tier-0 or Tier-1
 // strategy, executes the two-phase manifest swap (Publish -> Supersede), and
 // releases the shard lease.

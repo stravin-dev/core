@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	defaultPollInterval = 2 * time.Second
-	defaultGCInterval   = 5 * time.Minute
+	defaultPollInterval        = 2 * time.Second
+	defaultGCInterval          = 5 * time.Minute
+	maxConsecutiveTier0Batches = 10
 )
 
 // RepoTarget describes a repository tracked by the daemon scheduling loop for
@@ -143,7 +144,40 @@ func (w *Worker) stepQueued(ctx context.Context) (JobResult, bool, error) {
 		return JobResult{}, false, nil
 	}
 	res, err := w.engine.CompactShard(ctx, target)
-	return res, true, err
+	if err != nil || res.Skipped {
+		return res, true, err
+	}
+
+	isTier0 := target.Tier == "" || target.Tier == Tier0
+	maxBatch := w.engine.MaxBatchSize()
+	if !isTier0 || maxBatch <= 0 || res.InputPacks < maxBatch {
+		return res, true, nil
+	}
+
+	total := res
+	for batch := 1; batch < maxConsecutiveTier0Batches; batch++ {
+		if ctx.Err() != nil {
+			return total, true, ctx.Err()
+		}
+		next, nextErr := w.engine.CompactShard(ctx, target)
+		if nextErr != nil {
+			return total, true, nextErr
+		}
+		if next.Skipped {
+			break
+		}
+		total.InputPacks += next.InputPacks
+		total.BytesReclaimed += next.BytesReclaimed
+		total.OutputPackID = next.OutputPackID
+		total.OutputSize = next.OutputSize
+		total.AuxMIDXKey = next.AuxMIDXKey
+		total.AuxGraphKey = next.AuxGraphKey
+		total.BundleKey = next.BundleKey
+		if next.InputPacks < maxBatch {
+			break
+		}
+	}
+	return total, true, nil
 }
 
 func (w *Worker) compactionLoop(ctx context.Context) {
