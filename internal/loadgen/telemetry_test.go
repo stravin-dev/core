@@ -32,6 +32,7 @@ func TestInMemoryTelemetryExportsTracesMetricsLogsOnShutdown(t *testing.T) {
 	tel.RecordFsckFailure(ctx, "smoke")
 	tel.AddActiveThreads(ctx, PersonaDev, 1)
 	tel.AddActiveThreads(ctx, PersonaDev, -1)
+	tel.RecordGC(ctx, PersonaDev, GCTriggerPacks, "ok")
 	span.End()
 
 	// Collect metrics before shutdown (ManualReader collects on demand).
@@ -84,6 +85,7 @@ func TestInMemoryTelemetryExportsTracesMetricsLogsOnShutdown(t *testing.T) {
 		"stravin_loadgen_unexpected_errors_total",
 		"stravin_loadgen_fsck_failures_total",
 		"stravin_loadgen_active_threads",
+		"stravin_loadgen_gc_runs_total",
 	}
 	for _, name := range requiredMetrics {
 		if !found[name] {

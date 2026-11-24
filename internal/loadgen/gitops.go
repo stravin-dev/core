@@ -110,10 +110,7 @@ func isAuthorEnvVar(kv string) bool {
 
 // Run executes a git command with context cancellation and structured error capture.
 func (g *GitClient) Run(ctx context.Context, args ...string) (string, error) {
-	op := "git"
-	if len(args) > 0 {
-		op = args[0]
-	}
+	op := extractGitOp(args)
 
 	cmdCtx := ctx
 	if g.opts.CmdTimeout > 0 {
@@ -407,6 +404,23 @@ func isValidHexOID(s string) bool {
 func (g *GitClient) Fsck(ctx context.Context) error {
 	_, err := g.Run(ctx, "fsck", "--full", "--strict")
 	return err
+}
+
+// GC runs synchronous foreground garbage collection in workDir.
+func (g *GitClient) GC(ctx context.Context) error {
+	_, err := g.Run(ctx, "-c", "gc.autoDetach=false", "gc")
+	return err
+}
+
+func extractGitOp(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-c" && i+1 < len(args) {
+			i++
+			continue
+		}
+		return args[i]
+	}
+	return "git"
 }
 
 func (g *GitClient) buildArgs(args []string) []string {

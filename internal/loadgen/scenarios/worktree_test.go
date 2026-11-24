@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -246,5 +247,113 @@ func TestFreshCloneExemptionsStillCloneFresh(t *testing.T) {
 					tc.name, tc.wantOp, after-before, tc.minDelta, before, after)
 			}
 		})
+	}
+}
+
+func collectGCRunCount(t *testing.T, exp *loadgen.InMemoryExporters) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := exp.MetricReader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("MetricReader.Collect: %v", err)
+	}
+	var total int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "stravin_loadgen_gc_runs_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				continue
+			}
+			for _, dp := range sum.DataPoints {
+				total += dp.Value
+			}
+		}
+	}
+	return total
+}
+
+func TestAcquireWorktreeCleanupTriggersOnDemandGCAndRecordsTelemetry(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	initBareRepo(t, root, "loadgen", "repo-1", 1)
+
+	env, exp := newTelemetryTestEnv(t, root, loadgen.PersonaAgent, 0, 606)
+	env.BaseClones.SetGCThresholds(loadgen.GCThresholds{MaxPacks: 2, MaxLooseObjects: loadgen.DefaultGCLooseThreshold})
+
+	// Warm base clone via acquireWorktree.
+	ent := NewEntropy(env.RNG)
+	_, cleanup1, err := acquireWorktree(ctx, env, "test_gc", repoURL(env), ent, "wt-gc-1")
+	if err != nil {
+		t.Fatalf("1st acquireWorktree: %v", err)
+	}
+	cleanup1()
+
+	if got := collectGCRunCount(t, exp); got != 0 {
+		t.Fatalf("expected 0 GC runs below threshold, got %d", got)
+	}
+
+	baseDir, ok := env.BaseClones.Get("repo-1")
+	if !ok {
+		t.Fatal("expected repo-1 cached in BaseClones")
+	}
+
+	// Acquire a second worktree, push a commit to create a 2nd packfile in baseDir,
+	// then run cleanup() and verify on-demand GC fires after worktree removal.
+	wtGit, cleanup2, err := acquireWorktree(ctx, env, "test_gc", repoURL(env), ent, "wt-gc-2")
+	if err != nil {
+		t.Fatalf("2nd acquireWorktree: %v", err)
+	}
+	baseGit := env.Git.WithWorkDir(baseDir)
+	if _, err := baseGit.Run(ctx, "repack", "-d"); err != nil {
+		t.Fatalf("1st base repack: %v", err)
+	}
+	if err := wtGit.CheckoutNewBranch(ctx, "gc-test-branch"); err != nil {
+		t.Fatalf("CheckoutNewBranch: %v", err)
+	}
+	if err := wtGit.WriteFile("extra.txt", []byte("extra pack\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wtGit.AddAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := wtGit.Commit(ctx, "extra commit"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := baseGit.Run(ctx, "repack", "-d"); err != nil {
+		t.Fatalf("2nd base repack: %v", err)
+	}
+
+	cleanup2()
+
+	assertNoWorktreeLeaks(t, baseDir)
+	if got := collectGCRunCount(t, exp); got != 1 {
+		t.Fatalf("stravin_loadgen_gc_runs_total = %d, want 1", got)
+	}
+
+	foundGCSpan := false
+	for _, sp := range exp.SpanExporter.Spans() {
+		if sp.Name() == "loadgen.base_clone.gc" {
+			foundGCSpan = true
+			break
+		}
+	}
+	if !foundGCSpan {
+		t.Fatal("expected loadgen.base_clone.gc span to be exported")
+	}
+
+	packEntries, err := os.ReadDir(filepath.Join(baseDir, ".git", "objects", "pack"))
+	if err != nil {
+		t.Fatalf("ReadDir pack: %v", err)
+	}
+	idxCount := 0
+	for _, entry := range packEntries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".idx") {
+			idxCount++
+		}
+	}
+	if idxCount != 1 {
+		t.Fatalf("expected packfiles consolidated to 1 .idx after GC, got %d", idxCount)
 	}
 }

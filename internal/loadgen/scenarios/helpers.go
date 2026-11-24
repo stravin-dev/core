@@ -11,6 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"stravin.dev/core/internal/loadgen"
 )
 
@@ -109,7 +113,7 @@ func acquireWorktree(
 	}
 
 	worktreeDir := filepath.Join(env.WorkDir, fmt.Sprintf("%s-%d-%s", prefix, env.WorkerID, ent.HexID()))
-	cleanup := func() {
+	removeWorktree := func() {
 		cleanCtx, cancel := context.WithTimeout(context.Background(), worktreeCleanupTimeout)
 		defer cancel()
 		if err := baseGit.WorktreeRemove(cleanCtx, worktreeDir); err != nil {
@@ -119,12 +123,93 @@ func acquireWorktree(
 	}
 
 	if err := baseGit.WorktreeAddDetach(ctx, worktreeDir, startPoint); err != nil {
-		cleanup()
+		removeWorktree()
 		return nil, func() {}, err
+	}
+
+	cleanup := func() {
+		removeWorktree()
+		if ctx.Err() == nil {
+			maybeGCBaseClone(ctx, env, scenario, baseGit)
+		}
 	}
 
 	name, email := workerAuthor(env)
 	return env.Git.WithWorkDir(worktreeDir).WithAuthor(name, email), cleanup, nil
+}
+
+func maybeGCBaseClone(ctx context.Context, env *loadgen.ScenarioEnv, scenario string, baseGit *loadgen.GitClient) {
+	if env.BaseClones == nil || baseGit == nil {
+		return
+	}
+	status := env.BaseClones.InspectGC(baseGit.WorkDir())
+	if status.Trigger == loadgen.GCTriggerNone {
+		return
+	}
+
+	gcCtx := ctx
+	var span trace.Span
+	if env.Telemetry != nil && env.Telemetry.Tracer != nil {
+		gcCtx, span = env.Telemetry.Tracer.Start(ctx, "loadgen.base_clone.gc",
+			trace.WithAttributes(
+				attribute.String("persona", string(env.Persona)),
+				attribute.String("scenario", scenario),
+				attribute.String("repo", env.Repo),
+				attribute.Int("worker_id", env.WorkerID),
+				attribute.String("trigger", string(status.Trigger)),
+				attribute.Int("pack_count", status.PackCount),
+				attribute.Int("loose_bucket_count", status.LooseBucketCount),
+			),
+		)
+		defer span.End()
+	}
+
+	res, err := env.BaseClones.MaybeGC(gcCtx, baseGit)
+	if !res.Triggered {
+		return
+	}
+
+	outcome := "ok"
+	if err != nil {
+		outcome = "error"
+		if span != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		if env.Logger != nil {
+			env.Logger.WarnContext(gcCtx, "base clone on-demand git gc failed",
+				"persona", string(env.Persona),
+				"scenario", scenario,
+				"repo", env.Repo,
+				"worker_id", env.WorkerID,
+				"trigger", string(res.Trigger),
+				"pack_count", res.PackCount,
+				"loose_bucket_count", res.LooseBucketCount,
+				"duration_ms", res.Duration.Milliseconds(),
+				"error", err.Error(),
+			)
+		}
+	} else {
+		if span != nil {
+			span.SetStatus(codes.Ok, "")
+		}
+		if env.Logger != nil {
+			env.Logger.InfoContext(gcCtx, "base clone on-demand git gc completed",
+				"persona", string(env.Persona),
+				"scenario", scenario,
+				"repo", env.Repo,
+				"worker_id", env.WorkerID,
+				"trigger", string(res.Trigger),
+				"pack_count", res.PackCount,
+				"loose_bucket_count", res.LooseBucketCount,
+				"duration_ms", res.Duration.Milliseconds(),
+			)
+		}
+	}
+
+	if env.Telemetry != nil {
+		env.Telemetry.RecordGC(gcCtx, env.Persona, res.Trigger, outcome)
+	}
 }
 
 func resolveBaseStartPoint(ctx context.Context, baseGit *loadgen.GitClient) (string, bool) {
