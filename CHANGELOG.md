@@ -1,3 +1,11 @@
+# [1.12.0](https://github.com/stravin-dev/core/compare/v1.11.0...v1.12.0) (2026-11-24)
+
+
+### Features
+
+* **observability:** add edge pack-cache, ingress, hook, and node queue metrics ([ff61307](https://github.com/stravin-dev/core/commit/ff61307922712e9bb40ffe94b1faa238af591c1c))
+* **observability:** add Valkey pack-cache, edge, hook, and missing node queue metrics ([#186](https://github.com/stravin-dev/core/issues/186)) ([b23bb60](https://github.com/stravin-dev/core/commit/b23bb60dfa552b8096bc1fed19f36012d2826734))
+
 # [1.11.0](https://github.com/stravin-dev/core/compare/v1.10.3...v1.11.0) (2026-11-24)
 
 
