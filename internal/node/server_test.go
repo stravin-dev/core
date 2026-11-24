@@ -1442,7 +1442,8 @@ func TestServer_UploadPackV2LsRefsBypassesSemaphoreAndBundleURI(t *testing.T) {
 		t.Fatal("timed out waiting for fetch to hold upload-pack slot")
 	}
 
-	// 2. Send a v2 ls-refs request split across two frames while the slot is full.
+	// 2. Send a v2 ls-refs request with an unrecognized extension arg (triggers
+	// git-upload-pack fallback) split across two frames while the slot is full.
 	lsCtx := metadata.AppendToOutgoingContext(context.Background(), HeaderStatelessRPC, "true")
 	lsStream, err := client.OpenStream(lsCtx, rpc.RequestMeta{
 		TenantID:    rk.TenantID,
@@ -1453,7 +1454,7 @@ func TestServer_UploadPackV2LsRefsBypassesSemaphoreAndBundleURI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStream ls-refs: %v", err)
 	}
-	fullLsRefs := append(EncodePktLine([]byte("command=ls-refs\n")), []byte("00010000")...)
+	fullLsRefs := buildV2Request("ls-refs", nil, []string{"x-fallback-test"})
 	if err := lsStream.Send(&rpc.Frame{Data: fullLsRefs[:6]}); err != nil {
 		t.Fatalf("Send frame 1: %v", err)
 	}

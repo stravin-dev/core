@@ -628,9 +628,10 @@ func TestMaterializer_PrunesSupersededPacksAfterCompaction(t *testing.T) {
 	packStore.Put(packMerged, []byte("PACK-MERGED"), []byte("IDX-MERGED"))
 
 	mat, err := NewMaterializer(MaterializerConfig{
-		Meta:  metaStore,
-		Packs: packStore,
-		Cache: c,
+		Meta:                   metaStore,
+		Packs:                  packStore,
+		Cache:                  c,
+		PruneReconcileInterval: time.Nanosecond,
 	})
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
@@ -705,9 +706,10 @@ func TestMaterializer_PrunesSupersededPacksWhileNewerReadersPinned(t *testing.T)
 	packStore.Put(packMerged, []byte("PACK-MERGED"), []byte("IDX-MERGED"))
 
 	mat, err := NewMaterializer(MaterializerConfig{
-		Meta:  metaStore,
-		Packs: packStore,
-		Cache: c,
+		Meta:                   metaStore,
+		Packs:                  packStore,
+		Cache:                  c,
+		PruneReconcileInterval: time.Nanosecond,
 	})
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
@@ -1039,6 +1041,7 @@ func TestMaterializer_RefreshAuxIndexesRecoversFromStaleLocks(t *testing.T) {
 		Cache:                   c,
 		GitExecutor:             gitExec,
 		AuxIndexRefreshInterval: -1,
+		PruneReconcileInterval:  time.Nanosecond,
 	})
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
@@ -1413,6 +1416,7 @@ func TestMaterializer_MIDXAndBitmapStayActiveDuringDeferredPruneAndUnlink(t *tes
 		Cache:                   c,
 		GitExecutor:             gitExec,
 		AuxIndexRefreshInterval: -1,
+		PruneReconcileInterval:  time.Nanosecond,
 	})
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
@@ -2291,5 +2295,69 @@ func TestMaterializer_VersionZeroAlwaysQueries(t *testing.T) {
 	}
 	if metaStore.QueryManifestCalls() <= qAfter1 {
 		t.Fatalf("QueryManifestCalls = %d, want > %d for version 0", metaStore.QueryManifestCalls(), qAfter1)
+	}
+}
+
+func TestMaterializer_SkipsImmediatePruneOnFetchWithinReconcileInterval(t *testing.T) {
+	ctx := context.Background()
+	rk, _ := tenant.NewRepoKey("acme", "skip-prune-on-fetch")
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	metaStore := newFakeMetadataStore()
+	packStore := newFakePackFetcher()
+
+	pack1 := strings.Repeat("7", 64)
+	pack2 := strings.Repeat("8", 64)
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo: rk, HomeRegion: "us-east-1", FailoverEpoch: 1, RefShards: 1, ManifestShards: 1, WriteState: lease.ModeActive,
+	})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FE1", PackID: pack1, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	packStore.Put(pack1, []byte("PACK-1"), []byte("IDX-1"))
+	packStore.Put(pack2, []byte("PACK-2"), []byte("IDX-2"))
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:                   metaStore,
+		Packs:                  packStore,
+		Cache:                  c,
+		PruneReconcileInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	// First sync reconciles once and sets lastReconcile[rk].
+	res1, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(1): %v", err)
+	}
+	res1.Handle.Release()
+
+	// Publish pack2 and supersede pack1 while still within PruneReconcileInterval (1h).
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01ARZ3NDEKTSV4RRFFQ69G5FE2", PackID: pack2, Status: ddb.PackStatusActive, OriginRegion: "us-east-1",
+	})
+	metaStore.SetManifestStatus(rk, 0, "01ARZ3NDEKTSV4RRFFQ69G5FE1", ddb.PackStatusCompacted)
+
+	qBefore := metaStore.QueryManifestCalls()
+	res2, err := mat.SyncAndPin(ctx, rk)
+	if err != nil {
+		t.Fatalf("SyncAndPin(2): %v", err)
+	}
+	res2.Handle.Release()
+
+	if res2.PacksFetched != 1 {
+		t.Fatalf("PacksFetched = %d, want 1", res2.PacksFetched)
+	}
+	// Only the incremental watermark query should have run (1 call), NOT an extra activeOnly prune scan.
+	if got := metaStore.QueryManifestCalls() - qBefore; got != 1 {
+		t.Fatalf("QueryManifestCalls delta = %d, want 1 (prune scan must be deferred until PruneReconcileInterval)", got)
+	}
+	if !c.HasPack(rk, pack1) || !c.HasPack(rk, pack2) {
+		t.Fatalf("expected both pack1 (unpruned until interval) and pack2 cached, got %v", c.CachedPackIDs(rk))
 	}
 }

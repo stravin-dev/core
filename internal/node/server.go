@@ -186,6 +186,7 @@ type Server struct {
 	region                 string
 	uploadPackSem          chan struct{}
 	uploadPackQueueTimeout time.Duration
+	packCache              *uploadPackResponseCache
 }
 
 var _ rpc.GitWireHandler = (*Server)(nil)
@@ -240,6 +241,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		region:                 cfg.Region,
 		uploadPackSem:          make(chan struct{}, maxUploadPacks),
 		uploadPackQueueTimeout: queueTimeout,
+		packCache:              newUploadPackResponseCache(defaultPackCacheMaxBytes, defaultPackCacheMaxEntryBytes),
 	}, nil
 }
 
@@ -296,6 +298,64 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 		return nil, s.serveAdvertiseRefs(ctx, repo, meta.GitProtocol, stream)
 	}
 
+	statelessRPC := boolHeader(ctx, HeaderStatelessRPC)
+
+	var (
+		peekedBytes  []byte
+		peekEOF      bool
+		isV2LsRefs   bool
+		finishFlight func([]byte)
+	)
+	if statelessRPC && rpc.GitProtocolVersion(meta.GitProtocol) == "2" {
+		var (
+			cmdKind v2CommandKind
+			err     error
+		)
+		peekedBytes, peekEOF, cmdKind, err = readBoundedV2Request(stream)
+		if err != nil {
+			return nil, err
+		}
+		isV2LsRefs = cmdKind == v2CmdLsRefs
+
+		if isV2LsRefs && peekEOF {
+			if lsReq, ok := parseV2LsRefsRequest(peekedBytes); ok {
+				repoMeta, refs, loadErr := s.materializer.LoadAuthoritativeRefs(ctx, repo)
+				if loadErr != nil {
+					if errors.Is(loadErr, ddb.ErrNotFound) {
+						return nil, status.Errorf(codes.NotFound, "repository %s not found", repo)
+					}
+					return nil, status.Errorf(codes.Internal, "load refs %s: %v", repo, loadErr)
+				}
+				if payload, needsFallback := encodeV2LsRefsResponse(refs, repoMeta.DefaultBranch, lsReq); !needsFallback {
+					w := &streamChunkWriter{stream: stream}
+					if _, wErr := w.Write(payload); wErr != nil {
+						return nil, wErr
+					}
+					return nil, stream.Send(&rpc.Frame{EOF: true, ExitCode: 0})
+				}
+			}
+		}
+
+		if cmdKind == v2CmdFetch && peekEOF && s.packCache != nil && isCacheableV2FullCloneFetch(peekedBytes) {
+			cacheKey := uploadPackCacheKey(repo, meta.GitProtocol, peekedBytes)
+			cachedResp, finish, hit, waitErr := s.packCache.GetOrJoin(ctx, cacheKey)
+			if waitErr != nil {
+				return nil, status.FromContextError(waitErr).Err()
+			}
+			if hit {
+				w := &streamChunkWriter{stream: stream}
+				if _, wErr := w.Write(cachedResp); wErr != nil {
+					return nil, wErr
+				}
+				return nil, stream.Send(&rpc.Frame{EOF: true, ExitCode: 0})
+			}
+			if finish != nil {
+				finishFlight = finish
+				defer finishFlight(nil)
+			}
+		}
+	}
+
 	syncRes, err := s.materializer.SyncAndPin(ctx, repo)
 	if err != nil {
 		if errors.Is(err, ddb.ErrNotFound) {
@@ -304,20 +364,6 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 		return nil, status.Errorf(codes.Internal, "sync repository %s: %v", repo, err)
 	}
 	defer syncRes.Handle.Release()
-
-	statelessRPC := boolHeader(ctx, HeaderStatelessRPC)
-
-	var (
-		peekedBytes []byte
-		peekEOF     bool
-		isV2LsRefs  bool
-	)
-	if statelessRPC && rpc.GitProtocolVersion(meta.GitProtocol) == "2" {
-		peekedBytes, peekEOF, isV2LsRefs, err = peekV2LsRefs(stream)
-		if err != nil {
-			return nil, err
-		}
-	}
 
 	if !isV2LsRefs {
 		releaseSlot, slotErr := s.acquireUploadPackSlot(ctx)
@@ -377,6 +423,18 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 	}()
 
 	stdoutW := &streamChunkWriter{stream: stream}
+	var (
+		execStdout io.Writer = stdoutW
+		captureW   *boundedCaptureWriter
+	)
+	if finishFlight != nil && s.packCache != nil && s.packCache.maxEntryBytes > 0 {
+		captureW = &boundedCaptureWriter{
+			dst:      stdoutW,
+			maxBytes: s.packCache.maxEntryBytes,
+		}
+		execStdout = captureW
+	}
+
 	var stderrBuf bytes.Buffer
 	var bundleURI string
 	if !isV2LsRefs {
@@ -390,7 +448,7 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 		GitProtocol:  meta.GitProtocol,
 		BundleURI:    bundleURI,
 		Stdin:        stdinR,
-		Stdout:       stdoutW,
+		Stdout:       execStdout,
 		Stderr:       &stderrBuf,
 	})
 
@@ -428,6 +486,14 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 			return nil, sendErr
 		}
 		return execErr, nil
+	}
+
+	if finishFlight != nil {
+		if captureW != nil && !captureW.exceeded {
+			finishFlight(captureW.buf.Bytes())
+		} else {
+			finishFlight(nil)
+		}
 	}
 
 	s.logger.DebugContext(execCtx, "node: git-upload-pack completed",
@@ -508,50 +574,6 @@ func (s *Server) serveAdvertiseRefs(ctx context.Context, repoKey tenant.RepoKey,
 		}
 	}
 	return stream.Send(&rpc.Frame{EOF: true, ExitCode: 0})
-}
-
-// peekV2LsRefs reads just enough initial stream frames to determine whether the
-// first Protocol v2 pkt-line is `command=ls-refs`, returning the exact buffered
-// bytes for verbatim replay into git-upload-pack stdin.
-func peekV2LsRefs(stream rpc.GitWireStream) (peeked []byte, peekEOF bool, isLsRefs bool, err error) {
-	var buf []byte
-	for {
-		frame, recvErr := stream.Recv()
-		if errors.Is(recvErr, io.EOF) {
-			return buf, true, isV2LsRefsPktLine(buf), nil
-		}
-		if recvErr != nil {
-			return nil, false, false, recvErr
-		}
-		if len(frame.Data) > 0 {
-			buf = append(buf, frame.Data...)
-		}
-		if frame.EOF {
-			return buf, true, isV2LsRefsPktLine(buf), nil
-		}
-		if len(buf) < 4 {
-			continue
-		}
-		pktLen, parseErr := strconv.ParseInt(string(buf[:4]), 16, 32)
-		if parseErr != nil || pktLen < 4 || pktLen > maxV2PeekPktLen {
-			return buf, false, false, nil
-		}
-		if len(buf) >= int(pktLen) {
-			return buf, false, isV2LsRefsPktLine(buf), nil
-		}
-	}
-}
-
-func isV2LsRefsPktLine(buf []byte) bool {
-	if len(buf) < 4 {
-		return false
-	}
-	pktLen, err := strconv.ParseInt(string(buf[:4]), 16, 32)
-	if err != nil || pktLen < 4 || int(pktLen) > len(buf) {
-		return false
-	}
-	payload := string(buf[4:pktLen])
-	return payload == "command=ls-refs\n" || payload == "command=ls-refs"
 }
 
 func (s *Server) resolveBundleURI(ctx context.Context, repo tenant.RepoKey, gitProtocol string) string {
