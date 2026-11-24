@@ -172,6 +172,27 @@ func (g *GitClient) Clone(ctx context.Context, repoURL, destDir string) error {
 	return err
 }
 
+// WorktreeAddDetach creates a new detached linked worktree at destDir checked out at ref.
+func (g *GitClient) WorktreeAddDetach(ctx context.Context, destDir, ref string) error {
+	if err := os.MkdirAll(filepath.Dir(destDir), 0o750); err != nil {
+		return err
+	}
+	_, err := g.Run(ctx, "worktree", "add", "--detach", destDir, ref)
+	return err
+}
+
+// WorktreeRemove forcibly removes a linked worktree at destDir.
+func (g *GitClient) WorktreeRemove(ctx context.Context, destDir string) error {
+	_, err := g.Run(ctx, "worktree", "remove", "--force", destDir)
+	return err
+}
+
+// WorktreePrune removes stale linked worktree administrative metadata.
+func (g *GitClient) WorktreePrune(ctx context.Context) error {
+	_, err := g.Run(ctx, "worktree", "prune")
+	return err
+}
+
 // Fetch fetches from remote (or "origin" when empty).
 func (g *GitClient) Fetch(ctx context.Context, remote string, refspecs ...string) error {
 	if remote == "" {
@@ -280,17 +301,20 @@ func (g *GitClient) RevParse(ctx context.Context, rev string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
-// resolveHeadSHA resolves HEAD directly from .git/HEAD and loose ref files
-// without spawning a git subprocess. Returns ("", false) for unborn refs,
-// packed-refs, reftables, worktree .git files, or any non-standard layout so
-// callers fall back cleanly to `git rev-parse HEAD`.
+// resolveHeadSHA resolves HEAD directly from .git/HEAD (including linked worktree
+// .git gitdir pointers) and loose ref files without spawning a git subprocess.
+// Returns ("", false) for unborn refs, packed-refs, reftables, or any non-standard
+// layout so callers fall back cleanly to `git rev-parse HEAD`.
 func resolveHeadSHA(workDir string) (string, bool) {
 	if workDir == "" {
 		return "", false
 	}
-	gitDir := filepath.Clean(filepath.Join(workDir, ".git"))
+	gitDir, commonDir, ok := resolveGitDirs(workDir)
+	if !ok {
+		return "", false
+	}
 	headPath := filepath.Join(gitDir, "HEAD")
-	headBytes, err := os.ReadFile(headPath) //#nosec G304 -- workDir is a loadgen-managed local repository directory
+	headBytes, err := os.ReadFile(headPath) //#nosec G304 -- gitDir is resolved from a loadgen-managed local repository directory
 	if err != nil {
 		return "", false
 	}
@@ -301,11 +325,11 @@ func resolveHeadSHA(workDir string) (string, bool) {
 		if refRel == "" || filepath.IsAbs(cleanRef) || strings.HasPrefix(cleanRef, "..") {
 			return "", false
 		}
-		refPath := filepath.Clean(filepath.Join(gitDir, cleanRef))
-		if !strings.HasPrefix(refPath, gitDir+string(filepath.Separator)) {
+		refPath := filepath.Clean(filepath.Join(commonDir, cleanRef))
+		if !strings.HasPrefix(refPath, commonDir+string(filepath.Separator)) {
 			return "", false
 		}
-		refBytes, refErr := os.ReadFile(refPath) //#nosec G304,G703 -- refPath is verified to stay within .git inside workDir
+		refBytes, refErr := os.ReadFile(refPath) //#nosec G304,G703 -- refPath is verified to stay within commonDir
 		if refErr != nil {
 			return "", false
 		}
@@ -319,6 +343,49 @@ func resolveHeadSHA(workDir string) (string, bool) {
 		return head, true
 	}
 	return "", false
+}
+
+// resolveGitDirs returns the per-worktree gitDir and shared commonDir for workDir.
+func resolveGitDirs(workDir string) (gitDir, commonDir string, ok bool) {
+	dotGit := filepath.Clean(filepath.Join(workDir, ".git"))
+	info, err := os.Stat(dotGit)
+	if err != nil {
+		return "", "", false
+	}
+	if info.IsDir() {
+		return dotGit, dotGit, true
+	}
+
+	// Linked git worktree: .git is a file containing "gitdir: <path>".
+	content, err := os.ReadFile(dotGit) //#nosec G304 -- dotGit is inside a loadgen-managed local worktree directory
+	if err != nil {
+		return "", "", false
+	}
+	line := strings.TrimSpace(string(content))
+	if !strings.HasPrefix(line, "gitdir:") {
+		return "", "", false
+	}
+	target := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+	if target == "" {
+		return "", "", false
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(workDir, target)
+	}
+	gitDir = filepath.Clean(target)
+	commonDir = gitDir
+
+	if commonBytes, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil { //#nosec G304,G703 -- commondir is a standard git worktree metadata file inside gitDir
+		rel := strings.TrimSpace(string(commonBytes))
+		if rel != "" {
+			if filepath.IsAbs(rel) {
+				commonDir = filepath.Clean(rel)
+			} else {
+				commonDir = filepath.Clean(filepath.Join(gitDir, rel))
+			}
+		}
+	}
+	return gitDir, commonDir, true
 }
 
 func isValidHexOID(s string) bool {

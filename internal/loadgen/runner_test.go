@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -326,5 +329,106 @@ func TestRunnerClassifiesPerCommandTimeoutAsTransientNotCanceled(t *testing.T) {
 	}
 	if res.Oracle.HasFailures() {
 		t.Fatalf("expected 0 unexpected failures for per-command timeout, got %+v", res.Oracle)
+	}
+}
+
+func TestBaseCloneCacheIsolationAndSanitization(t *testing.T) {
+	baseRoot := filepath.Join(t.TempDir(), "base")
+	cache := NewBaseCloneCache(baseRoot)
+
+	if dir, ok := cache.Get("repo-1"); ok || dir != "" {
+		t.Fatalf("expected cache miss, got (%q, %v)", dir, ok)
+	}
+
+	dir1 := cache.Dir("repo-1")
+	dir2 := cache.Dir("org/repo-2")
+	dirTraversal := cache.Dir("../../evil")
+	if !strings.HasPrefix(dir1, baseRoot+string(filepath.Separator)) {
+		t.Fatalf("dir1 %q escaped baseRoot %q", dir1, baseRoot)
+	}
+	if !strings.HasPrefix(dir2, baseRoot+string(filepath.Separator)) {
+		t.Fatalf("dir2 %q escaped baseRoot %q", dir2, baseRoot)
+	}
+	if !strings.HasPrefix(dirTraversal, baseRoot+string(filepath.Separator)) {
+		t.Fatalf("dirTraversal %q escaped baseRoot %q", dirTraversal, baseRoot)
+	}
+	if dir1 == dir2 {
+		t.Fatalf("distinct repos collided on %q", dir1)
+	}
+
+	cache.Set("repo-1", dir1)
+	got, ok := cache.Get("repo-1")
+	if !ok || got != dir1 {
+		t.Fatalf("Get(repo-1) = (%q, %v), want (%q, true)", got, ok, dir1)
+	}
+
+	cache.Delete("repo-1")
+	if _, ok := cache.Get("repo-1"); ok {
+		t.Fatal("expected cache miss after Delete")
+	}
+}
+
+func TestRunnerProvidesIsolatedPerWorkerBaseCloneCache(t *testing.T) {
+	var mu sync.Mutex
+	cachesByWorker := make(map[string][]*BaseCloneCache)
+
+	reg := NewRegistry()
+	record := func(ctx context.Context, env *ScenarioEnv) error {
+		if env.BaseClones == nil {
+			return errors.New("expected non-nil env.BaseClones")
+		}
+		key := fmt.Sprintf("%s-%d", env.Persona, env.WorkerID)
+		mu.Lock()
+		cachesByWorker[key] = append(cachesByWorker[key], env.BaseClones)
+		mu.Unlock()
+		return nil
+	}
+	reg.MustRegister(&stubScenario{name: "dev-cache", persona: PersonaDev, weight: 10, fn: record})
+	reg.MustRegister(&stubScenario{name: "agent-cache", persona: PersonaAgent, weight: 10, fn: record})
+
+	cfg := DefaultConfig()
+	cfg.Devs = 2
+	cfg.Agents = 2
+	cfg.Seed = 42
+	cfg.ThinkMin = 1 * time.Millisecond
+	cfg.ThinkMax = 2 * time.Millisecond
+	cfg.Duration = 80 * time.Millisecond
+
+	var logBuf bytes.Buffer
+	tel, _, err := NewInMemoryTelemetry(&logBuf)
+	if err != nil {
+		t.Fatalf("NewInMemoryTelemetry: %v", err)
+	}
+	defer func() { _ = tel.Shutdown(context.Background()) }()
+
+	runner, err := NewRunner(cfg, reg, tel, NewOracle())
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	res := runner.Run(context.Background())
+	if res.Oracle.HasFailures() {
+		t.Fatalf("unexpected failures: %+v", res.Failures)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(cachesByWorker) != 4 {
+		t.Fatalf("expected 4 distinct workers, got %d", len(cachesByWorker))
+	}
+	seenPtrs := make(map[*BaseCloneCache]string)
+	for workerKey, caches := range cachesByWorker {
+		if len(caches) < 2 {
+			t.Fatalf("worker %s only ran %d time(s); want >= 2 to verify reuse", workerKey, len(caches))
+		}
+		first := caches[0]
+		for _, c := range caches[1:] {
+			if c != first {
+				t.Fatalf("worker %s received different BaseCloneCache instances across scenarios", workerKey)
+			}
+		}
+		if other, dup := seenPtrs[first]; dup {
+			t.Fatalf("workers %s and %s shared the same BaseCloneCache instance", workerKey, other)
+		}
+		seenPtrs[first] = workerKey
 	}
 }
