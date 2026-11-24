@@ -40,6 +40,8 @@ const (
 
 	httpStreamSmallChunkThreshold = 32 * 1024
 	httpStreamFlushThreshold      = 256 * 1024
+
+	infoRefsRetryBackoff = 15 * time.Millisecond
 )
 
 var (
@@ -241,8 +243,17 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	exitCode, err := h.proxy.ProxyStream(proxyCtx, peer, rpcMeta, stdin, sw, nil)
+	if err != nil && route.kind == routeInfoRefs && !sw.wroteHeader && isTransientInfoRefsError(ctx, err) {
+		timer := time.NewTimer(infoRefsRetryBackoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-timer.C:
+			exitCode, err = h.proxy.ProxyStream(proxyCtx, peer, rpcMeta, stdin, sw, nil)
+		}
+	}
 	if err != nil {
-		h.handleProxyError(w, ctx, sw, route.metricOp, err, start)
+		h.handleProxyError(w, ctx, sw, route, err, start)
 		return
 	}
 
@@ -298,34 +309,58 @@ func (h *HTTPHandler) handleBodyError(w http.ResponseWriter, ctx context.Context
 	http.Error(w, "invalid gzip request body", http.StatusBadRequest)
 }
 
-func (h *HTTPHandler) handleProxyError(w http.ResponseWriter, ctx context.Context, sw *smartHTTPStreamWriter, metricOp string, err error, start time.Time) {
+func (h *HTTPHandler) handleProxyError(w http.ResponseWriter, ctx context.Context, sw *smartHTTPStreamWriter, route smartHTTPRoute, err error, start time.Time) {
 	switch {
 	case errors.Is(err, ErrRateLimited):
-		h.metrics.RecordRequest(ctx, "http", metricOp, strconv.Itoa(http.StatusTooManyRequests), "rate_limited", time.Since(start))
+		h.metrics.RecordRequest(ctx, "http", route.metricOp, strconv.Itoa(http.StatusTooManyRequests), "rate_limited", time.Since(start))
 		if !sw.wroteHeader {
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		}
 	case errors.Is(err, ErrDecompressedBodyTooLarge):
-		h.metrics.RecordRequest(ctx, "http", metricOp, strconv.Itoa(http.StatusRequestEntityTooLarge), "payload_too_large", time.Since(start))
+		h.metrics.RecordRequest(ctx, "http", route.metricOp, strconv.Itoa(http.StatusRequestEntityTooLarge), "payload_too_large", time.Since(start))
 		if !sw.wroteHeader {
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		}
 	case errors.Is(err, ErrInvalidGzipBody):
-		h.metrics.RecordRequest(ctx, "http", metricOp, strconv.Itoa(http.StatusBadRequest), "invalid_request", time.Since(start))
+		h.metrics.RecordRequest(ctx, "http", route.metricOp, strconv.Itoa(http.StatusBadRequest), "invalid_request", time.Since(start))
 		if !sw.wroteHeader {
 			http.Error(w, "invalid gzip request body", http.StatusBadRequest)
 		}
 	case isClientCanceled(ctx, err):
-		h.metrics.RecordRequest(ctx, "http", metricOp, strconv.Itoa(httpStatusClientClosedRequest), "client_canceled", time.Since(start))
+		h.metrics.RecordRequest(ctx, "http", route.metricOp, strconv.Itoa(httpStatusClientClosedRequest), "client_canceled", time.Since(start))
 		if !sw.wroteHeader {
 			w.WriteHeader(httpStatusClientClosedRequest)
 		}
 	default:
-		h.metrics.RecordRequest(ctx, "http", metricOp, strconv.Itoa(http.StatusBadGateway), "upstream", time.Since(start))
+		h.metrics.RecordRequest(ctx, "http", route.metricOp, strconv.Itoa(http.StatusBadGateway), "upstream", time.Since(start))
+		h.logger.WarnContext(ctx, "git smart http upstream error",
+			"tenant_id", string(route.repo.TenantID),
+			"repo_id", string(route.repo.RepoID),
+			"operation", string(route.op),
+			"error", err,
+		)
 		if !sw.wroteHeader {
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 		}
 	}
+}
+
+func isTransientInfoRefsError(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, ErrRateLimited) ||
+		errors.Is(err, ErrInvalidGzipBody) ||
+		errors.Is(err, ErrDecompressedBodyTooLarge) ||
+		isClientCanceled(ctx, err) {
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	return true
 }
 
 func isClientCanceled(ctx context.Context, err error) bool {

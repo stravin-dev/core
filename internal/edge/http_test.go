@@ -7,11 +7,13 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -953,7 +955,13 @@ func TestHTTPHandler_ClientCanceledClassifiedAs499(t *testing.T) {
 
 				rec := httptest.NewRecorder()
 				sw := &smartHTTPStreamWriter{w: rec, contentType: "application/x-git-upload-pack-result"}
-				env.handler.handleProxyError(rec, tc.ctx(), sw, "fetch", tc.err, time.Now())
+				route := smartHTTPRoute{
+					kind:     routeUploadPack,
+					repo:     tenant.RepoKey{TenantID: "acme", RepoID: "core"},
+					op:       rpc.OpUploadPack,
+					metricOp: "fetch",
+				}
+				env.handler.handleProxyError(rec, tc.ctx(), sw, route, tc.err, time.Now())
 
 				if rec.Code != httpStatusClientClosedRequest {
 					t.Fatalf("HTTP status = %d, want %d", rec.Code, httpStatusClientClosedRequest)
@@ -1072,4 +1080,161 @@ func TestSmartHTTPStreamWriter_FlushCoalescing(t *testing.T) {
 	if rec.flushes != 3 {
 		t.Fatalf("flushes after small chunk = %d, want 3", rec.flushes)
 	}
+}
+
+func TestHTTPHandler_InfoRefsRetryAnd502Logging(t *testing.T) {
+	t.Run("GET info/refs retries once on transient upstream error before headers and succeeds", func(t *testing.T) {
+		env := newTestEdgeEnv(t, LimiterConfig{})
+		defer env.close()
+
+		var attempts atomic.Int32
+		env.node.mu.Lock()
+		env.node.onHandle = func(_ context.Context, _ rpc.RequestMeta, stream rpc.GitWireStream) error {
+			if attempts.Add(1) == 1 {
+				return status.Error(codes.Unavailable, "transient upstream reset")
+			}
+			if err := stream.Send(&rpc.Frame{Data: []byte("003f0123456789abcdef0123456789abcdef01234567 refs/heads/main\n0000")}); err != nil {
+				return err
+			}
+			return stream.Send(&rpc.Frame{EOF: true})
+		}
+		env.node.mu.Unlock()
+
+		req := httptest.NewRequest(http.MethodGet, "/acme/core.git/info/refs?service=git-upload-pack", nil)
+		req.Header.Set("Authorization", "Bearer tok-acme")
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("HTTP status = %d, want 200; body = %q", rec.Code, rec.Body.String())
+		}
+		if got := attempts.Load(); got != 2 {
+			t.Fatalf("upstream attempts = %d, want 2", got)
+		}
+		expectedPrefix := "001e# service=git-upload-pack\n0000"
+		if !strings.HasPrefix(rec.Body.String(), expectedPrefix) {
+			t.Fatalf("body missing smart HTTP prefix: %q", rec.Body.String())
+		}
+		counts := collectEdgeRequestCounts(t, env.tel)
+		if got := counts[edgeRequestMetricKey{statusCode: "200", errorClass: ""}]; got != 1 {
+			t.Fatalf("expected 1 (200) metric, got %d (all: %+v)", got, counts)
+		}
+		if got := counts[edgeRequestMetricKey{statusCode: "502", errorClass: "upstream"}]; got != 0 {
+			t.Fatalf("expected 0 (502, upstream) metrics after successful retry, got %d", got)
+		}
+	})
+
+	t.Run("GET info/refs does not retry after headers/bytes already written", func(t *testing.T) {
+		env := newTestEdgeEnv(t, LimiterConfig{})
+		defer env.close()
+
+		var logBuf bytes.Buffer
+		env.handler.logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+
+		var attempts atomic.Int32
+		env.node.mu.Lock()
+		env.node.onHandle = func(_ context.Context, _ rpc.RequestMeta, stream rpc.GitWireStream) error {
+			attempts.Add(1)
+			if err := stream.Send(&rpc.Frame{Data: []byte("partial-refs-chunk")}); err != nil {
+				return err
+			}
+			return status.Error(codes.Unavailable, "stream dropped mid-response")
+		}
+		env.node.mu.Unlock()
+
+		req := httptest.NewRequest(http.MethodGet, "/acme/core.git/info/refs?service=git-upload-pack", nil)
+		req.Header.Set("Authorization", "Bearer tok-acme")
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+
+		if got := attempts.Load(); got != 1 {
+			t.Fatalf("upstream attempts = %d, want 1 (must not retry after headers written)", got)
+		}
+		counts := collectEdgeRequestCounts(t, env.tel)
+		if got := counts[edgeRequestMetricKey{statusCode: "502", errorClass: "upstream"}]; got != 1 {
+			t.Fatalf("expected 1 (502, upstream) metric, got %d (all: %+v)", got, counts)
+		}
+		if !strings.Contains(logBuf.String(), "git smart http upstream error") {
+			t.Fatalf("expected upstream 502 error log, got %q", logBuf.String())
+		}
+	})
+
+	t.Run("POST upload-pack and receive-pack are never retried", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			path string
+			op   string
+		}{
+			{name: "upload-pack", path: "/acme/core.git/git-upload-pack", op: string(rpc.OpUploadPack)},
+			{name: "receive-pack", path: "/acme/core.git/git-receive-pack", op: string(rpc.OpReceivePack)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				env := newTestEdgeEnv(t, LimiterConfig{})
+				defer env.close()
+
+				var logBuf bytes.Buffer
+				env.handler.logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+
+				var attempts atomic.Int32
+				env.node.mu.Lock()
+				env.node.onHandle = func(_ context.Context, _ rpc.RequestMeta, _ rpc.GitWireStream) error {
+					attempts.Add(1)
+					return status.Error(codes.Unavailable, "upstream unavailable")
+				}
+				env.node.mu.Unlock()
+
+				req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader("payload"))
+				req.Header.Set("Authorization", "Bearer tok-acme")
+				rec := httptest.NewRecorder()
+				env.handler.ServeHTTP(rec, req)
+
+				if rec.Code != http.StatusBadGateway {
+					t.Fatalf("HTTP status = %d, want 502", rec.Code)
+				}
+				if got := attempts.Load(); got != 1 {
+					t.Fatalf("upstream attempts = %d, want 1 (POST must never retry)", got)
+				}
+				logOut := logBuf.String()
+				for _, want := range []string{"git smart http upstream error", "tenant_id=acme", "repo_id=core", "operation=" + tc.op, "upstream unavailable"} {
+					if !strings.Contains(logOut, want) {
+						t.Fatalf("expected log %q to contain %q", logOut, want)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("unrecovered GET info/refs 502 retries once then logs error", func(t *testing.T) {
+		env := newTestEdgeEnv(t, LimiterConfig{})
+		defer env.close()
+
+		var logBuf bytes.Buffer
+		env.handler.logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+
+		var attempts atomic.Int32
+		env.node.mu.Lock()
+		env.node.onHandle = func(_ context.Context, _ rpc.RequestMeta, _ rpc.GitWireStream) error {
+			attempts.Add(1)
+			return status.Error(codes.Unavailable, "persistent node failure")
+		}
+		env.node.mu.Unlock()
+
+		req := httptest.NewRequest(http.MethodGet, "/acme/core.git/info/refs?service=git-upload-pack", nil)
+		req.Header.Set("Authorization", "Bearer tok-acme")
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("HTTP status = %d, want 502", rec.Code)
+		}
+		if got := attempts.Load(); got != 2 {
+			t.Fatalf("upstream attempts = %d, want 2", got)
+		}
+		logOut := logBuf.String()
+		for _, want := range []string{"git smart http upstream error", "tenant_id=acme", "repo_id=core", "operation=git-upload-pack", "persistent node failure"} {
+			if !strings.Contains(logOut, want) {
+				t.Fatalf("expected log %q to contain %q", logOut, want)
+			}
+		}
+	})
 }

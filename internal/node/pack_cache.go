@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	defaultPackCacheMaxBytes      = 128 << 20 // 128 MiB total response cache cap
-	defaultPackCacheMaxEntryBytes = 64 << 20  // 64 MiB single response cap
+	defaultPackCacheMaxBytes      = 64 << 20 // 64 MiB total response cache cap
+	defaultPackCacheMaxEntryBytes = 8 << 20  // 8 MiB single response cap
 )
 
 // isCacheableV2FullCloneFetch returns true when raw is a complete Protocol v2

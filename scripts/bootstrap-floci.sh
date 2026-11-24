@@ -11,7 +11,7 @@ BUCKET="${STRAVIN_S3_BUCKET:-git-objects-us-east-1}"
 TABLE="${STRAVIN_DDB_TABLE:-stravin-core}"
 KMS_ALIAS="${STRAVIN_KMS_ALIAS:-alias/stravin-local-dev}"
 TENANT="${STRAVIN_DEFAULT_TENANT:-local}"
-REPO="${STRAVIN_DEFAULT_REPO:-demo}"
+REPOS="${STRAVIN_DEFAULT_REPOS:-${STRAVIN_DEFAULT_REPO:-demo}}"
 
 echo "[floci-init] Bootstrapping Floci at ${AWS_ENDPOINT_URL} (region=${AWS_DEFAULT_REGION})"
 
@@ -74,23 +74,32 @@ else
   echo "[floci-init] Created KMS key '${KEY_ID}' with alias '${KMS_ALIAS}'"
 fi
 
-# 5. Seed default local tenant/repo META item (idempotent, never overwrites)
-META_PK="T#${TENANT}#REPO#${REPO}"
-if aws dynamodb put-item \
-  --table-name "${TABLE}" \
-  --item "{
-    \"PK\": {\"S\": \"${META_PK}\"},
-    \"SK\": {\"S\": \"META\"},
-    \"home_region\": {\"S\": \"${AWS_DEFAULT_REGION}\"},
-    \"failover_epoch\": {\"N\": \"1\"},
-    \"ref_shards\": {\"N\": \"1\"},
-    \"manifest_shards\": {\"N\": \"1\"},
-    \"write_state\": {\"S\": \"ACTIVE\"}
-  }" \
-  --condition-expression "attribute_not_exists(PK)" >/dev/null 2>&1; then
-  echo "[floci-init] Seeded default repo META item (${META_PK})"
-else
-  echo "[floci-init] Default repo META item (${META_PK}) already exists"
-fi
+# 5. Seed default local tenant/repo META items (idempotent, never overwrites)
+OLD_IFS="$IFS"
+IFS=,
+for R in $REPOS; do
+  REPO=$(printf '%s' "$R" | tr -d '[:space:]')
+  if [ -z "${REPO}" ]; then
+    continue
+  fi
+  META_PK="T#${TENANT}#REPO#${REPO}"
+  if aws dynamodb put-item \
+    --table-name "${TABLE}" \
+    --item "{
+      \"PK\": {\"S\": \"${META_PK}\"},
+      \"SK\": {\"S\": \"META\"},
+      \"home_region\": {\"S\": \"${AWS_DEFAULT_REGION}\"},
+      \"failover_epoch\": {\"N\": \"1\"},
+      \"ref_shards\": {\"N\": \"1\"},
+      \"manifest_shards\": {\"N\": \"1\"},
+      \"write_state\": {\"S\": \"ACTIVE\"}
+    }" \
+    --condition-expression "attribute_not_exists(PK)" >/dev/null 2>&1; then
+    echo "[floci-init] Seeded default repo META item (${META_PK})"
+  else
+    echo "[floci-init] Default repo META item (${META_PK}) already exists"
+  fi
+done
+IFS="$OLD_IFS"
 
 echo "[floci-init] Bootstrap complete."
