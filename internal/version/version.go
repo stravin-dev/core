@@ -5,7 +5,7 @@ package version
 // It is updated on release commits and may be overridden at link time via:
 //
 //	-ldflags "-X stravin.dev/core/internal/version.Version=vX.Y.Z"
-var Version = "v1.9.4"
+var Version = "v1.9.5"
 
 // String returns the current Stravin Core version string.
 func String() string {

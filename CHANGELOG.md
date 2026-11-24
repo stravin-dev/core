@@ -1,3 +1,11 @@
+## [1.9.5](https://github.com/stravin-dev/core/compare/v1.9.4...v1.9.5) (2026-11-24)
+
+
+### Performance Improvements
+
+* **pack,loadgen:** drain multi-batch Tier-0 compaction, restore pack.compression=1, and remove redundant loadgen git subprocesses ([7134286](https://github.com/stravin-dev/core/commit/7134286a2a71ed886ba5301ddd7f6f5a8474e7cc))
+* **pack,loadgen:** drain multi-batch Tier-0 compaction, restore pack.compression=1, and remove redundant loadgen git subprocesses ([#158](https://github.com/stravin-dev/core/issues/158)) ([6501d54](https://github.com/stravin-dev/core/commit/6501d547a1f8987575b688675391bf23edae5218))
+
 ## [1.9.4](https://github.com/stravin-dev/core/compare/v1.9.3...v1.9.4) (2026-11-24)
 
 
