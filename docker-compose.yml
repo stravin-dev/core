@@ -41,6 +41,25 @@ services:
     networks:
       - stravin-net
 
+  valkey:
+    image: valkey/valkey:8-alpine
+    command:
+      - "valkey-server"
+      - "--maxmemory"
+      - "128mb"
+      - "--maxmemory-policy"
+      - "allkeys-lfu"
+      - "--save"
+      - ""
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - stravin-net
+
   stravin-edge:
     build:
       context: .
@@ -49,6 +68,8 @@ services:
     depends_on:
       floci-init:
         condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
       stravin-node:
         condition: service_healthy
       stravin-ctrl:
@@ -59,6 +80,8 @@ services:
     environment:
       STRAVIN_REGION: "us-east-1"
       STRAVIN_DDB_TABLE: "stravin-core"
+      STRAVIN_S3_BUCKET: "git-objects-us-east-1"
+      STRAVIN_S3_FORCE_PATH_STYLE: "true"
       STRAVIN_NODE_PEERS: "stravin-node:9090"
       STRAVIN_INTERNAL_GRPC_TOKEN: "${STRAVIN_INTERNAL_GRPC_TOKEN:-stravin-local-internal-grpc-token}"
       STRAVIN_GRPC_ALLOW_INSECURE: "${STRAVIN_GRPC_ALLOW_INSECURE:-true}"
@@ -67,6 +90,10 @@ services:
       STRAVIN_META_CACHE_TTL: "${STRAVIN_META_CACHE_TTL:-1s}"
       STRAVIN_RATE_LIMIT_RPS: "${STRAVIN_RATE_LIMIT_RPS:-2000}"
       STRAVIN_MAX_CONCURRENT_CLONES: "${STRAVIN_MAX_CONCURRENT_CLONES:-256}"
+      STRAVIN_PACK_CACHE_VALKEY_ADDR: "${STRAVIN_PACK_CACHE_VALKEY_ADDR:-valkey:6379}"
+      STRAVIN_PACK_CACHE_TTL: "${STRAVIN_PACK_CACHE_TTL:-5m}"
+      STRAVIN_PACK_CACHE_VALKEY_MAX_ENTRY_BYTES: "${STRAVIN_PACK_CACHE_VALKEY_MAX_ENTRY_BYTES:-8388608}"
+      STRAVIN_PACK_CACHE_S3_MAX_ENTRY_BYTES: "${STRAVIN_PACK_CACHE_S3_MAX_ENTRY_BYTES:-67108864}"
       AWS_ENDPOINT_URL: "http://floci:4566"
       AWS_REGION: "us-east-1"
       AWS_ACCESS_KEY_ID: "test"

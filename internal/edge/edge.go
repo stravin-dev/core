@@ -36,6 +36,7 @@ type ServerConfig struct {
 	Resolver                 *Resolver
 	Router                   NodeSelector
 	Proxy                    *WireProxy
+	PackCache                *PackCacheCoordinator
 	Telemetry                *telemetry.Provider
 	Logger                   *slog.Logger
 }
@@ -73,6 +74,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, err
 	}
 	httpHandler.SetMaxDecompressedBodyBytes(cfg.MaxDecompressedBodyBytes)
+	httpHandler.SetPackCache(cfg.PackCache)
 	sshServer, err := NewSSHServer(cfg.HostKey, cfg.Authenticator, cfg.Limiter, cfg.Resolver, cfg.Router, cfg.Proxy, metrics, cfg.Logger)
 	if err != nil {
 		return nil, err

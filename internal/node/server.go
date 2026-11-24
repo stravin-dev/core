@@ -186,7 +186,6 @@ type Server struct {
 	region                 string
 	uploadPackSem          chan struct{}
 	uploadPackQueueTimeout time.Duration
-	packCache              *uploadPackResponseCache
 }
 
 var _ rpc.GitWireHandler = (*Server)(nil)
@@ -241,7 +240,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		region:                 cfg.Region,
 		uploadPackSem:          make(chan struct{}, maxUploadPacks),
 		uploadPackQueueTimeout: queueTimeout,
-		packCache:              newUploadPackResponseCache(defaultPackCacheMaxBytes, defaultPackCacheMaxEntryBytes),
 	}, nil
 }
 
@@ -301,10 +299,9 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 	statelessRPC := boolHeader(ctx, HeaderStatelessRPC)
 
 	var (
-		peekedBytes  []byte
-		peekEOF      bool
-		isV2LsRefs   bool
-		finishFlight func([]byte)
+		peekedBytes []byte
+		peekEOF     bool
+		isV2LsRefs  bool
 	)
 	if statelessRPC && rpc.GitProtocolVersion(meta.GitProtocol) == "2" {
 		var (
@@ -333,25 +330,6 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 					}
 					return nil, stream.Send(&rpc.Frame{EOF: true, ExitCode: 0})
 				}
-			}
-		}
-
-		if cmdKind == v2CmdFetch && peekEOF && s.packCache != nil && isCacheableV2FullCloneFetch(peekedBytes) {
-			cacheKey := uploadPackCacheKey(repo, meta.GitProtocol, peekedBytes)
-			cachedResp, finish, hit, waitErr := s.packCache.GetOrJoin(ctx, cacheKey)
-			if waitErr != nil {
-				return nil, status.FromContextError(waitErr).Err()
-			}
-			if hit {
-				w := &streamChunkWriter{stream: stream}
-				if _, wErr := w.Write(cachedResp); wErr != nil {
-					return nil, wErr
-				}
-				return nil, stream.Send(&rpc.Frame{EOF: true, ExitCode: 0})
-			}
-			if finish != nil {
-				finishFlight = finish
-				defer finishFlight(nil)
 			}
 		}
 	}
@@ -423,17 +401,6 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 	}()
 
 	stdoutW := &streamChunkWriter{stream: stream}
-	var (
-		execStdout io.Writer = stdoutW
-		captureW   *boundedCaptureWriter
-	)
-	if finishFlight != nil && s.packCache != nil && s.packCache.maxEntryBytes > 0 {
-		captureW = &boundedCaptureWriter{
-			dst:      stdoutW,
-			maxBytes: s.packCache.maxEntryBytes,
-		}
-		execStdout = captureW
-	}
 
 	var stderrBuf bytes.Buffer
 	var bundleURI string
@@ -448,7 +415,7 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 		GitProtocol:  meta.GitProtocol,
 		BundleURI:    bundleURI,
 		Stdin:        stdinR,
-		Stdout:       execStdout,
+		Stdout:       stdoutW,
 		Stderr:       &stderrBuf,
 	})
 
@@ -486,14 +453,6 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 			return nil, sendErr
 		}
 		return execErr, nil
-	}
-
-	if finishFlight != nil {
-		if captureW != nil && !captureW.exceeded {
-			finishFlight(captureW.buf.Bytes())
-		} else {
-			finishFlight(nil)
-		}
 	}
 
 	s.logger.DebugContext(execCtx, "node: git-upload-pack completed",

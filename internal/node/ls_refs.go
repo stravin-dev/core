@@ -14,8 +14,7 @@ import (
 )
 
 const (
-	maxV2LsRefsReqBytes     = 1 << 20   // 1 MiB cap for buffered v2 ls-refs requests
-	maxV2FetchCacheReqBytes = 512 << 10 // 512 KiB cap for buffered v2 full-clone fetch requests
+	maxV2LsRefsReqBytes = 1 << 20 // 1 MiB cap for buffered v2 ls-refs requests
 )
 
 type v2CommandKind uint8
@@ -23,7 +22,6 @@ type v2CommandKind uint8
 const (
 	v2CmdOther v2CommandKind = iota
 	v2CmdLsRefs
-	v2CmdFetch
 )
 
 type v2LsRefsRequest struct {
@@ -34,14 +32,11 @@ type v2LsRefsRequest struct {
 }
 
 // readBoundedV2Request reads frames from a stateless-RPC Protocol v2 stream
-// to classify the command and buffer complete ls-refs (<= 1 MiB) or fetch
-// (<= 512 KiB) requests. The returned bytes are always safe to replay verbatim
-// into git-upload-pack stdin if a fast path declines to handle the request.
+// to classify the command and buffer complete ls-refs (<= 1 MiB) requests.
+// The returned bytes are always safe to replay verbatim into git-upload-pack
+// stdin if the fast path declines to handle the request.
 func readBoundedV2Request(stream rpc.GitWireStream) (buf []byte, completeEOF bool, kind v2CommandKind, err error) {
-	var (
-		classified bool
-		maxCap     int
-	)
+	var classified bool
 	for {
 		frame, recvErr := stream.Recv()
 		if errors.Is(recvErr, io.EOF) {
@@ -70,17 +65,12 @@ func readBoundedV2Request(stream rpc.GitWireStream) (buf []byte, completeEOF boo
 			if len(buf) >= int(pktLen) {
 				classified = true
 				kind = classifyV2FirstPktLine(buf[:pktLen])
-				switch kind {
-				case v2CmdLsRefs:
-					maxCap = maxV2LsRefsReqBytes
-				case v2CmdFetch:
-					maxCap = maxV2FetchCacheReqBytes
-				default:
+				if kind != v2CmdLsRefs {
 					return buf, false, v2CmdOther, nil
 				}
 			}
 		}
-		if classified && len(buf) > maxCap {
+		if classified && len(buf) > maxV2LsRefsReqBytes {
 			return buf, false, kind, nil
 		}
 	}
@@ -95,14 +85,10 @@ func classifyV2FirstPktLine(buf []byte) v2CommandKind {
 		return v2CmdOther
 	}
 	payload := strings.TrimSuffix(string(buf[4:pktLen]), "\n")
-	switch payload {
-	case "command=ls-refs":
+	if payload == "command=ls-refs" {
 		return v2CmdLsRefs
-	case "command=fetch":
-		return v2CmdFetch
-	default:
-		return v2CmdOther
 	}
+	return v2CmdOther
 }
 
 // nextPktLine reads one Git pkt-line from raw starting at pos.

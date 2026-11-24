@@ -19,6 +19,7 @@ import (
 	"stravin.dev/core/internal/lease"
 	"stravin.dev/core/internal/rpc"
 	"stravin.dev/core/internal/storage/ddb"
+	"stravin.dev/core/internal/storage/s3"
 	"stravin.dev/core/internal/telemetry"
 )
 
@@ -111,6 +112,12 @@ func run() error {
 		return fmt.Errorf("init wire proxy: %w", err)
 	}
 
+	packCache, closePackCache, err := initPackCacheFromEnv(awsCfg, logger)
+	if err != nil {
+		return fmt.Errorf("init pack cache: %w", err)
+	}
+	defer closePackCache()
+
 	srv, err := edge.NewServer(edge.ServerConfig{
 		SSHAddr:                  sshAddr,
 		HTTPAddr:                 httpAddr,
@@ -122,6 +129,7 @@ func run() error {
 		Resolver:                 resolver,
 		Router:                   router,
 		Proxy:                    proxy,
+		PackCache:                packCache,
 		Telemetry:                telProvider,
 		Logger:                   logger,
 	})
@@ -165,6 +173,71 @@ func loadAuthenticatorFromEnv() (edge.Authenticator, error) {
 		keys = append(keys, parsed...)
 	}
 	return edge.NewStaticAuthenticator(tokens, keys)
+}
+
+func initPackCacheFromEnv(awsCfg aws.Config, logger *slog.Logger) (*edge.PackCacheCoordinator, func(), error) {
+	valkeyAddr := strings.TrimSpace(os.Getenv("STRAVIN_PACK_CACHE_VALKEY_ADDR"))
+	s3Bucket := strings.TrimSpace(os.Getenv("STRAVIN_S3_BUCKET"))
+	ttl := envDurationOrDefault("STRAVIN_PACK_CACHE_TTL", edge.DefaultPackCacheTTL)
+	valkeyMaxBytes := envIntOrDefault("STRAVIN_PACK_CACHE_VALKEY_MAX_ENTRY_BYTES", edge.DefaultPackCacheValkeyMaxEntryBytes)
+	s3MaxBytes := envIntOrDefault("STRAVIN_PACK_CACHE_S3_MAX_ENTRY_BYTES", edge.DefaultPackCacheS3MaxEntryBytes)
+
+	var (
+		valkeyTier edge.PackResponseCache
+		s3Tier     edge.PackResponseCache
+		closers    []func()
+	)
+	if valkeyAddr != "" && valkeyMaxBytes > 0 {
+		vc, err := edge.NewValkeyPackCache(edge.ValkeyPackCacheConfig{
+			Addr:          valkeyAddr,
+			MaxEntryBytes: valkeyMaxBytes,
+		})
+		if err != nil {
+			return nil, func() {}, err
+		}
+		valkeyTier = vc
+		closers = append(closers, func() { _ = vc.Close() })
+	}
+	if s3Bucket != "" && s3MaxBytes > 0 {
+		s3Client := s3.NewAWSClient(awsCfg, strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL")), s3.ForcePathStyleFromEnv())
+		sc, err := edge.NewS3PackCache(edge.S3PackCacheConfig{
+			Client:        s3Client,
+			Bucket:        s3Bucket,
+			MaxEntryBytes: s3MaxBytes,
+			TTL:           ttl,
+		})
+		if err != nil {
+			for _, fn := range closers {
+				fn()
+			}
+			return nil, func() {}, err
+		}
+		s3Tier = sc
+	}
+
+	cleanup := func() {
+		for _, fn := range closers {
+			fn()
+		}
+	}
+	if valkeyTier == nil && s3Tier == nil {
+		return nil, cleanup, nil
+	}
+
+	tiered := edge.NewTieredPackCache(edge.TieredPackCacheConfig{
+		Valkey:              valkeyTier,
+		S3:                  s3Tier,
+		ValkeyMaxEntryBytes: valkeyMaxBytes,
+		S3MaxEntryBytes:     s3MaxBytes,
+		Logger:              logger,
+	})
+	coord := edge.NewPackCacheCoordinator(edge.PackCacheCoordinatorConfig{
+		Backend:         tiered,
+		TTL:             ttl,
+		MaxCaptureBytes: tiered.MaxEntryBytes(),
+		Logger:          logger,
+	})
+	return coord, cleanup, nil
 }
 
 func envOrDefault(key, fallback string) string {
