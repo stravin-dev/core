@@ -1,3 +1,11 @@
+## [1.9.3](https://github.com/stravin-dev/core/compare/v1.9.2...v1.9.3) (2026-11-24)
+
+
+### Performance Improvements
+
+* **ddb,node:** add linearizable META ref_version/manifest_version and version-gated in-memory cache ([#153](https://github.com/stravin-dev/core/issues/153)) ([d0bfd47](https://github.com/stravin-dev/core/commit/d0bfd476ddbf40eee95a749d5cf130a6f926d682))
+* **ddb,node:** add linearizable META versioning and version-gated in-memory cache ([0d92a40](https://github.com/stravin-dev/core/commit/0d92a407328df302caf2a36d1f99c31bad069511))
+
 ## [1.9.2](https://github.com/stravin-dev/core/compare/v1.9.1...v1.9.2) (2026-11-24)
 
 
