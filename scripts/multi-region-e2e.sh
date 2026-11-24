@@ -19,6 +19,8 @@ ALL_SERVICES=(
   floci-region-b
   floci-init-a
   floci-init-b
+  valkey-east
+  valkey-west
   floci-test-s3-sync-a-to-b
   floci-test-s3-sync-b-to-a
   floci-test-ddb-sync-a-to-b
