@@ -60,6 +60,7 @@ type TieredPackCacheConfig struct {
 	ValkeyMaxEntryBytes int
 	S3MaxEntryBytes     int
 	Logger              *slog.Logger
+	Metrics             *Metrics
 }
 
 // TieredPackCache routes small/medium pack responses to Valkey and spills
@@ -71,6 +72,7 @@ type TieredPackCache struct {
 	valkeyMaxEntryBytes int
 	s3MaxEntryBytes     int
 	logger              *slog.Logger
+	metrics             *Metrics
 }
 
 var _ PackResponseCache = (*TieredPackCache)(nil)
@@ -95,6 +97,7 @@ func NewTieredPackCache(cfg TieredPackCacheConfig) *TieredPackCache {
 		valkeyMaxEntryBytes: valkeyMax,
 		s3MaxEntryBytes:     s3Max,
 		logger:              logger,
+		metrics:             cfg.Metrics,
 	}
 }
 
@@ -160,6 +163,11 @@ func (c *TieredPackCache) Set(ctx context.Context, key string, data []byte, ttl 
 		}
 		return nil
 	}
+	if c.s3 != nil {
+		c.metrics.RecordPackCacheWrite(ctx, "s3", "too_large")
+	} else if c.valkey != nil {
+		c.metrics.RecordPackCacheWrite(ctx, "valkey", "too_large")
+	}
 	return nil
 }
 
@@ -175,6 +183,7 @@ type PackCacheCoordinatorConfig struct {
 	MaxCaptureBytes int
 	WriteTimeout    time.Duration
 	Logger          *slog.Logger
+	Metrics         *Metrics
 }
 
 // PackCacheCoordinator wraps a PackResponseCache with in-process singleflight
@@ -186,6 +195,7 @@ type PackCacheCoordinator struct {
 	maxCaptureBytes int
 	writeTimeout    time.Duration
 	logger          *slog.Logger
+	metrics         *Metrics
 
 	mu       sync.Mutex
 	inflight map[string]*packCacheFlight
@@ -224,6 +234,7 @@ func NewPackCacheCoordinator(cfg PackCacheCoordinatorConfig) *PackCacheCoordinat
 		maxCaptureBytes: maxCapture,
 		writeTimeout:    writeTimeout,
 		logger:          logger,
+		metrics:         cfg.Metrics,
 		inflight:        make(map[string]*packCacheFlight),
 	}
 }
@@ -257,10 +268,14 @@ func (c *PackCacheCoordinator) GetOrJoin(ctx context.Context, key string) (data 
 		select {
 		case <-flight.done:
 			if len(flight.data) > 0 {
+				c.metrics.RecordPackCacheLookup(ctx, "singleflight", "hit")
+				c.metrics.RecordPackCacheBytes(ctx, "singleflight", "hit_served", int64(len(flight.data)))
 				return flight.data, nil, true, nil
 			}
+			c.metrics.RecordPackCacheLookup(ctx, "singleflight", "miss")
 			return nil, nil, false, nil
 		case <-ctx.Done():
+			c.metrics.RecordPackCacheLookup(ctx, "singleflight", "error")
 			return nil, nil, false, ctx.Err()
 		}
 	}

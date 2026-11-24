@@ -73,6 +73,7 @@ type DispatcherConfig struct {
 	DLQ                  DLQSink
 	HTTPClient           *http.Client
 	Telemetry            *telemetry.Provider
+	Metrics              *Metrics
 	Logger               *slog.Logger
 	RequestTimeout       time.Duration
 	MaxAttempts          int
@@ -91,6 +92,7 @@ type WebhookDispatcher struct {
 	dlq                  DLQSink
 	httpClient           *http.Client
 	tracer               trace.Tracer
+	metrics              *Metrics
 	logger               *slog.Logger
 	maxAttempts          int
 	initialBackoff       time.Duration
@@ -139,12 +141,22 @@ func NewWebhookDispatcher(cfg DispatcherConfig) (*WebhookDispatcher, error) {
 		cfg.Sleep = sleepWithContext
 	}
 
+	metrics := cfg.Metrics
+	if metrics == nil {
+		var err error
+		metrics, err = NewMetrics(cfg.Telemetry)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	d := &WebhookDispatcher{
 		webhooks:             cfg.Webhooks,
 		cipher:               cfg.Cipher,
 		dlq:                  cfg.DLQ,
 		httpClient:           cfg.HTTPClient,
 		tracer:               cfg.Telemetry.Tracer("stravin-hook"),
+		metrics:              metrics,
 		logger:               cfg.Logger,
 		maxAttempts:          cfg.MaxAttempts,
 		initialBackoff:       cfg.InitialBackoff,
@@ -169,6 +181,7 @@ func (d *WebhookDispatcher) OnEvent(ctx context.Context, ev RefHistoryEvent) err
 		if errors.Is(err, ddb.ErrNotFound) {
 			return nil
 		}
+		d.metrics.RecordDelivery(ctx, "error")
 		return fmt.Errorf("async: load webhooks for %s/%s: %w", ev.Repo.TenantID, ev.Repo.RepoID, err)
 	}
 
@@ -185,6 +198,7 @@ func (d *WebhookDispatcher) OnEvent(ctx context.Context, ev RefHistoryEvent) err
 		Timestamp: ts.UTC().Format(time.RFC3339Nano),
 	})
 	if err != nil {
+		d.metrics.RecordDelivery(ctx, "error")
 		return fmt.Errorf("async: marshal webhook payload: %w", err)
 	}
 
@@ -197,10 +211,12 @@ func (d *WebhookDispatcher) OnEvent(ctx context.Context, ev RefHistoryEvent) err
 		if len(wh.EncryptedSecret) > 0 {
 			decrypted, decErr := d.cipher.Decrypt(ctx, ev.Repo.TenantID, wh.EncryptedSecret)
 			if decErr != nil {
+				d.metrics.RecordDelivery(ctx, "error")
 				d.recordDLQ(ctx, ev, wh, DeliveryResult{
 					Attempts: 1,
 					Err:      fmt.Errorf("decrypt webhook secret: %w", decErr),
 				})
+				d.metrics.RecordDelivery(ctx, "dlq")
 				continue
 			}
 			secret = decrypted
@@ -273,19 +289,24 @@ func (d *WebhookDispatcher) retryAndDLQMiddleware() DeliveryMiddleware {
 				maxBackoff = time.Duration(req.Webhook.Retry.MaxBackoffMS) * time.Millisecond
 			}
 
+			start := time.Now()
 			var last DeliveryResult
 			backoff := initialBackoff
 			for attempt := 1; attempt <= maxAttempts; attempt++ {
 				last = next(ctx, req)
 				last.Attempts = attempt
 				if last.Err == nil {
+					d.metrics.RecordDelivery(ctx, "ok")
+					d.metrics.RecordDeliveryDuration(ctx, "ok", time.Since(start))
 					return last
 				}
 				if !last.Retryable || attempt == maxAttempts {
 					break
 				}
+				d.metrics.RecordDelivery(ctx, "retry")
 				if sleepErr := d.sleep(ctx, backoff); sleepErr != nil {
 					last.Err = sleepErr
+					d.metrics.RecordDelivery(ctx, "error")
 					break
 				}
 				backoff *= 2
@@ -295,6 +316,8 @@ func (d *WebhookDispatcher) retryAndDLQMiddleware() DeliveryMiddleware {
 			}
 
 			d.recordDLQ(ctx, req.Event, req.Webhook, last)
+			d.metrics.RecordDelivery(ctx, "dlq")
+			d.metrics.RecordDeliveryDuration(ctx, "dlq", time.Since(start))
 			return last
 		}
 	}
@@ -365,6 +388,7 @@ func (d *WebhookDispatcher) recordDLQ(ctx context.Context, ev RefHistoryEvent, w
 		FailedAt:       time.Now().UTC(),
 	}
 	if err := d.dlq.Record(ctx, entry); err != nil {
+		d.metrics.RecordDelivery(ctx, "error")
 		d.logger.ErrorContext(ctx, "failed to record webhook DLQ entry",
 			"hook_id", wh.WebhookID,
 			"error", err,

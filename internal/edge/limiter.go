@@ -36,6 +36,7 @@ type LimiterConfig struct {
 	MaxConcurrentClones int
 	PackBytesPerMin     int64
 	Clock               lease.Clock
+	Metrics             *Metrics
 }
 
 type tokenBucket struct {
@@ -137,7 +138,7 @@ func (l *TokenBucketLimiter) AllowRequest(_ context.Context, tenantID tenant.Ten
 }
 
 // AcquireClone claims a concurrent clone slot for tenantID, returning an idempotent release function.
-func (l *TokenBucketLimiter) AcquireClone(_ context.Context, tenantID tenant.TenantID) (func(), error) {
+func (l *TokenBucketLimiter) AcquireClone(ctx context.Context, tenantID tenant.TenantID) (func(), error) {
 	if l.cfg.MaxConcurrentClones <= 0 {
 		return func() {}, nil
 	}
@@ -150,6 +151,7 @@ func (l *TokenBucketLimiter) AcquireClone(_ context.Context, tenantID tenant.Ten
 	}
 	st.activeClones++
 	l.mu.Unlock()
+	l.cfg.Metrics.AddActiveClones(ctx, 1)
 
 	var once sync.Once
 	release := func() {
@@ -159,6 +161,7 @@ func (l *TokenBucketLimiter) AcquireClone(_ context.Context, tenantID tenant.Ten
 				st.activeClones--
 			}
 			l.mu.Unlock()
+			l.cfg.Metrics.AddActiveClones(context.Background(), -1)
 		})
 	}
 	return release, nil

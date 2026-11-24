@@ -76,6 +76,11 @@ func run() error {
 		return fmt.Errorf("init ddb repository: %w", err)
 	}
 
+	edgeMetrics, err := edge.NewMetrics(telProvider)
+	if err != nil {
+		return fmt.Errorf("init edge metrics: %w", err)
+	}
+
 	metaCacheTTL := envDurationOrDefault("STRAVIN_META_CACHE_TTL", 30*time.Second)
 	leaseSafetyMargin := envDurationOrDefault("STRAVIN_LEASE_SAFETY_MARGIN", 2*time.Second)
 	verifier := lease.NewStoreVerifier(ddbRepo, lease.RealClock{}, leaseSafetyMargin)
@@ -83,6 +88,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("init resolver: %w", err)
 	}
+	resolver.SetMetrics(edgeMetrics)
 
 	auth, err := loadAuthenticatorFromEnv()
 	if err != nil {
@@ -98,6 +104,7 @@ func run() error {
 		RequestsPerSecond:   envFloatOrDefault("STRAVIN_RATE_LIMIT_RPS", 100),
 		MaxConcurrentClones: envIntOrDefault("STRAVIN_MAX_CONCURRENT_CLONES", 32),
 		PackBytesPerMin:     envInt64OrDefault("STRAVIN_PACK_BYTES_PER_MIN", 0),
+		Metrics:             edgeMetrics,
 	})
 
 	router := edge.NewRendezvousRouter(peers)
@@ -112,7 +119,7 @@ func run() error {
 		return fmt.Errorf("init wire proxy: %w", err)
 	}
 
-	packCache, closePackCache, err := initPackCacheFromEnv(awsCfg, logger)
+	packCache, closePackCache, err := initPackCacheFromEnv(awsCfg, edgeMetrics, logger)
 	if err != nil {
 		return fmt.Errorf("init pack cache: %w", err)
 	}
@@ -131,6 +138,7 @@ func run() error {
 		Proxy:                    proxy,
 		PackCache:                packCache,
 		Telemetry:                telProvider,
+		Metrics:                  edgeMetrics,
 		Logger:                   logger,
 	})
 	if err != nil {
@@ -175,7 +183,7 @@ func loadAuthenticatorFromEnv() (edge.Authenticator, error) {
 	return edge.NewStaticAuthenticator(tokens, keys)
 }
 
-func initPackCacheFromEnv(awsCfg aws.Config, logger *slog.Logger) (*edge.PackCacheCoordinator, func(), error) {
+func initPackCacheFromEnv(awsCfg aws.Config, metrics *edge.Metrics, logger *slog.Logger) (*edge.PackCacheCoordinator, func(), error) {
 	valkeyAddr := strings.TrimSpace(os.Getenv("STRAVIN_PACK_CACHE_VALKEY_ADDR"))
 	s3Bucket := strings.TrimSpace(os.Getenv("STRAVIN_S3_BUCKET"))
 	ttl := envDurationOrDefault("STRAVIN_PACK_CACHE_TTL", edge.DefaultPackCacheTTL)
@@ -191,6 +199,7 @@ func initPackCacheFromEnv(awsCfg aws.Config, logger *slog.Logger) (*edge.PackCac
 		vc, err := edge.NewValkeyPackCache(edge.ValkeyPackCacheConfig{
 			Addr:          valkeyAddr,
 			MaxEntryBytes: valkeyMaxBytes,
+			Metrics:       metrics,
 		})
 		if err != nil {
 			return nil, func() {}, err
@@ -205,6 +214,7 @@ func initPackCacheFromEnv(awsCfg aws.Config, logger *slog.Logger) (*edge.PackCac
 			Bucket:        s3Bucket,
 			MaxEntryBytes: s3MaxBytes,
 			TTL:           ttl,
+			Metrics:       metrics,
 		})
 		if err != nil {
 			for _, fn := range closers {
@@ -230,12 +240,14 @@ func initPackCacheFromEnv(awsCfg aws.Config, logger *slog.Logger) (*edge.PackCac
 		ValkeyMaxEntryBytes: valkeyMaxBytes,
 		S3MaxEntryBytes:     s3MaxBytes,
 		Logger:              logger,
+		Metrics:             metrics,
 	})
 	coord := edge.NewPackCacheCoordinator(edge.PackCacheCoordinatorConfig{
 		Backend:         tiered,
 		TTL:             ttl,
 		MaxCaptureBytes: tiered.MaxEntryBytes(),
 		Logger:          logger,
+		Metrics:         metrics,
 	})
 	return coord, cleanup, nil
 }
