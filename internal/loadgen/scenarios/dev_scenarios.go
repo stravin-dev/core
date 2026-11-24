@@ -50,13 +50,11 @@ func (s *devFeatureBranchPR) Weight() int              { return 15 }
 
 func (s *devFeatureBranchPR) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "dev-feat")
-	defer cleanup()
-
-	g, err := cloneFresh(ctx, env, s.Name(), repoURL(env), cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), repoURL(env), ent, "dev-feat")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
@@ -93,13 +91,11 @@ func (s *devIncrementalThinPack) Weight() int              { return 12 }
 
 func (s *devIncrementalThinPack) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "dev-thin")
-	defer cleanup()
-
-	g, err := cloneFresh(ctx, env, s.Name(), repoURL(env), cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), repoURL(env), ent, "dev-thin")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
@@ -150,13 +146,11 @@ func (s *devRebaseAndForcePush) Weight() int              { return 10 }
 
 func (s *devRebaseAndForcePush) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "dev-force")
-	defer cleanup()
-
-	g, err := cloneFresh(ctx, env, s.Name(), repoURL(env), cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), repoURL(env), ent, "dev-force")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
@@ -216,17 +210,15 @@ func (s *devConcurrentMainPushRetry) Weight() int              { return 10 }
 
 func (s *devConcurrentMainPushRetry) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "dev-main")
-	defer cleanup()
-
-	g, err := cloneFresh(ctx, env, s.Name(), repoURL(env), cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), repoURL(env), ent, "dev-main")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
-	if _, err := g.Run(ctx, "checkout", "-B", "main"); err != nil {
+	if err := g.CheckoutNewBranch(ctx, ent.BranchName("main-work")); err != nil {
 		return err
 	}
 
@@ -251,13 +243,11 @@ func (s *devTagAndRelease) Weight() int              { return 8 }
 
 func (s *devTagAndRelease) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "dev-tag")
-	defer cleanup()
-
-	g, err := cloneFresh(ctx, env, s.Name(), repoURL(env), cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), repoURL(env), ent, "dev-tag")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
@@ -323,13 +313,11 @@ func (s *devLargeBinaryAsset) Weight() int              { return 6 }
 
 func (s *devLargeBinaryAsset) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "dev-bin")
-	defer cleanup()
-
-	g, err := cloneFresh(ctx, env, s.Name(), repoURL(env), cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), repoURL(env), ent, "dev-bin")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
@@ -382,14 +370,12 @@ func (s *devBranchCleanupCycle) Weight() int              { return 8 }
 
 func (s *devBranchCleanupCycle) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "dev-cleanup")
-	defer cleanup()
-
 	remote := repoURL(env)
-	g, err := cloneFresh(ctx, env, s.Name(), remote, cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), remote, ent, "dev-cleanup")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
@@ -537,9 +523,6 @@ func (s *devNoopEmptyPushAndFetch) Weight() int              { return 10 }
 
 func (s *devNoopEmptyPushAndFetch) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "dev-noop")
-	defer cleanup()
-
 	remote := repoURL(env)
 	if err := env.RunOp(ctx, s.Name(), "ls-remote", loadgen.ClassifyOptions{}, func(opCtx context.Context) error {
 		_, err := env.Git.LsRemote(opCtx, remote)
@@ -548,10 +531,11 @@ func (s *devNoopEmptyPushAndFetch) Run(ctx context.Context, env *loadgen.Scenari
 		return err
 	}
 
-	g, err := cloneFresh(ctx, env, s.Name(), remote, cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), remote, ent, "dev-noop")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := env.RunOp(ctx, s.Name(), "fetch", loadgen.ClassifyOptions{}, func(opCtx context.Context) error {
 		return g.Fetch(opCtx, "origin")
 	}); err != nil {

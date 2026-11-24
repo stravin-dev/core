@@ -31,15 +31,118 @@ func newTempDir(env *loadgen.ScenarioEnv, ent *Entropy, prefix string) (string, 
 	return dir, func() { _ = os.RemoveAll(dir) }
 }
 
+const worktreeCleanupTimeout = 5 * time.Second
+
+func workerAuthor(env *loadgen.ScenarioEnv) (name, email string) {
+	return fmt.Sprintf("Stravin %s %d", env.Persona, env.WorkerID),
+		fmt.Sprintf("%s-%d@loadgen.stravin.local", env.Persona, env.WorkerID)
+}
+
 func cloneFresh(ctx context.Context, env *loadgen.ScenarioEnv, scenario, remoteURL, destDir string) (*loadgen.GitClient, error) {
 	if err := env.RunOp(ctx, scenario, "clone", loadgen.ClassifyOptions{}, func(opCtx context.Context) error {
 		return env.Git.Clone(opCtx, remoteURL, destDir)
 	}); err != nil {
 		return nil, err
 	}
-	name := fmt.Sprintf("Stravin %s %d", env.Persona, env.WorkerID)
-	email := fmt.Sprintf("%s-%d@loadgen.stravin.local", env.Persona, env.WorkerID)
+	name, email := workerAuthor(env)
 	return env.Git.WithWorkDir(destDir).WithAuthor(name, email), nil
+}
+
+// acquireWorktree returns an isolated GitClient for a scenario by reusing the
+// worker's per-repo base clone (cloning once on first use, then running
+// incremental git fetch + detached git worktree per scenario).
+// When the remote repository is still empty (unborn HEAD), it falls back to a
+// fresh temporary clone so ensureBaseCommit can seed main cleanly.
+func acquireWorktree(
+	ctx context.Context,
+	env *loadgen.ScenarioEnv,
+	scenario, remoteURL string,
+	ent *Entropy,
+	prefix string,
+) (*loadgen.GitClient, func(), error) {
+	if env.BaseClones == nil {
+		dir, cleanup := newTempDir(env, ent, prefix)
+		g, err := cloneFresh(ctx, env, scenario, remoteURL, dir)
+		if err != nil {
+			cleanup()
+			return nil, func() {}, err
+		}
+		return g, cleanup, nil
+	}
+
+	baseDir, cached := env.BaseClones.Get(env.Repo)
+	if !cached {
+		baseDir = env.BaseClones.Dir(env.Repo)
+		_ = os.RemoveAll(baseDir)
+		if err := env.RunOp(ctx, scenario, "clone", loadgen.ClassifyOptions{}, func(opCtx context.Context) error {
+			return env.Git.Clone(opCtx, remoteURL, baseDir)
+		}); err != nil {
+			_ = os.RemoveAll(baseDir)
+			return nil, func() {}, err
+		}
+		env.BaseClones.Set(env.Repo, baseDir)
+	} else {
+		baseGit := env.Git.WithWorkDir(baseDir)
+		if err := env.RunOp(ctx, scenario, "fetch", loadgen.ClassifyOptions{}, func(opCtx context.Context) error {
+			_, fetchErr := baseGit.Run(opCtx, "fetch", "--no-tags", "origin")
+			return fetchErr
+		}); err != nil {
+			return nil, func() {}, err
+		}
+	}
+
+	baseGit := env.Git.WithWorkDir(baseDir)
+	startPoint, ok := resolveBaseStartPoint(ctx, baseGit)
+	if !ok {
+		if ctx.Err() != nil {
+			return nil, func() {}, ctx.Err()
+		}
+		// Empty remote repo (unborn HEAD): detached worktree cannot attach to an
+		// unborn ref, so fall back to a fresh temporary clone for this scenario.
+		dir, cleanup := newTempDir(env, ent, prefix)
+		g, err := cloneFresh(ctx, env, scenario, remoteURL, dir)
+		if err != nil {
+			cleanup()
+			return nil, func() {}, err
+		}
+		return g, cleanup, nil
+	}
+
+	worktreeDir := filepath.Join(env.WorkDir, fmt.Sprintf("%s-%d-%s", prefix, env.WorkerID, ent.HexID()))
+	cleanup := func() {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), worktreeCleanupTimeout)
+		defer cancel()
+		if err := baseGit.WorktreeRemove(cleanCtx, worktreeDir); err != nil {
+			_ = os.RemoveAll(worktreeDir)
+			_ = baseGit.WorktreePrune(cleanCtx)
+		}
+	}
+
+	if err := baseGit.WorktreeAddDetach(ctx, worktreeDir, startPoint); err != nil {
+		cleanup()
+		return nil, func() {}, err
+	}
+
+	name, email := workerAuthor(env)
+	return env.Git.WithWorkDir(worktreeDir).WithAuthor(name, email), cleanup, nil
+}
+
+func resolveBaseStartPoint(ctx context.Context, baseGit *loadgen.GitClient) (string, bool) {
+	candidates := []string{
+		"refs/remotes/origin/main",
+		"refs/remotes/origin/HEAD",
+		"HEAD",
+		"FETCH_HEAD",
+	}
+	for _, ref := range candidates {
+		if ctx.Err() != nil {
+			return "", false
+		}
+		if sha, err := baseGit.RevParse(ctx, ref); err == nil && sha != "" {
+			return sha, true
+		}
+	}
+	return "", false
 }
 
 func hasHead(ctx context.Context, g *loadgen.GitClient) bool {

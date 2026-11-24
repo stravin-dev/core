@@ -2,11 +2,15 @@ package loadgen
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -39,6 +43,75 @@ func scenarioRequiresSSH(s Scenario) bool {
 	return ok && sshScen.RequiresSSH()
 }
 
+// BaseCloneCache tracks persistent per-worker base clones keyed by repository name.
+// Each worker owns its own isolated BaseCloneCache under its private WorkDir;
+// base clones and .git directories are never shared across workers.
+type BaseCloneCache struct {
+	mu      sync.Mutex
+	rootDir string
+	clones  map[string]string
+}
+
+// NewBaseCloneCache creates a BaseCloneCache rooted at rootDir.
+func NewBaseCloneCache(rootDir string) *BaseCloneCache {
+	return &BaseCloneCache{
+		rootDir: filepath.Clean(rootDir),
+		clones:  make(map[string]string),
+	}
+}
+
+// Dir returns the deterministic local base-clone directory for repo inside rootDir.
+func (c *BaseCloneCache) Dir(repo string) string {
+	return filepath.Join(c.rootDir, sanitizeRepoDirName(repo))
+}
+
+// Get returns the cached base clone path for repo, if present.
+func (c *BaseCloneCache) Get(repo string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	dir, ok := c.clones[repo]
+	return dir, ok
+}
+
+// Set records dir as the cached base clone path for repo.
+func (c *BaseCloneCache) Set(repo, dir string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clones[repo] = dir
+}
+
+// Delete removes repo from the cache.
+func (c *BaseCloneCache) Delete(repo string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.clones, repo)
+}
+
+func sanitizeRepoDirName(repo string) string {
+	var b strings.Builder
+	b.Grow(len(repo))
+	modified := false
+	for _, r := range repo {
+		isSafe := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-'
+		if isSafe {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+			modified = true
+		}
+	}
+	name := b.String()
+	if name == "" || name == "." || name == ".." || strings.HasPrefix(name, ".") {
+		name = "repo_" + strings.TrimLeft(name, ".")
+		modified = true
+	}
+	if modified {
+		sum := sha256.Sum256([]byte(repo))
+		name = name + "-" + hex.EncodeToString(sum[:4])
+	}
+	return name
+}
+
 // ScenarioEnv provides per-worker isolated dependencies for executing a Scenario.
 type ScenarioEnv struct {
 	Config      Config
@@ -46,6 +119,7 @@ type ScenarioEnv struct {
 	Persona     Persona
 	Repo        string
 	WorkDir     string
+	BaseClones  *BaseCloneCache
 	RNG         *rand.Rand
 	Git         *GitClient
 	Oracle      *Oracle

@@ -351,3 +351,94 @@ func TestGitClientRevParseHeadFastPathAndFallbacks(t *testing.T) {
 		t.Fatalf("RevParse(HEAD) detached = (%q, %v), want (%q, nil)", gotDetached, err, wantSHA)
 	}
 }
+
+func TestGitClientWorktreeLifecycleAndRevParseFastPath(t *testing.T) {
+	ctx := context.Background()
+	baseDir := filepath.Join(t.TempDir(), "base")
+	if err := os.MkdirAll(baseDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	baseGit := NewGitClient(baseDir, GitOptions{}).WithAuthor("Test User", "test@stravin.local")
+	if _, err := baseGit.Run(ctx, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	if err := baseGit.WriteFile("README.md", []byte("base\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := baseGit.AddAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := baseGit.Commit(ctx, "initial"); err != nil {
+		t.Fatal(err)
+	}
+	baseSHA, err := baseGit.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatalf("RevParse base HEAD: %v", err)
+	}
+
+	wtDir := filepath.Join(t.TempDir(), "wt-1")
+	if err := baseGit.WorktreeAddDetach(ctx, wtDir, baseSHA); err != nil {
+		t.Fatalf("WorktreeAddDetach: %v", err)
+	}
+
+	// Linked detached worktree should hit resolveHeadSHA fast path.
+	wtSHA, ok := resolveHeadSHA(wtDir)
+	if !ok || wtSHA != baseSHA {
+		t.Fatalf("resolveHeadSHA(linked detached) = (%q, %v), want (%q, true)", wtSHA, ok, baseSHA)
+	}
+
+	wtGit := baseGit.WithWorkDir(wtDir)
+	gotSHA, err := wtGit.RevParse(ctx, "HEAD")
+	if err != nil || gotSHA != baseSHA {
+		t.Fatalf("RevParse(HEAD) in linked detached worktree = (%q, %v), want (%q, nil)", gotSHA, err, baseSHA)
+	}
+
+	// Switching to a new branch inside the linked worktree should also hit fast path via commondir.
+	if err := wtGit.CheckoutNewBranch(ctx, "wt-branch-1"); err != nil {
+		t.Fatalf("CheckoutNewBranch: %v", err)
+	}
+	if err := wtGit.WriteFile("wt.txt", []byte("from worktree\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wtGit.AddAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := wtGit.Commit(ctx, "wt commit"); err != nil {
+		t.Fatal(err)
+	}
+	wantBranchSHAOut, err := wtGit.Run(ctx, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD: %v", err)
+	}
+	wantBranchSHA := strings.TrimSpace(wantBranchSHAOut)
+
+	branchFastSHA, ok := resolveHeadSHA(wtDir)
+	if !ok || branchFastSHA != wantBranchSHA {
+		t.Fatalf("resolveHeadSHA(linked branch) = (%q, %v), want (%q, true)", branchFastSHA, ok, wantBranchSHA)
+	}
+
+	// Remove worktree and verify directory and metadata are cleaned up.
+	if err := baseGit.WorktreeRemove(ctx, wtDir); err != nil {
+		t.Fatalf("WorktreeRemove: %v", err)
+	}
+	if _, statErr := os.Stat(wtDir); !os.IsNotExist(statErr) {
+		t.Fatalf("expected worktree dir %s to be removed, statErr=%v", wtDir, statErr)
+	}
+
+	// Verify WorktreePrune cleans up manually deleted worktree metadata.
+	wtDir2 := filepath.Join(t.TempDir(), "wt-2")
+	if err := baseGit.WorktreeAddDetach(ctx, wtDir2, baseSHA); err != nil {
+		t.Fatalf("WorktreeAddDetach 2: %v", err)
+	}
+	if err := os.RemoveAll(wtDir2); err != nil {
+		t.Fatal(err)
+	}
+	if err := baseGit.WorktreePrune(ctx); err != nil {
+		t.Fatalf("WorktreePrune: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(baseDir, ".git", "worktrees"))
+	if err == nil && len(entries) != 0 {
+		t.Fatalf("expected 0 stale worktree metadata entries after prune, got %d", len(entries))
+	}
+}

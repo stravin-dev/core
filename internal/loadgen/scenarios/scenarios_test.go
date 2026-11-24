@@ -272,6 +272,7 @@ func newTestEnv(t *testing.T, root string, persona loadgen.Persona, workerID int
 		Persona:     persona,
 		Repo:        "repo-1",
 		WorkDir:     workDir,
+		BaseClones:  loadgen.NewBaseCloneCache(filepath.Join(workDir, "base")),
 		RNG:         rand.New(rand.NewPCG(seed, uint64(workerID+1))),
 		Git:         loadgen.NewGitClient(workDir, loadgen.GitOptions{}),
 		Oracle:      oracle,

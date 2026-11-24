@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -133,6 +134,7 @@ func (r *Runner) runWorker(ctx context.Context, cancelRun context.CancelFunc, pe
 		SSHKey:     r.cfg.SSHKey,
 		CmdTimeout: r.cfg.CmdTimeout,
 	})
+	baseClones := NewBaseCloneCache(filepath.Join(workDir, "base"))
 
 	for {
 		if ctx.Err() != nil {
@@ -145,7 +147,7 @@ func (r *Runner) runWorker(ctx context.Context, cancelRun context.CancelFunc, pe
 		}
 		repo := r.cfg.Repos[rng.IntN(len(r.cfg.Repos))]
 
-		r.executeScenario(ctx, cancelRun, persona, workerID, repo, workDir, rng, gitClient, scenario)
+		r.executeScenario(ctx, cancelRun, persona, workerID, repo, workDir, baseClones, rng, gitClient, scenario)
 
 		if ctx.Err() != nil {
 			return
@@ -164,6 +166,7 @@ func (r *Runner) executeScenario(
 	workerID int,
 	repo string,
 	workDir string,
+	baseClones *BaseCloneCache,
 	rng *rand.Rand,
 	gitClient *GitClient,
 	scenario Scenario,
@@ -184,6 +187,7 @@ func (r *Runner) executeScenario(
 		Persona:     persona,
 		Repo:        repo,
 		WorkDir:     workDir,
+		BaseClones:  baseClones,
 		RNG:         rng,
 		Git:         gitClient,
 		Oracle:      r.oracle,

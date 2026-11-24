@@ -22,13 +22,11 @@ func (s *agentRapidCheckpointBurst) Weight() int              { return 14 }
 
 func (s *agentRapidCheckpointBurst) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "agent-burst")
-	defer cleanup()
-
-	g, err := cloneFresh(ctx, env, s.Name(), repoURL(env), cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), repoURL(env), ent, "agent-burst")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
@@ -67,13 +65,11 @@ func (s *agentParallelBranchFanout) Weight() int              { return 12 }
 
 func (s *agentParallelBranchFanout) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "agent-fanout")
-	defer cleanup()
-
-	g, err := cloneFresh(ctx, env, s.Name(), repoURL(env), cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), repoURL(env), ent, "agent-fanout")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
@@ -124,25 +120,25 @@ func (s *agentSharedBranchRace) Weight() int              { return 12 }
 
 func (s *agentSharedBranchRace) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "agent-race")
-	defer cleanup()
-
 	const sharedBranch = "agent/shared-race"
-	g, err := cloneFresh(ctx, env, s.Name(), repoURL(env), cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), repoURL(env), ent, "agent-race")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
 
 	// Start from remote shared branch if it already exists; otherwise branch from HEAD.
+	// Use a unique local branch name to avoid worktree branch-lock contention.
+	localBranch := ent.BranchName("shared-race")
 	if fetchErr := g.Fetch(ctx, "origin", sharedBranch); fetchErr == nil {
-		if _, err := g.Run(ctx, "checkout", "-B", sharedBranch, "FETCH_HEAD"); err != nil {
+		if _, err := g.Run(ctx, "checkout", "-B", localBranch, "FETCH_HEAD"); err != nil {
 			return err
 		}
 	} else {
-		if _, err := g.Run(ctx, "checkout", "-B", sharedBranch); err != nil {
+		if _, err := g.Run(ctx, "checkout", "-B", localBranch); err != nil {
 			return err
 		}
 	}
@@ -168,14 +164,12 @@ func (s *agentDeepTreeRefactor) Weight() int              { return 10 }
 
 func (s *agentDeepTreeRefactor) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "agent-tree")
-	defer cleanup()
-
 	remote := repoURL(env)
-	g, err := cloneFresh(ctx, env, s.Name(), remote, cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), remote, ent, "agent-tree")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
@@ -218,7 +212,7 @@ func (s *agentDeepTreeRefactor) Run(ctx context.Context, env *loadgen.ScenarioEn
 		switch {
 		case i < len(paths)/2:
 			dst := filepath.ToSlash(filepath.Join("refactored", ent.HexID(), filepath.Base(p)))
-			if err := os.MkdirAll(filepath.Dir(filepath.Join(cloneDir, dst)), 0o750); err != nil {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(g.WorkDir(), dst)), 0o750); err != nil {
 				return err
 			}
 			if _, err := g.Run(ctx, "mv", p, dst); err != nil {
@@ -277,14 +271,12 @@ func (s *agentOrphanBranchArtifact) Weight() int              { return 8 }
 
 func (s *agentOrphanBranchArtifact) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "agent-orphan")
-	defer cleanup()
-
 	remote := repoURL(env)
-	g, err := cloneFresh(ctx, env, s.Name(), remote, cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), remote, ent, "agent-orphan")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 
 	branch := ent.BranchName("artifact")
 	if _, err := g.Run(ctx, "checkout", "--orphan", branch); err != nil {
@@ -349,13 +341,11 @@ func (s *agentMergeCommitDiamond) Weight() int              { return 10 }
 
 func (s *agentMergeCommitDiamond) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "agent-diamond")
-	defer cleanup()
-
-	g, err := cloneFresh(ctx, env, s.Name(), repoURL(env), cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), repoURL(env), ent, "agent-diamond")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
@@ -426,13 +416,11 @@ func (s *agentCherryPickBackport) Weight() int              { return 8 }
 
 func (s *agentCherryPickBackport) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "agent-cherry")
-	defer cleanup()
-
-	g, err := cloneFresh(ctx, env, s.Name(), repoURL(env), cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), repoURL(env), ent, "agent-cherry")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
@@ -475,7 +463,7 @@ func (s *agentCherryPickBackport) Run(ctx context.Context, env *loadgen.Scenario
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(filepath.Join(cloneDir, pickFile)); err != nil {
+	if _, err := os.Stat(filepath.Join(g.WorkDir(), pickFile)); err != nil {
 		return fmt.Errorf("cherry-picked file %s missing on release branch: %w", pickFile, err)
 	}
 
@@ -502,13 +490,11 @@ func (s *agentWasmHookAllowAndReject) Weight() int              { return 8 }
 
 func (s *agentWasmHookAllowAndReject) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "agent-hook")
-	defer cleanup()
-
-	g, err := cloneFresh(ctx, env, s.Name(), repoURL(env), cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), repoURL(env), ent, "agent-hook")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
@@ -558,14 +544,12 @@ func (s *agentHighChurnCompactionTrigger) Weight() int              { return 8 }
 
 func (s *agentHighChurnCompactionTrigger) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "agent-churn")
-	defer cleanup()
-
 	remote := repoURL(env)
-	g, err := cloneFresh(ctx, env, s.Name(), remote, cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), remote, ent, "agent-churn")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
@@ -638,8 +622,6 @@ func (s *agentProtocolSwitchHTTPSSH) RequiresSSH() bool        { return true }
 
 func (s *agentProtocolSwitchHTTPSSH) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	httpDir, httpCleanup := newTempDir(env, ent, "agent-proto-http")
-	defer httpCleanup()
 	sshDir, sshCleanup := newTempDir(env, ent, "agent-proto-ssh")
 	defer sshCleanup()
 
@@ -647,10 +629,11 @@ func (s *agentProtocolSwitchHTTPSSH) Run(ctx context.Context, env *loadgen.Scena
 	sshURL := sshRepoURL(env)
 
 	// Step A: Push over Smart HTTP -> immediately fetch/verify over SSH.
-	httpGit, err := cloneFresh(ctx, env, s.Name(), httpURL, httpDir)
+	httpGit, httpCleanup, err := acquireWorktree(ctx, env, s.Name(), httpURL, ent, "agent-proto-http")
 	if err != nil {
 		return err
 	}
+	defer httpCleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), httpGit, ent); err != nil {
 		return err
 	}
@@ -708,14 +691,12 @@ func (s *agentCorruptRefNegativeTest) Weight() int              { return 6 }
 
 func (s *agentCorruptRefNegativeTest) Run(ctx context.Context, env *loadgen.ScenarioEnv) error {
 	ent := NewEntropy(env.RNG)
-	cloneDir, cleanup := newTempDir(env, ent, "agent-badref")
-	defer cleanup()
-
 	remote := repoURL(env)
-	g, err := cloneFresh(ctx, env, s.Name(), remote, cloneDir)
+	g, cleanup, err := acquireWorktree(ctx, env, s.Name(), remote, ent, "agent-badref")
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	if err := ensureBaseCommit(ctx, env, s.Name(), g, ent); err != nil {
 		return err
 	}
