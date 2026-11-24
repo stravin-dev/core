@@ -1,3 +1,11 @@
+## [1.10.1](https://github.com/stravin-dev/core/compare/v1.10.0...v1.10.1) (2026-11-24)
+
+
+### Bug Fixes
+
+* **deps:** bump go.opentelemetry.io/otel modules to v1.47.0 / v0.23.0 ([14e13ef](https://github.com/stravin-dev/core/commit/14e13ef01dba172ba5dd9c40d82e4833cfc4f133)), closes [#3](https://github.com/stravin-dev/core/issues/3) [#5](https://github.com/stravin-dev/core/issues/5) [#6](https://github.com/stravin-dev/core/issues/6) [25-#32](https://github.com/25-/issues/32) [#3](https://github.com/stravin-dev/core/issues/3) [#5](https://github.com/stravin-dev/core/issues/5) [#6](https://github.com/stravin-dev/core/issues/6) [#28](https://github.com/stravin-dev/core/issues/28) [#29](https://github.com/stravin-dev/core/issues/29) [30-#32](https://github.com/30-/issues/32) [25-#27](https://github.com/25-/issues/27)
+* **deps:** bump OpenTelemetry Go modules to v1.47.0 / v0.23.0 ([#173](https://github.com/stravin-dev/core/issues/173)) ([63c0591](https://github.com/stravin-dev/core/commit/63c0591759584005596952846d2c07a48bfbe2e7))
+
 # [1.10.0](https://github.com/stravin-dev/core/compare/v1.9.8...v1.10.0) (2026-11-24)
 
 
