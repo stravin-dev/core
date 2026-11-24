@@ -262,7 +262,7 @@ func (e *Engine) effectiveMemoryPages(memoryLimitMB int) uint32 {
 	}
 	const maxMemoryLimitMB = math.MaxUint32 / wasmPagesPerMB
 	if mb > maxMemoryLimitMB {
-		mb = maxMemoryLimitMB
+		return uint32(maxMemoryLimitMB) * wasmPagesPerMB
 	}
 	return uint32(mb) * wasmPagesPerMB
 }
