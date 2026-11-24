@@ -531,8 +531,9 @@ func (s *agentWasmHookAllowAndReject) Run(ctx context.Context, env *loadgen.Scen
 		return err
 	}
 
-	// Verify repository integrity remains clean after allow + reject sequence.
-	return runFsck(ctx, env, s.Name(), g)
+	// Verify repository integrity remains clean after allow + reject sequence
+	// using an isolated fresh clone rather than the shared-base linked worktree.
+	return runFsckFreshClone(ctx, env, s.Name(), repoURL(env), ent, "agent-hook-verify")
 }
 
 // 20. agent_high_churn_compaction_trigger: rapid small packs triggering stravin-pack compaction under concurrent reads.
@@ -606,10 +607,16 @@ func (s *agentHighChurnCompactionTrigger) Run(ctx context.Context, env *loadgen.
 	if readerErr != nil {
 		return readerErr
 	}
-	if err := fetchAndVerifySHA(ctx, env, s.Name(), g, branch, headSHA); err != nil {
+	verifyDir, verifyCleanup := newTempDir(env, ent, "agent-churn-verify")
+	defer verifyCleanup()
+	vg, err := cloneFresh(ctx, env, s.Name(), remote, verifyDir)
+	if err != nil {
 		return err
 	}
-	return runFsck(ctx, env, s.Name(), g)
+	if err := fetchAndVerifySHA(ctx, env, s.Name(), vg, branch, headSHA); err != nil {
+		return err
+	}
+	return runFsck(ctx, env, s.Name(), vg)
 }
 
 // 21. agent_protocol_switch_http_ssh: push over Smart HTTP -> immediately fetch/verify over SSH (and reverse).
@@ -676,10 +683,16 @@ func (s *agentProtocolSwitchHTTPSSH) Run(ctx context.Context, env *loadgen.Scena
 	}); err != nil {
 		return err
 	}
-	if err := fetchAndVerifySHA(ctx, env, s.Name(), httpGit, sshBranch, sshSHA); err != nil {
+	verifyDir, verifyCleanup := newTempDir(env, ent, "agent-proto-verify")
+	defer verifyCleanup()
+	vg, err := cloneFresh(ctx, env, s.Name(), httpURL, verifyDir)
+	if err != nil {
 		return err
 	}
-	return runFsck(ctx, env, s.Name(), httpGit)
+	if err := fetchAndVerifySHA(ctx, env, s.Name(), vg, sshBranch, sshSHA); err != nil {
+		return err
+	}
+	return runFsck(ctx, env, s.Name(), vg)
 }
 
 // 22. agent_corrupt_ref_negative_test: invalid ref name rejected cleanly without harming repo health.
@@ -732,5 +745,5 @@ func (s *agentCorruptRefNegativeTest) Run(ctx context.Context, env *loadgen.Scen
 	}); err != nil {
 		return err
 	}
-	return runFsck(ctx, env, s.Name(), g)
+	return runFsckFreshClone(ctx, env, s.Name(), remote, ent, "agent-badref-verify")
 }
