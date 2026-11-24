@@ -1,3 +1,11 @@
+## [1.9.8](https://github.com/stravin-dev/core/compare/v1.9.7...v1.9.8) (2026-11-24)
+
+
+### Bug Fixes
+
+* **loadgen:** disable git gc.auto/maintenance.auto and isolate runFsck clones ([0aa25b3](https://github.com/stravin-dev/core/commit/0aa25b335a3937b90596c13c2037f81b629889e7)), closes [#164](https://github.com/stravin-dev/core/issues/164)
+* **loadgen:** disable git gc.auto/maintenance.auto and isolate runFsck clones ([#164](https://github.com/stravin-dev/core/issues/164)) ([#165](https://github.com/stravin-dev/core/issues/165)) ([9da7ad6](https://github.com/stravin-dev/core/commit/9da7ad66b34dcd2bd7ced996686f72e04a803f78))
+
 ## [1.9.7](https://github.com/stravin-dev/core/compare/v1.9.6...v1.9.7) (2026-11-24)
 
 
