@@ -1,3 +1,10 @@
+## [1.12.1](https://github.com/stravin-dev/core/compare/v1.12.0...v1.12.1) (2026-11-24)
+
+
+### Bug Fixes
+
+* persist s3 to disk to reduce memory locally ([e162f3b](https://github.com/stravin-dev/core/commit/e162f3b335c74fc5a8886c86b8e255923c7a098c))
+
 # [1.12.0](https://github.com/stravin-dev/core/compare/v1.11.0...v1.12.0) (2026-11-24)
 
 
