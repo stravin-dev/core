@@ -129,6 +129,7 @@ func TestFlociIntegration_NodeUploadPackReadPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
+	t.Cleanup(mat.Close)
 	srv, err := NewServer(ServerConfig{
 		Materializer: mat,
 		GitExecutor:  gitexec.NewSubprocessExecutor(gitexec.Config{}),
@@ -305,6 +306,7 @@ func TestFlociIntegration_NodeReceivePackPushAndFetchRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMaterializer write: %v", err)
 	}
+	t.Cleanup(writeMat.Close)
 
 	hookEngine := wasm.NewEngine(
 		NewS3WasmLoader(s3Store),
@@ -391,6 +393,7 @@ func TestFlociIntegration_NodeReceivePackPushAndFetchRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMaterializer read: %v", err)
 	}
+	t.Cleanup(readMat.Close)
 	readSrv, err := NewServer(ServerConfig{
 		Materializer: readMat,
 		GitExecutor:  gitexec.NewSubprocessExecutor(gitexec.Config{}),
@@ -556,6 +559,7 @@ func TestFlociIntegration_NodeReceivePackKMSEnvelopeEncryption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMaterializer: %v", err)
 	}
+	t.Cleanup(mat.Close)
 	hookEngine := wasm.NewEngine(
 		NewS3WasmLoader(encStore),
 		NewDDBHookConfigStore(ddbRepo),

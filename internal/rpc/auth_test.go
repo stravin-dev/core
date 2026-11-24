@@ -413,3 +413,66 @@ func TestTLSMTLS_RoundTrip(t *testing.T) {
 		}
 	})
 }
+
+func TestTransportOptions_Large256KiBStreaming(t *testing.T) {
+	srvOpts, err := rpc.ServerOptions(rpc.TransportConfig{AllowInsecure: true})
+	if err != nil {
+		t.Fatalf("ServerOptions: %v", err)
+	}
+	cliOpts, err := rpc.ClientDialOptions(rpc.TransportConfig{AllowInsecure: true})
+	if err != nil {
+		t.Fatalf("ClientDialOptions: %v", err)
+	}
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	gs := grpc.NewServer(srvOpts...)
+	rpc.RegisterGitWireServer(gs, &echoHandler{})
+	go func() { _ = gs.Serve(lis) }()
+	t.Cleanup(func() {
+		gs.GracefulStop()
+		_ = lis.Close()
+	})
+
+	cc, err := grpc.NewClient(lis.Addr().String(), cliOpts...)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = cc.Close() })
+
+	client := rpc.NewGRPCGitWireClient(cc)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := client.OpenStream(ctx, rpc.RequestMeta{
+		TenantID:  "acme",
+		RepoID:    "large-stream",
+		Operation: rpc.OpUploadPack,
+	})
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+
+	chunk := make([]byte, 256*1024)
+	for i := range chunk {
+		chunk[i] = byte(i)
+	}
+	const chunks = 8
+	for i := 0; i < chunks; i++ {
+		if err := stream.Send(&rpc.Frame{Data: chunk}); err != nil {
+			t.Fatalf("Send %d: %v", i, err)
+		}
+	}
+	if err := stream.Send(&rpc.Frame{EOF: true}); err != nil {
+		t.Fatalf("Send EOF: %v", err)
+	}
+	got, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	wantLen := len("ack:") + chunks*len(chunk)
+	if len(got.Data) != wantLen {
+		t.Fatalf("echoed payload len = %d, want %d", len(got.Data), wantLen)
+	}
+}

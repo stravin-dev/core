@@ -175,7 +175,9 @@ func (h *ReceivePackHandler) HandleReceivePack(ctx context.Context, meta rpc.Req
 	}
 
 	// 2. Load authoritative repo metadata and current refs from DynamoDB.
-	repoMeta, currentRefs, err := h.materializer.LoadAuthoritativeRefs(ctx, repo)
+	// For update/delete pushes without new ref creations, only the targeted refs
+	// are fetched via GetRef instead of scanning all ref shards via ListRefs.
+	repoMeta, currentRefs, checkCollisions, err := h.materializer.LoadAuthoritativeRefsForCommands(ctx, repo, cmds)
 	if err != nil {
 		if errors.Is(err, ddb.ErrNotFound) {
 			return status.Errorf(codes.NotFound, "repository %s not found", repo)
@@ -225,19 +227,22 @@ func (h *ReceivePackHandler) HandleReceivePack(ctx context.Context, meta rpc.Req
 	}
 
 	// 5b. Reject ref/directory prefix collisions in the effective post-push ref set.
-	if collisions := findRefCollisions(cmds, currentRefs); len(collisions) > 0 {
-		statuses := make([]refStatus, 0, len(cmds))
-		for _, c := range cmds {
-			if other, ok := collisions[c.RefName]; ok {
-				statuses = append(statuses, refStatus{
-					RefName: c.RefName,
-					Err:     fmt.Sprintf("ref/directory collision with %s", other),
-				})
-			} else {
-				statuses = append(statuses, refStatus{RefName: c.RefName, Err: "atomic push failed"})
+	// Skipped when all commands are updates/deletes (no new ref names introduced).
+	if checkCollisions {
+		if collisions := findRefCollisions(cmds, currentRefs); len(collisions) > 0 {
+			statuses := make([]refStatus, 0, len(cmds))
+			for _, c := range cmds {
+				if other, ok := collisions[c.RefName]; ok {
+					statuses = append(statuses, refStatus{
+						RefName: c.RefName,
+						Err:     fmt.Sprintf("ref/directory collision with %s", other),
+					})
+				} else {
+					statuses = append(statuses, refStatus{RefName: c.RefName, Err: "atomic push failed"})
+				}
 			}
+			return h.sendStatusAndFinish(stream, reportStatus, useSideBand, "unpack ok", statuses, nil)
 		}
-		return h.sendStatusAndFinish(stream, reportStatus, useSideBand, "unpack ok", statuses, nil)
 	}
 
 	// 6. Ingest packfile, run thin-pack completion, and build .idx v2 when objects are pushed.
@@ -260,7 +265,9 @@ func (h *ReceivePackHandler) HandleReceivePack(ctx context.Context, meta rpc.Req
 		packSHA256 = ingested.packSHA256
 		packReader = ingested.reader
 		syncHandle = ingested.handle
-		defer syncHandle.Release()
+		if syncHandle != nil {
+			defer syncHandle.Release()
+		}
 	}
 
 	// 7. Overlap S3 PutPack (Goroutine A) and Tier 1 Wasm Hooks (Goroutine B).
@@ -453,59 +460,60 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 		return ingestedPack{}, fmt.Errorf("object format: %w", err)
 	}
 
-	handle, err := h.materializer.SyncPacksAndPin(packCtx, repo, repoMeta)
-	if err != nil {
-		recordSpanError(span, err)
-		return ingestedPack{}, fmt.Errorf("sync base packs: %w", err)
-	}
-	baseResolver := handle.BaseResolver()
+	var (
+		handle       *cache.RepoHandle
+		baseResolver pack.BaseResolver
+		completed    []byte
+		parsed       *pack.ParsedPack
+		localOK      bool
+	)
 
-	var completed []byte
-	if algoCompleter, ok := h.thinCompleter.(pack.AlgorithmAwareThinPackCompleter); ok {
-		completed, err = algoCompleter.CompleteWithAlgorithm(packCtx, rawPack, baseResolver, algo)
-	} else {
-		completed, err = h.thinCompleter.Complete(packCtx, rawPack, baseResolver)
-	}
-	if err != nil {
-		handle.Release()
-		recordSpanError(span, err)
-		return ingestedPack{}, fmt.Errorf("thin-pack completion: %w", err)
-	}
-
-	parsed, err := pack.Parse(bytes.NewReader(completed), pack.ParseOptions{
-		Limits:        h.packLimits,
-		HashAlgorithm: algo,
-	})
-	if err != nil {
-		handle.Release()
-		recordSpanError(span, err)
-		return ingestedPack{}, fmt.Errorf("parse completed pack: %w", err)
-	}
-
-	// Verify every pushed non-delete target OID is reachable in the new pack or existing repo packs.
-	for _, c := range cmds {
-		if c.IsDelete() {
-			continue
+	// Fast path: pin warm local NVMe packs (0 DDB calls, 0 singleflight contention).
+	if pinned, pinErr := h.cache.Pin(repo); pinErr == nil {
+		resolver := pinned.BaseResolver()
+		if comp, p, verifyErr := h.completeAndVerifyPack(packCtx, rawPack, algo, cmds, resolver); verifyErr == nil {
+			handle = pinned
+			baseResolver = resolver
+			completed = comp
+			parsed = p
+			localOK = true
+		} else {
+			pinned.Release()
 		}
-		oid, err := pack.ParseOIDForAlgorithm(c.NewOID, algo)
+	} else if h.hookEngine == nil {
+		// Cold repo with no hooks: a self-contained pack (e.g., initial push) needs no remote sync.
+		resolver := h.cache.BaseResolver(repo)
+		if comp, p, verifyErr := h.completeAndVerifyPack(packCtx, rawPack, algo, cmds, resolver); verifyErr == nil {
+			baseResolver = resolver
+			completed = comp
+			parsed = p
+			localOK = true
+		}
+	}
+
+	// Slow path: linearizable full SyncAndPin to fetch any missing base packs from S3.
+	if !localOK {
+		syncRes, syncErr := h.materializer.SyncAndPin(packCtx, repo)
+		if syncErr != nil {
+			recordSpanError(span, syncErr)
+			return ingestedPack{}, fmt.Errorf("sync base packs: %w", syncErr)
+		}
+		handle = syncRes.Handle
+		baseResolver = handle.BaseResolver()
+
+		completed, parsed, err = h.completeAndVerifyPack(packCtx, rawPack, algo, cmds, baseResolver)
 		if err != nil {
 			handle.Release()
 			recordSpanError(span, err)
-			return ingestedPack{}, fmt.Errorf("invalid target oid for %s: %w", c.RefName, err)
-		}
-		if _, inNew := parsed.Objects[oid]; !inNew {
-			if _, _, baseErr := baseResolver.ResolveBase(oid); baseErr != nil {
-				handle.Release()
-				err = fmt.Errorf("missing target object %s for %s", c.NewOID, c.RefName)
-				recordSpanError(span, err)
-				return ingestedPack{}, err
-			}
+			return ingestedPack{}, err
 		}
 	}
 
 	idxBytes, err := pack.BuildIdx(parsed)
 	if err != nil {
-		handle.Release()
+		if handle != nil {
+			handle.Release()
+		}
 		recordSpanError(span, err)
 		return ingestedPack{}, fmt.Errorf("build idx v2: %w", err)
 	}
@@ -521,6 +529,53 @@ func (h *ReceivePackHandler) ingestAndIndexPack(
 		reader:     pack.NewPackReader(parsed, baseResolver),
 		handle:     handle,
 	}, nil
+}
+
+func (h *ReceivePackHandler) completeAndVerifyPack(
+	ctx context.Context,
+	rawPack []byte,
+	algo pack.HashAlgorithm,
+	cmds []ddb.RefUpdate,
+	baseResolver pack.BaseResolver,
+) ([]byte, *pack.ParsedPack, error) {
+	var (
+		completed []byte
+		err       error
+	)
+	if algoCompleter, ok := h.thinCompleter.(pack.AlgorithmAwareThinPackCompleter); ok {
+		completed, err = algoCompleter.CompleteWithAlgorithm(ctx, rawPack, baseResolver, algo)
+	} else {
+		completed, err = h.thinCompleter.Complete(ctx, rawPack, baseResolver)
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("thin-pack completion: %w", err)
+	}
+
+	parsed, err := pack.Parse(bytes.NewReader(completed), pack.ParseOptions{
+		Limits:        h.packLimits,
+		HashAlgorithm: algo,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse completed pack: %w", err)
+	}
+
+	// Verify every pushed non-delete target OID is reachable in the new pack or existing repo packs.
+	for _, c := range cmds {
+		if c.IsDelete() {
+			continue
+		}
+		oid, err := pack.ParseOIDForAlgorithm(c.NewOID, algo)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid target oid for %s: %w", c.RefName, err)
+		}
+		if _, inNew := parsed.Objects[oid]; !inNew {
+			if _, _, baseErr := baseResolver.ResolveBase(oid); baseErr != nil {
+				return nil, nil, fmt.Errorf("missing target object %s for %s", c.NewOID, c.RefName)
+			}
+		}
+	}
+
+	return completed, parsed, nil
 }
 
 type pushOverlapRequest struct {

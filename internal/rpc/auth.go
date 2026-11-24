@@ -23,6 +23,11 @@ const (
 	HeaderInternalToken = "x-stravin-internal-token" //nolint:gosec // gRPC metadata header name, not a secret
 	// HeaderAuthorization is the standard gRPC metadata key for Bearer token auth.
 	HeaderAuthorization = "authorization"
+
+	// DefaultInitialWindowSize is the per-stream HTTP/2 flow-control window (4 MiB).
+	DefaultInitialWindowSize = 4 << 20
+	// DefaultInitialConnWindowSize is the connection-level HTTP/2 flow-control window (16 MiB).
+	DefaultInitialConnWindowSize = 16 << 20
 )
 
 // TransportConfig configures authentication and TLS/mTLS for the internal GitWire gRPC boundary.
@@ -216,6 +221,11 @@ func ServerOptions(cfg TransportConfig) ([]grpc.ServerOption, error) {
 		return nil, errors.New("rpc: STRAVIN_INTERNAL_GRPC_TOKEN or mTLS (STRAVIN_GRPC_TLS_CA) required unless STRAVIN_GRPC_ALLOW_INSECURE=true")
 	}
 
+	opts = append(opts,
+		grpc.InitialWindowSize(DefaultInitialWindowSize),
+		grpc.InitialConnWindowSize(DefaultInitialConnWindowSize),
+	)
+
 	return opts, nil
 }
 
@@ -250,6 +260,11 @@ func ClientDialOptions(cfg TransportConfig) ([]grpc.DialOption, error) {
 	} else if !hasClientCert && !cfg.AllowInsecure {
 		return nil, errors.New("rpc: STRAVIN_INTERNAL_GRPC_TOKEN or mTLS client cert required unless STRAVIN_GRPC_ALLOW_INSECURE=true")
 	}
+
+	opts = append(opts,
+		grpc.WithInitialWindowSize(DefaultInitialWindowSize),
+		grpc.WithInitialConnWindowSize(DefaultInitialConnWindowSize),
+	)
 
 	return opts, nil
 }

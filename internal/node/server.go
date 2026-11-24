@@ -34,7 +34,7 @@ const (
 	// HeaderSmartHTTPServiceHeader prepends the Smart HTTP `# service=...` pkt-line header.
 	HeaderSmartHTTPServiceHeader = "x-stravin-service-header"
 
-	streamChunkSize       = 32 * 1024
+	streamChunkSize       = 256 * 1024
 	defaultBundleCacheTTL = 5 * time.Second
 	maxV2PeekPktLen       = 64
 )

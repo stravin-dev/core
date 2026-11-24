@@ -37,6 +37,9 @@ const (
 	// DefaultMaxDecompressedBodyBytes bounds decompressed Smart HTTP POST bodies (256 MiB)
 	// to mitigate gzip-bomb resource exhaustion.
 	DefaultMaxDecompressedBodyBytes int64 = 256 << 20
+
+	httpStreamSmallChunkThreshold = 32 * 1024
+	httpStreamFlushThreshold      = 256 * 1024
 )
 
 var (
@@ -243,8 +246,11 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Ensure headers/prefix are flushed even if upstream returned an empty stream.
+	// Ensure headers/prefix and any remaining buffered bytes are flushed.
 	sw.ensureHeader()
+	if sw.unflushed > 0 {
+		sw.flush()
+	}
 	if exitCode != 0 {
 		h.metrics.RecordRequest(ctx, "http", route.metricOp, strconv.Itoa(http.StatusBadGateway), "upstream", time.Since(start))
 		h.logger.WarnContext(ctx, "git smart http upstream non-zero exit",
@@ -555,6 +561,8 @@ type smartHTTPStreamWriter struct {
 	contentType string
 	prefix      []byte
 	wroteHeader bool
+	wroteFirst  bool
+	unflushed   int
 }
 
 func (s *smartHTTPStreamWriter) ensureHeader() {
@@ -570,11 +578,20 @@ func (s *smartHTTPStreamWriter) ensureHeader() {
 	}
 }
 
+func (s *smartHTTPStreamWriter) flush() {
+	if f, ok := s.w.(http.Flusher); ok {
+		f.Flush()
+	}
+	s.unflushed = 0
+}
+
 func (s *smartHTTPStreamWriter) Write(p []byte) (int, error) {
 	s.ensureHeader()
 	n, err := s.w.Write(p)
-	if f, ok := s.w.(http.Flusher); ok {
-		f.Flush()
+	s.unflushed += n
+	if !s.wroteFirst || len(p) < httpStreamSmallChunkThreshold || s.unflushed >= httpStreamFlushThreshold {
+		s.wroteFirst = true
+		s.flush()
 	}
 	return n, err
 }

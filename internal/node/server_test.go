@@ -595,7 +595,7 @@ func TestServer_UploadPackSanitizesInvalidUTF8Stderr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStream: %v", err)
 	}
-	if err := stream.Send(&rpc.Frame{EOF: true}); err != nil {
+	if err := stream.Send(&rpc.Frame{EOF: true}); err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("stream.Send: %v", err)
 	}
 
@@ -692,7 +692,7 @@ func TestServer_UploadPackExitStatusMetricAndRootSpan(t *testing.T) {
 			if err != nil {
 				t.Fatalf("OpenStream: %v", err)
 			}
-			if err := stream.Send(&rpc.Frame{EOF: true}); err != nil {
+			if err := stream.Send(&rpc.Frame{EOF: true}); err != nil && !errors.Is(err, io.EOF) {
 				t.Fatalf("stream.Send: %v", err)
 			}
 
@@ -918,7 +918,7 @@ func TestServer_UploadPackConcurrencyCapAndQueueing(t *testing.T) {
 				errCh <- err
 				return
 			}
-			if err := stream.Send(&rpc.Frame{EOF: true}); err != nil {
+			if err := stream.Send(&rpc.Frame{EOF: true}); err != nil && !errors.Is(err, io.EOF) {
 				errCh <- err
 				return
 			}
