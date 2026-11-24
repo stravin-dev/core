@@ -26,7 +26,7 @@ const (
 	defaultMaxConcurrentPackFetches = 8
 	defaultPruneReconcileInterval   = 30 * time.Second
 	defaultAuxIndexRefreshTimeout   = 30 * time.Second
-	defaultAuxIndexRefreshInterval  = 2 * time.Second
+	defaultAuxIndexRefreshInterval  = 10 * time.Second
 	maxImmediateAuxRetries          = 2
 )
 
@@ -64,7 +64,7 @@ type MaterializerConfig struct {
 	MaxConcurrentPackFetches int
 	PruneReconcileInterval   time.Duration
 	// AuxIndexRefreshInterval sets the minimum cooldown between background
-	// MIDX/bitmap/commit-graph refreshes per repository. Zero defaults to 2s;
+	// MIDX/bitmap/commit-graph refreshes per repository. Zero defaults to 10s;
 	// negative values disable the cooldown (useful for deterministic tests).
 	AuxIndexRefreshInterval time.Duration
 }
@@ -545,7 +545,7 @@ func (m *Materializer) SyncAndPin(ctx context.Context, repo tenant.RepoKey) (Syn
 	if err != nil {
 		return SyncResult{}, err
 	}
-	if !m.shouldReconcilePrune(repo, false) {
+	if !m.shouldReconcilePrune(repo) {
 		if cachedRefs, ok := m.tryFastPathVersions(repo, initialMeta.RefVersion, initialMeta.ManifestVersion); ok {
 			handle, pinErr := m.cache.Pin(repo)
 			if pinErr == nil {
@@ -660,7 +660,7 @@ func (m *Materializer) queryManifestShardWithTrace(ctx context.Context, repo ten
 }
 
 func (m *Materializer) syncManifestPacks(ctx context.Context, repo tenant.RepoKey, meta ddb.RepoMeta) (fetched, cached, pruned int, err error) {
-	if m.isManifestSynced(repo, meta.ManifestVersion) && !m.shouldReconcilePrune(repo, false) {
+	if m.isManifestSynced(repo, meta.ManifestVersion) && !m.shouldReconcilePrune(repo) {
 		return 0, 0, 0, nil
 	}
 
@@ -755,7 +755,7 @@ func (m *Materializer) syncManifestPacks(ctx context.Context, repo tenant.RepoKe
 		}
 	}
 
-	if m.shouldReconcilePrune(repo, fetched > 0) {
+	if m.shouldReconcilePrune(repo) {
 		pruned = m.pruneSupersededPacks(ctx, repo, meta)
 	}
 
@@ -763,10 +763,7 @@ func (m *Materializer) syncManifestPacks(ctx context.Context, repo tenant.RepoKe
 	return fetched, cached, pruned, nil
 }
 
-func (m *Materializer) shouldReconcilePrune(repo tenant.RepoKey, fetchedNewPacks bool) bool {
-	if fetchedNewPacks {
-		return true
-	}
+func (m *Materializer) shouldReconcilePrune(repo tenant.RepoKey) bool {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 	last, ok := m.lastReconcile[repo]

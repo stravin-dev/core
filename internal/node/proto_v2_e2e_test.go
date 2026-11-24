@@ -342,6 +342,14 @@ func TestWireProtocolV2_HTTP_SSH_Fallback_PartialClone_And_DualHash(t *testing.T
 			}
 			stack.runGit(cloneV2HTTP, nil, "fsck", "--full", "--strict")
 
+			// Verify annotated tag peeling fallback over Smart HTTP v2.
+			stack.runGit(seedDir, nil, "tag", "-a", "v1.0", "-m", "release v1.0")
+			stack.runGit(seedDir, nil, "-c", "protocol.version=2", "push", httpURL, "refs/tags/v1.0")
+			tagLsOut := stack.runGit("", nil, "-c", "protocol.version=2", "ls-remote", "--tags", httpURL)
+			if !strings.Contains(tagLsOut, "refs/tags/v1.0\n") || !strings.Contains(tagLsOut, commit1+"\trefs/tags/v1.0^{}\n") {
+				t.Fatalf("HTTP v2 ls-remote --tags missing peeled annotated tag for %s:\n%s", commit1, tagLsOut)
+			}
+
 			partialHTTP := filepath.Join(t.TempDir(), "partial-http")
 			partialOut := stack.runGit("", []string{"GIT_TRACE_PACKET=1"}, "-c", "protocol.version=2", "clone", "--filter=blob:none", "--no-checkout", httpURL, partialHTTP)
 			if !strings.Contains(partialOut, "filter blob:none") {
