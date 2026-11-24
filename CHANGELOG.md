@@ -1,3 +1,15 @@
+## [1.10.2](https://github.com/stravin-dev/core/compare/v1.10.1...v1.10.2) (2026-11-24)
+
+
+### Bug Fixes
+
+* **ctrl:** bound uint64-to-int64 failover epoch conversions in OTel spans ([ac0aa77](https://github.com/stravin-dev/core/commit/ac0aa77495a029eff8cac2e837659c9895b69cd2))
+* **ctrl:** bound uint64-to-int64 failover epoch conversions in OTel spans ([#179](https://github.com/stravin-dev/core/issues/179)) ([f0e9b99](https://github.com/stravin-dev/core/commit/f0e9b997b6ef43aba2eb3bcb3e4ed6b287fa3817))
+* **edge:** preserve gRPC Recv status error when Send returns io.EOF ([341a0d8](https://github.com/stravin-dev/core/commit/341a0d83c1d731717a7d21fddf092d68ff0dbc73))
+* **edge:** preserve gRPC Recv status error when Send returns io.EOF ([#180](https://github.com/stravin-dev/core/issues/180)) ([af23fa3](https://github.com/stravin-dev/core/commit/af23fa3eae53afc944c47e71be1927c5d630c502))
+* **node:** clamp failover epoch uint64 to int64 conversions ([c5d156a](https://github.com/stravin-dev/core/commit/c5d156ae07ef758dac8301869e34be434194789b))
+* **node:** clamp failover epoch uint64 to int64 conversions ([#181](https://github.com/stravin-dev/core/issues/181)) ([5c0dd6a](https://github.com/stravin-dev/core/commit/5c0dd6a0c18d28abd516691057e568a6d277eed4))
+
 ## [1.10.1](https://github.com/stravin-dev/core/compare/v1.10.0...v1.10.1) (2026-11-24)
 
 
