@@ -143,9 +143,9 @@ func TestHookDispatcherAndConsumerMetrics(t *testing.T) {
 		Dynamodb: &streamtypes.StreamRecord{
 			SequenceNumber: aws.String("seq-2"),
 			NewImage: map[string]streamtypes.AttributeValue{
-				"PK": &streamtypes.AttributeValueMemberS{Value: "T#acme#REPO#core#RH#1"},
-				"SK": &streamtypes.AttributeValueMemberS{Value: "REF#refs/heads/main#01J2"},
-				// missing oid / ref_name -> parse error
+				"PK":         &streamtypes.AttributeValueMemberS{Value: "T#acme#REPO#core#RH#1"},
+				"SK":         &streamtypes.AttributeValueMemberS{Value: "REF#refs/heads/main#01J2"},
+				"updated_at": &streamtypes.AttributeValueMemberS{Value: "not-a-timestamp"},
 			},
 		},
 	}
