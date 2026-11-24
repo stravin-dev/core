@@ -210,6 +210,10 @@ func (c *guardedInt64Counter) Add(ctx context.Context, incr int64, opts ...metri
 	c.inner.Add(ctx, incr, metric.WithAttributeSet(set))
 }
 
+func (c *guardedInt64Counter) Enabled(ctx context.Context) bool {
+	return c.inner.Enabled(ctx)
+}
+
 type guardedInt64UpDownCounter struct {
 	embedded.Int64UpDownCounter
 	inner metric.Int64UpDownCounter
@@ -223,6 +227,10 @@ func (c *guardedInt64UpDownCounter) Add(ctx context.Context, incr int64, opts ..
 		return
 	}
 	c.inner.Add(ctx, incr, metric.WithAttributeSet(set))
+}
+
+func (c *guardedInt64UpDownCounter) Enabled(ctx context.Context) bool {
+	return c.inner.Enabled(ctx)
 }
 
 type guardedInt64Histogram struct {
@@ -240,6 +248,10 @@ func (h *guardedInt64Histogram) Record(ctx context.Context, incr int64, opts ...
 	h.inner.Record(ctx, incr, metric.WithAttributeSet(set))
 }
 
+func (h *guardedInt64Histogram) Enabled(ctx context.Context) bool {
+	return h.inner.Enabled(ctx)
+}
+
 type guardedInt64Gauge struct {
 	embedded.Int64Gauge
 	inner metric.Int64Gauge
@@ -253,6 +265,10 @@ func (g *guardedInt64Gauge) Record(ctx context.Context, value int64, opts ...met
 		return
 	}
 	g.inner.Record(ctx, value, metric.WithAttributeSet(set))
+}
+
+func (g *guardedInt64Gauge) Enabled(ctx context.Context) bool {
+	return g.inner.Enabled(ctx)
 }
 
 type guardedFloat64Counter struct {
@@ -270,6 +286,10 @@ func (c *guardedFloat64Counter) Add(ctx context.Context, incr float64, opts ...m
 	c.inner.Add(ctx, incr, metric.WithAttributeSet(set))
 }
 
+func (c *guardedFloat64Counter) Enabled(ctx context.Context) bool {
+	return c.inner.Enabled(ctx)
+}
+
 type guardedFloat64UpDownCounter struct {
 	embedded.Float64UpDownCounter
 	inner metric.Float64UpDownCounter
@@ -283,6 +303,10 @@ func (c *guardedFloat64UpDownCounter) Add(ctx context.Context, incr float64, opt
 		return
 	}
 	c.inner.Add(ctx, incr, metric.WithAttributeSet(set))
+}
+
+func (c *guardedFloat64UpDownCounter) Enabled(ctx context.Context) bool {
+	return c.inner.Enabled(ctx)
 }
 
 type guardedFloat64Histogram struct {
@@ -300,6 +324,10 @@ func (h *guardedFloat64Histogram) Record(ctx context.Context, incr float64, opts
 	h.inner.Record(ctx, incr, metric.WithAttributeSet(set))
 }
 
+func (h *guardedFloat64Histogram) Enabled(ctx context.Context) bool {
+	return h.inner.Enabled(ctx)
+}
+
 type guardedFloat64Gauge struct {
 	embedded.Float64Gauge
 	inner metric.Float64Gauge
@@ -313,4 +341,8 @@ func (g *guardedFloat64Gauge) Record(ctx context.Context, value float64, opts ..
 		return
 	}
 	g.inner.Record(ctx, value, metric.WithAttributeSet(set))
+}
+
+func (g *guardedFloat64Gauge) Enabled(ctx context.Context) bool {
+	return g.inner.Enabled(ctx)
 }
