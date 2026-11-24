@@ -1,3 +1,11 @@
+# [1.11.0](https://github.com/stravin-dev/core/compare/v1.10.3...v1.11.0) (2026-11-24)
+
+
+### Features
+
+* **observability:** wire Valkey to Prometheus and add stravin-valkey Grafana dashboard ([2da95c4](https://github.com/stravin-dev/core/commit/2da95c46046708b1d1e5c79529522f1b679b7813))
+* **observability:** wire Valkey to Prometheus and add stravin-valkey Grafana dashboard ([#185](https://github.com/stravin-dev/core/issues/185)) ([767923d](https://github.com/stravin-dev/core/commit/767923d0053547324a64eeff73780b849e23b284))
+
 ## [1.10.3](https://github.com/stravin-dev/core/compare/v1.10.2...v1.10.3) (2026-11-24)
 
 
