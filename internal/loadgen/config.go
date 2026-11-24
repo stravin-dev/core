@@ -24,7 +24,7 @@ type Config struct {
 	AdminURL     string
 	AdminToken   string
 	Tenant       string
-	Repos        []string
+	RepoCount    int
 	Seed         int64
 	Duration     time.Duration
 	RampUp       time.Duration
@@ -52,7 +52,7 @@ func DefaultConfig() Config {
 		HTTPURL:      "http://127.0.0.1:8080",
 		SSHAddr:      "127.0.0.1:2222",
 		Tenant:       "loadgen",
-		Repos:        []string{"repo-1", "repo-2", "repo-3"},
+		RepoCount:    3,
 		RampUp:       5 * time.Second,
 		ThinkMin:     50 * time.Millisecond,
 		ThinkMax:     500 * time.Millisecond,
@@ -71,7 +71,6 @@ func ParseFlags(args []string, stderr io.Writer) (Config, error) {
 		fs.SetOutput(stderr)
 	}
 
-	var reposCSV string
 	var scenariosCSV string
 
 	fs.IntVar(&cfg.Devs, "devs", cfg.Devs, "number of concurrent developer personas")
@@ -83,7 +82,7 @@ func ParseFlags(args []string, stderr io.Writer) (Config, error) {
 	fs.StringVar(&cfg.AdminURL, "admin-url", "", "optional Stravin Control Plane admin API URL")
 	fs.StringVar(&cfg.AdminToken, "admin-token", "", "optional bearer token for Control Plane admin API")
 	fs.StringVar(&cfg.Tenant, "tenant", cfg.Tenant, "Stravin tenant identifier")
-	fs.StringVar(&reposCSV, "repos", strings.Join(cfg.Repos, ","), "comma-separated repository names")
+	fs.IntVar(&cfg.RepoCount, "repos", cfg.RepoCount, "number of target repositories (generated as repo-1..repo-N)")
 	fs.Int64Var(&cfg.Seed, "seed", 0, "PRNG seed (0 uses current time)")
 	fs.DurationVar(&cfg.Duration, "duration", 0, "run duration (0 runs continuously until Ctrl+C)")
 	fs.DurationVar(&cfg.RampUp, "ramp-up", cfg.RampUp, "staggered worker startup ramp-up window (0 disables ramp-up)")
@@ -100,7 +99,6 @@ func ParseFlags(args []string, stderr io.Writer) (Config, error) {
 		return Config{}, err
 	}
 
-	cfg.Repos = splitCSV(reposCSV)
 	cfg.Scenarios = splitCSV(scenariosCSV)
 	cfg.HTTPURL = strings.TrimSpace(cfg.HTTPURL)
 	cfg.SSHAddr = strings.TrimSpace(cfg.SSHAddr)
@@ -124,8 +122,8 @@ func (c Config) Validate() error {
 	if c.Tenant == "" {
 		return errors.New("loadgen: --tenant must be non-empty")
 	}
-	if len(c.Repos) == 0 {
-		return errors.New("loadgen: --repos must include at least one repository")
+	if c.RepoCount < 1 {
+		return errors.New("loadgen: --repos must be at least 1")
 	}
 	if c.Duration < 0 {
 		return errors.New("loadgen: --duration must be non-negative")
@@ -157,6 +155,23 @@ func (c Config) EffectiveSeed() int64 {
 		return c.Seed
 	}
 	return time.Now().UnixNano()
+}
+
+// RepoName returns the deterministic repository name for 0-based index (repo-1, repo-2, ...).
+func RepoName(index int) string {
+	return fmt.Sprintf("repo-%d", index+1)
+}
+
+// RepoNames returns the deterministic list of repository names (repo-1..repo-N).
+func (c Config) RepoNames() []string {
+	if c.RepoCount < 1 {
+		return nil
+	}
+	names := make([]string, c.RepoCount)
+	for i := range names {
+		names[i] = RepoName(i)
+	}
+	return names
 }
 
 // RepoHTTPURL constructs the Stravin Smart HTTP repository URL for repo.

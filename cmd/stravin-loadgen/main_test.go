@@ -139,3 +139,24 @@ func TestDefaultRegistryHas22ScenariosAndCLIFiltering(t *testing.T) {
 			len(filtered.Scenarios(loadgen.PersonaDev)), len(filtered.Scenarios(loadgen.PersonaAgent)))
 	}
 }
+
+func TestMainRejectsInvalidReposFlag(t *testing.T) {
+	deps := runtimeDeps{
+		newTelemetry: func(context.Context, string) (*loadgen.Telemetry, error) {
+			var buf bytes.Buffer
+			tel, _, err := loadgen.NewInMemoryTelemetry(&buf)
+			return tel, err
+		},
+		newRegistry: loadgen.NewRegistry,
+	}
+
+	for _, arg := range []string{"--repos=0", "--repos=alpha,beta"} {
+		t.Run(arg, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := run(context.Background(), []string{arg, "--otel-endpoint="}, deps, &stdout, &stderr)
+			if code == 0 {
+				t.Fatalf("expected non-zero exit code for %s, got 0", arg)
+			}
+		})
+	}
+}

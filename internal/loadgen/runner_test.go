@@ -717,3 +717,55 @@ func TestRunnerMidRampCancellationSkipsWaitingWorkersAndActiveThreads(t *testing
 		}
 	}
 }
+
+func TestRunnerSelectsRandomRepoPerScenarioAcrossRepoCount(t *testing.T) {
+	var mu sync.Mutex
+	seenRepos := make(map[string]int)
+
+	reg := NewRegistry()
+	record := func(_ context.Context, env *ScenarioEnv) error {
+		mu.Lock()
+		seenRepos[env.Repo]++
+		mu.Unlock()
+		return nil
+	}
+	reg.MustRegister(&stubScenario{name: "dev-repo", persona: PersonaDev, weight: 10, fn: record})
+
+	cfg := DefaultConfig()
+	cfg.Devs = 1
+	cfg.Agents = 0
+	cfg.RepoCount = 3
+	cfg.Seed = 99
+	cfg.RampUp = 0
+	cfg.ThinkMin = 1 * time.Millisecond
+	cfg.ThinkMax = 1 * time.Millisecond
+	cfg.Duration = 120 * time.Millisecond
+
+	var logBuf bytes.Buffer
+	tel, _, err := NewInMemoryTelemetry(&logBuf)
+	if err != nil {
+		t.Fatalf("NewInMemoryTelemetry: %v", err)
+	}
+	defer func() { _ = tel.Shutdown(context.Background()) }()
+
+	runner, err := NewRunner(cfg, reg, tel, NewOracle())
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	res := runner.Run(context.Background())
+	if res.Oracle.HasFailures() {
+		t.Fatalf("unexpected failures: %+v", res.Failures)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	allowed := map[string]bool{"repo-1": true, "repo-2": true, "repo-3": true}
+	for repo := range seenRepos {
+		if !allowed[repo] {
+			t.Errorf("unexpected repo %q outside repo-1..repo-3", repo)
+		}
+	}
+	if len(seenRepos) < 2 {
+		t.Fatalf("single worker touched only %d repo(s) (%v); expected random per-scenario selection across repo-1..repo-3", len(seenRepos), seenRepos)
+	}
+}

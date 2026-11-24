@@ -17,7 +17,7 @@ HTTP_URL ?= http://127.0.0.1:8080
 SSH_ADDR ?= 127.0.0.1:2222
 SSH_KEY ?=
 TENANT ?= local
-REPOS ?= demo
+REPOS ?= 3
 AUTH_TOKEN ?= dev:stravin-local-dev-token
 OTEL_ENDPOINT ?=
 SEED ?= 0
@@ -71,7 +71,7 @@ load-test: build-loadgen
 		--ssh-addr "$(SSH_ADDR)" \
 		$(if $(SSH_KEY),--ssh-key "$(SSH_KEY)",) \
 		--tenant "$(TENANT)" \
-		--repos "$(REPOS)" \
+		--repos $(REPOS) \
 		--auth-token "$(AUTH_TOKEN)" \
 		--otel-endpoint "$(OTEL_ENDPOINT)" \
 		--seed $(SEED) \

@@ -33,7 +33,7 @@ services:
       STRAVIN_KMS_ALIAS: "alias/stravin-local-dev"
       STRAVIN_DEFAULT_TENANT: "local"
       STRAVIN_DEFAULT_REPO: "demo"
-      STRAVIN_DEFAULT_REPOS: "${STRAVIN_DEFAULT_REPOS:-demo,demo-1,demo-2,demo-3,demo-4,demo-5}"
+      STRAVIN_DEFAULT_REPOS: "${STRAVIN_DEFAULT_REPOS:-demo,repo-1,repo-2,repo-3}"
     entrypoint: ["/bin/sh", "/scripts/bootstrap-floci.sh"]
     volumes:
       - ./scripts/bootstrap-floci.sh:/scripts/bootstrap-floci.sh:ro
@@ -167,7 +167,7 @@ services:
       STRAVIN_S3_FORCE_PATH_STYLE: "true"
       STRAVIN_DDB_TABLE: "stravin-core"
       STRAVIN_KMS_KEY_ID: "alias/stravin-local-dev"
-      STRAVIN_PACK_REPOS: "${STRAVIN_PACK_REPOS:-local/demo,local/demo-1,local/demo-2,local/demo-3,local/demo-4,local/demo-5}"
+      STRAVIN_PACK_REPOS: "${STRAVIN_PACK_REPOS:-local/demo,local/repo-1,local/repo-2,local/repo-3}"
       STRAVIN_PACK_POLL_INTERVAL: "${STRAVIN_PACK_POLL_INTERVAL:-5s}"
       STRAVIN_PACK_GC_INTERVAL: "${STRAVIN_PACK_GC_INTERVAL:-5m}"
       STRAVIN_PACK_GC_GRACE: "${STRAVIN_PACK_GC_GRACE:-24h}"
