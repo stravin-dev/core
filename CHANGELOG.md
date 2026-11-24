@@ -1,3 +1,11 @@
+## [1.9.6](https://github.com/stravin-dev/core/compare/v1.9.5...v1.9.6) (2026-11-24)
+
+
+### Bug Fixes
+
+* **node,edge,local:** bound pack_cache memory, log & retry transient info/refs 502s, and seed multi-repo local bootstrap ([d1996c8](https://github.com/stravin-dev/core/commit/d1996c86615e82151b22568731c78159407db821)), closes [#160](https://github.com/stravin-dev/core/issues/160)
+* **node,edge,local:** bound pack_cache memory, log & retry transient info/refs 502s, and seed multi-repo local bootstrap ([#162](https://github.com/stravin-dev/core/issues/162)) ([e71d162](https://github.com/stravin-dev/core/commit/e71d16232aeed3d9868d51685431c027e7b3ad3a))
+
 ## [1.9.5](https://github.com/stravin-dev/core/compare/v1.9.4...v1.9.5) (2026-11-24)
 
 
