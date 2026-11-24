@@ -1,3 +1,11 @@
+## [1.9.2](https://github.com/stravin-dev/core/compare/v1.9.1...v1.9.2) (2026-11-24)
+
+
+### Performance Improvements
+
+* **node:** cut redundant DDB/S3/git overhead in upload-pack, SyncAndPin, and receive-pack ([aa04d89](https://github.com/stravin-dev/core/commit/aa04d89f23d02f940973dbd15858f037e97ef7b7))
+* **node:** cut redundant DDB/S3/git overhead in upload-pack, SyncAndPin, and receive-pack ([#149](https://github.com/stravin-dev/core/issues/149)) ([ef7ecde](https://github.com/stravin-dev/core/commit/ef7ecded15dd7ceea73facad1a7cbf56bb00ea19))
+
 ## [1.9.1](https://github.com/stravin-dev/core/compare/v1.9.0...v1.9.1) (2026-11-24)
 
 
