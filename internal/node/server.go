@@ -34,7 +34,9 @@ const (
 	// HeaderSmartHTTPServiceHeader prepends the Smart HTTP `# service=...` pkt-line header.
 	HeaderSmartHTTPServiceHeader = "x-stravin-service-header"
 
-	streamChunkSize = 32 * 1024
+	streamChunkSize       = 32 * 1024
+	defaultBundleCacheTTL = 5 * time.Second
+	maxV2PeekPktLen       = 64
 )
 
 // ErrWriteNotImplemented is returned by the default WriteHandler stub until Issue #11 plugs in git-receive-pack.
@@ -65,10 +67,21 @@ type BundlePresigner interface {
 	PresignBundleURL(ctx context.Context, repo tenant.RepoKey, expiry time.Duration) (string, error)
 }
 
-// S3BundleURIResolver resolves presigned S3 bundle URLs via *s3.Store.
+type bundleCacheEntry struct {
+	uri       string
+	expiresAt time.Time
+}
+
+// S3BundleURIResolver resolves presigned S3 bundle URLs via *s3.Store with a
+// short TTL cache covering both positive presigned URLs and ErrNotFound misses.
 type S3BundleURIResolver struct {
 	presigner BundlePresigner
 	expiry    time.Duration
+	cacheTTL  time.Duration
+	now       func() time.Time
+
+	mu    sync.Mutex
+	cache map[tenant.RepoKey]bundleCacheEntry
 }
 
 // NewS3BundleURIResolver creates a BundleURIResolver backed by an S3 presigner.
@@ -79,7 +92,31 @@ func NewS3BundleURIResolver(presigner BundlePresigner, expiry time.Duration) *S3
 	if expiry <= 0 {
 		expiry = 15 * time.Minute
 	}
-	return &S3BundleURIResolver{presigner: presigner, expiry: expiry}
+	cacheTTL := defaultBundleCacheTTL
+	if expiry < cacheTTL {
+		cacheTTL = expiry
+	}
+	return &S3BundleURIResolver{
+		presigner: presigner,
+		expiry:    expiry,
+		cacheTTL:  cacheTTL,
+		now:       time.Now,
+		cache:     make(map[tenant.RepoKey]bundleCacheEntry),
+	}
+}
+
+func (r *S3BundleURIResolver) nowTime() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
+}
+
+func (r *S3BundleURIResolver) ttl() time.Duration {
+	if r.cacheTTL > 0 {
+		return r.cacheTTL
+	}
+	return defaultBundleCacheTTL
 }
 
 // ResolveBundleURI returns a validated presigned bundle URL or ("", nil) when absent.
@@ -87,9 +124,19 @@ func (r *S3BundleURIResolver) ResolveBundleURI(ctx context.Context, repo tenant.
 	if r == nil || r.presigner == nil {
 		return "", nil
 	}
+
+	now := r.nowTime()
+	r.mu.Lock()
+	if entry, ok := r.cache[repo]; ok && now.Before(entry.expiresAt) {
+		r.mu.Unlock()
+		return entry.uri, nil
+	}
+	r.mu.Unlock()
+
 	u, err := r.presigner.PresignBundleURL(ctx, repo, r.expiry)
 	if err != nil {
 		if errors.Is(err, s3.ErrNotFound) {
+			r.storeCache(repo, "")
 			return "", nil
 		}
 		return "", err
@@ -97,7 +144,18 @@ func (r *S3BundleURIResolver) ResolveBundleURI(ctx context.Context, repo tenant.
 	if err := gitexec.ValidateBundleURI(u); err != nil {
 		return "", err
 	}
+	r.storeCache(repo, u)
 	return u, nil
+}
+
+func (r *S3BundleURIResolver) storeCache(repo tenant.RepoKey, uri string) {
+	exp := r.nowTime().Add(r.ttl())
+	r.mu.Lock()
+	if r.cache == nil {
+		r.cache = make(map[tenant.RepoKey]bundleCacheEntry)
+	}
+	r.cache[repo] = bundleCacheEntry{uri: uri, expiresAt: exp}
+	r.mu.Unlock()
 }
 
 // ServerConfig configures the stravin-node gRPC GitWire server.
@@ -238,12 +296,6 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 		return nil, s.serveAdvertiseRefs(ctx, repo, meta.GitProtocol, stream)
 	}
 
-	releaseSlot, err := s.acquireUploadPackSlot(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer releaseSlot()
-
 	syncRes, err := s.materializer.SyncAndPin(ctx, repo)
 	if err != nil {
 		if errors.Is(err, ddb.ErrNotFound) {
@@ -254,6 +306,26 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 	defer syncRes.Handle.Release()
 
 	statelessRPC := boolHeader(ctx, HeaderStatelessRPC)
+
+	var (
+		peekedBytes []byte
+		peekEOF     bool
+		isV2LsRefs  bool
+	)
+	if statelessRPC && rpc.GitProtocolVersion(meta.GitProtocol) == "2" {
+		peekedBytes, peekEOF, isV2LsRefs, err = peekV2LsRefs(stream)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if !isV2LsRefs {
+		releaseSlot, slotErr := s.acquireUploadPackSlot(ctx)
+		if slotErr != nil {
+			return nil, slotErr
+		}
+		defer releaseSlot()
+	}
 
 	execCtx, execSpan := s.tracer.Start(ctx, "node.git.upload_pack", trace.WithAttributes(
 		telemetry.NewSpanAttrs().
@@ -273,6 +345,14 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 	go func() {
 		defer pumpWG.Done()
 		defer func() { _ = stdinW.Close() }()
+		if len(peekedBytes) > 0 {
+			if _, wErr := stdinW.Write(peekedBytes); wErr != nil {
+				return
+			}
+		}
+		if peekEOF {
+			return
+		}
 		for {
 			if pumpCtx.Err() != nil {
 				return
@@ -298,7 +378,10 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 
 	stdoutW := &streamChunkWriter{stream: stream}
 	var stderrBuf bytes.Buffer
-	bundleURI := s.resolveBundleURI(execCtx, repo, meta.GitProtocol)
+	var bundleURI string
+	if !isV2LsRefs {
+		bundleURI = s.resolveBundleURI(execCtx, repo, meta.GitProtocol)
+	}
 
 	execErr := s.gitExec.ExecUploadPack(execCtx, gitexec.UploadPackRequest{
 		Repo:         repo,
@@ -387,25 +470,35 @@ func (s *Server) acquireUploadPackSlot(ctx context.Context) (func(), error) {
 }
 
 func (s *Server) serveAdvertiseRefs(ctx context.Context, repoKey tenant.RepoKey, gitProtocol string, stream rpc.GitWireStream) error {
-	repoMeta, refs, err := s.materializer.LoadAuthoritativeRefs(ctx, repoKey)
-	if err != nil {
-		if errors.Is(err, ddb.ErrNotFound) {
-			return status.Errorf(codes.NotFound, "repository %s not found", repoKey)
-		}
-		return status.Errorf(codes.Internal, "load refs %s: %v", repoKey, err)
-	}
-
-	opts := AdvertiseOptions{
-		IncludeServiceHeader: boolHeader(ctx, HeaderSmartHTTPServiceHeader),
-		ServiceName:          string(rpc.OpUploadPack),
-		ObjectFormat:         repoMeta.EffectiveObjectFormat(),
-	}
-
 	var payload []byte
 	if rpc.GitProtocolVersion(gitProtocol) == "2" {
-		opts.AdvertiseBundleURI = s.resolveBundleURI(ctx, repoKey, gitProtocol) != ""
+		repoMeta, err := s.materializer.LoadRepoMeta(ctx, repoKey)
+		if err != nil {
+			if errors.Is(err, ddb.ErrNotFound) {
+				return status.Errorf(codes.NotFound, "repository %s not found", repoKey)
+			}
+			return status.Errorf(codes.Internal, "load meta %s: %v", repoKey, err)
+		}
+		opts := AdvertiseOptions{
+			IncludeServiceHeader: boolHeader(ctx, HeaderSmartHTTPServiceHeader),
+			ServiceName:          string(rpc.OpUploadPack),
+			ObjectFormat:         repoMeta.EffectiveObjectFormat(),
+			AdvertiseBundleURI:   s.resolveBundleURI(ctx, repoKey, gitProtocol) != "",
+		}
 		payload = AdvertiseV2Capabilities(opts)
 	} else {
+		repoMeta, refs, err := s.materializer.LoadAuthoritativeRefs(ctx, repoKey)
+		if err != nil {
+			if errors.Is(err, ddb.ErrNotFound) {
+				return status.Errorf(codes.NotFound, "repository %s not found", repoKey)
+			}
+			return status.Errorf(codes.Internal, "load refs %s: %v", repoKey, err)
+		}
+		opts := AdvertiseOptions{
+			IncludeServiceHeader: boolHeader(ctx, HeaderSmartHTTPServiceHeader),
+			ServiceName:          string(rpc.OpUploadPack),
+			ObjectFormat:         repoMeta.EffectiveObjectFormat(),
+		}
 		payload = AdvertiseRefs(refs, repoMeta.DefaultBranch, opts)
 	}
 
@@ -415,6 +508,50 @@ func (s *Server) serveAdvertiseRefs(ctx context.Context, repoKey tenant.RepoKey,
 		}
 	}
 	return stream.Send(&rpc.Frame{EOF: true, ExitCode: 0})
+}
+
+// peekV2LsRefs reads just enough initial stream frames to determine whether the
+// first Protocol v2 pkt-line is `command=ls-refs`, returning the exact buffered
+// bytes for verbatim replay into git-upload-pack stdin.
+func peekV2LsRefs(stream rpc.GitWireStream) (peeked []byte, peekEOF bool, isLsRefs bool, err error) {
+	var buf []byte
+	for {
+		frame, recvErr := stream.Recv()
+		if errors.Is(recvErr, io.EOF) {
+			return buf, true, isV2LsRefsPktLine(buf), nil
+		}
+		if recvErr != nil {
+			return nil, false, false, recvErr
+		}
+		if len(frame.Data) > 0 {
+			buf = append(buf, frame.Data...)
+		}
+		if frame.EOF {
+			return buf, true, isV2LsRefsPktLine(buf), nil
+		}
+		if len(buf) < 4 {
+			continue
+		}
+		pktLen, parseErr := strconv.ParseInt(string(buf[:4]), 16, 32)
+		if parseErr != nil || pktLen < 4 || pktLen > maxV2PeekPktLen {
+			return buf, false, false, nil
+		}
+		if len(buf) >= int(pktLen) {
+			return buf, false, isV2LsRefsPktLine(buf), nil
+		}
+	}
+}
+
+func isV2LsRefsPktLine(buf []byte) bool {
+	if len(buf) < 4 {
+		return false
+	}
+	pktLen, err := strconv.ParseInt(string(buf[:4]), 16, 32)
+	if err != nil || pktLen < 4 || int(pktLen) > len(buf) {
+		return false
+	}
+	payload := string(buf[4:pktLen])
+	return payload == "command=ls-refs\n" || payload == "command=ls-refs"
 }
 
 func (s *Server) resolveBundleURI(ctx context.Context, repo tenant.RepoKey, gitProtocol string) string {

@@ -158,11 +158,14 @@ func TestReceivePackAndHooksAdapterSHA256(t *testing.T) {
 		t.Fatalf("expected unpack ok + ok refs/heads/main, got %q", out)
 	}
 
-	// Verify bare repo config in NVMe cache declares extensions.objectformat = sha256.
-	repoPath, err := env.nvmeCache.RepoPath(repo)
+	// Verify bare repo config in NVMe cache declares extensions.objectformat = sha256
+	// once materialized on the read path.
+	syncRes, err := env.mat.SyncAndPin(context.Background(), repo)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("SyncAndPin(sha256): %v", err)
 	}
+	repoPath := syncRes.Handle.Path()
+	syncRes.Handle.Release()
 	cfgBytes, err := os.ReadFile(filepath.Join(repoPath, "config"))
 	if err != nil {
 		t.Fatalf("read bare repo config: %v", err)
