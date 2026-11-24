@@ -25,6 +25,8 @@ type Metrics struct {
 	cacheBytesUsed          metric.Int64Gauge
 	s3PackFetches           metric.Int64Counter
 	auxIndexRefreshFailures metric.Int64Counter
+	uploadPackQueueWait     metric.Float64Histogram
+	uploadPackQueueTimeouts metric.Int64Counter
 
 	promRequestsOK              atomic.Int64
 	promRequestsErr             atomic.Int64
@@ -34,6 +36,7 @@ type Metrics struct {
 	promS3FetchesOK             atomic.Int64
 	promS3FetchesErr            atomic.Int64
 	promAuxIndexRefreshFailures atomic.Int64
+	promUploadPackQueueTimeouts atomic.Int64
 }
 
 // NewMetrics initializes bounded-cardinality OTel instruments via GuardedMeter.
@@ -69,6 +72,14 @@ func NewMetrics(tp *telemetry.Provider, region string) *Metrics {
 	auxIndexFailures, _ := meter.Int64Counter("stravin_node_aux_index_refresh_failures_total",
 		metric.WithDescription("Failed auxiliary index (multi-pack-index and commit-graph) refresh attempts"),
 	)
+	queueWait, _ := meter.Float64Histogram("stravin_node_upload_pack_queue_wait_seconds",
+		metric.WithDescription("Time spent waiting for an upload-pack concurrency slot in seconds"),
+		metric.WithUnit("s"),
+		telemetry.WithDurationSecondsBuckets(),
+	)
+	queueTimeouts, _ := meter.Int64Counter("stravin_node_upload_pack_queue_timeouts_total",
+		metric.WithDescription("Upload-pack requests rejected after waiting past queue timeout"),
+	)
 
 	return &Metrics{
 		region:                  region,
@@ -79,6 +90,8 @@ func NewMetrics(tp *telemetry.Provider, region string) *Metrics {
 		cacheBytesUsed:          bytesUsed,
 		s3PackFetches:           s3Fetches,
 		auxIndexRefreshFailures: auxIndexFailures,
+		uploadPackQueueWait:     queueWait,
+		uploadPackQueueTimeouts: queueTimeouts,
 	}
 }
 
@@ -168,6 +181,31 @@ func (m *Metrics) RecordAuxIndexRefreshFailure(ctx context.Context, indexType st
 	}
 }
 
+// RecordUploadPackQueueWait records time spent waiting for an upload-pack concurrency slot.
+func (m *Metrics) RecordUploadPackQueueWait(ctx context.Context, dur time.Duration) {
+	if m == nil {
+		return
+	}
+	if m.uploadPackQueueWait != nil {
+		m.uploadPackQueueWait.Record(ctx, dur.Seconds(), metric.WithAttributes(
+			telemetry.AttrRegion.String(m.region),
+		))
+	}
+}
+
+// RecordUploadPackQueueTimeout records an upload-pack request rejected due to queue timeout.
+func (m *Metrics) RecordUploadPackQueueTimeout(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	m.promUploadPackQueueTimeouts.Add(1)
+	if m.uploadPackQueueTimeouts != nil {
+		m.uploadPackQueueTimeouts.Add(ctx, 1, metric.WithAttributes(
+			telemetry.AttrRegion.String(m.region),
+		))
+	}
+}
+
 // ServeHTTP exposes bounded-cardinality Prometheus metrics at /metrics.
 func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -191,7 +229,10 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 			"stravin_node_s3_pack_fetches_total{region=%q,status_code=\"error\"} %d\n"+
 			"# HELP stravin_node_aux_index_refresh_failures_total Failed auxiliary index refresh attempts.\n"+
 			"# TYPE stravin_node_aux_index_refresh_failures_total counter\n"+
-			"stravin_node_aux_index_refresh_failures_total{region=%q} %d\n",
+			"stravin_node_aux_index_refresh_failures_total{region=%q} %d\n"+
+			"# HELP stravin_node_upload_pack_queue_timeouts_total Upload-pack requests rejected due to queue timeout.\n"+
+			"# TYPE stravin_node_upload_pack_queue_timeouts_total counter\n"+
+			"stravin_node_upload_pack_queue_timeouts_total{region=%q} %d\n",
 		m.region, m.promRequestsOK.Load(),
 		m.region, m.promRequestsErr.Load(),
 		m.region, m.promCacheHits.Load(),
@@ -200,5 +241,6 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 		m.region, m.promS3FetchesOK.Load(),
 		m.region, m.promS3FetchesErr.Load(),
 		m.region, m.promAuxIndexRefreshFailures.Load(),
+		m.region, m.promUploadPackQueueTimeouts.Load(),
 	)
 }

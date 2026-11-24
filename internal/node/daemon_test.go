@@ -277,3 +277,70 @@ func TestLoadDaemonConfigFromEnv_TelemetryShutdownTimeout(t *testing.T) {
 		t.Fatalf("override TelemetryShutdownTimeout = %v, want 11s", got)
 	}
 }
+
+func TestLoadDaemonConfigFromEnv_UploadPackLimits(t *testing.T) {
+	t.Run("defaults when unset", func(t *testing.T) {
+		t.Setenv("STRAVIN_NODE_MAX_UPLOAD_PACKS", "")
+		t.Setenv("STRAVIN_NODE_UPLOAD_PACK_QUEUE_TIMEOUT", "")
+
+		cfg := LoadDaemonConfigFromEnv()
+		wantMax := defaultMaxUploadPacks()
+		if cfg.MaxUploadPacks != wantMax || cfg.MaxUploadPacks < 2 {
+			t.Errorf("MaxUploadPacks = %d, want %d (>=2)", cfg.MaxUploadPacks, wantMax)
+		}
+		if cfg.UploadPackQueueTimeout != 15*time.Second {
+			t.Errorf("UploadPackQueueTimeout = %v, want 15s", cfg.UploadPackQueueTimeout)
+		}
+	})
+
+	t.Run("valid overrides", func(t *testing.T) {
+		t.Setenv("STRAVIN_NODE_MAX_UPLOAD_PACKS", "6")
+		t.Setenv("STRAVIN_NODE_UPLOAD_PACK_QUEUE_TIMEOUT", "25s")
+
+		cfg := LoadDaemonConfigFromEnv()
+		if cfg.MaxUploadPacks != 6 {
+			t.Errorf("MaxUploadPacks = %d, want 6", cfg.MaxUploadPacks)
+		}
+		if cfg.UploadPackQueueTimeout != 25*time.Second {
+			t.Errorf("UploadPackQueueTimeout = %v, want 25s", cfg.UploadPackQueueTimeout)
+		}
+	})
+
+	t.Run("invalid values fall back to defaults", func(t *testing.T) {
+		t.Setenv("STRAVIN_NODE_MAX_UPLOAD_PACKS", "0")
+		t.Setenv("STRAVIN_NODE_UPLOAD_PACK_QUEUE_TIMEOUT", "-3s")
+
+		cfg := LoadDaemonConfigFromEnv()
+		if cfg.MaxUploadPacks != defaultMaxUploadPacks() {
+			t.Errorf("MaxUploadPacks = %d, want default %d", cfg.MaxUploadPacks, defaultMaxUploadPacks())
+		}
+		if cfg.UploadPackQueueTimeout != defaultUploadPackQueueTimeout {
+			t.Errorf("UploadPackQueueTimeout = %v, want default %v", cfg.UploadPackQueueTimeout, defaultUploadPackQueueTimeout)
+		}
+	})
+}
+
+func TestParseUploadPackLimitsFromEnv_ValidationErrors(t *testing.T) {
+	cases := []struct {
+		name    string
+		maxEnv  string
+		waitEnv string
+	}{
+		{name: "max zero", maxEnv: "0", waitEnv: "15s"},
+		{name: "max negative", maxEnv: "-4", waitEnv: "15s"},
+		{name: "max non-integer", maxEnv: "abc", waitEnv: "15s"},
+		{name: "timeout zero", maxEnv: "2", waitEnv: "0s"},
+		{name: "timeout negative", maxEnv: "2", waitEnv: "-1s"},
+		{name: "timeout invalid", maxEnv: "2", waitEnv: "soon"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("STRAVIN_NODE_MAX_UPLOAD_PACKS", tc.maxEnv)
+			t.Setenv("STRAVIN_NODE_UPLOAD_PACK_QUEUE_TIMEOUT", tc.waitEnv)
+			if _, _, err := ParseUploadPackLimitsFromEnv(); err == nil {
+				t.Errorf("ParseUploadPackLimitsFromEnv(max=%q, timeout=%q) = nil, want error", tc.maxEnv, tc.waitEnv)
+			}
+		})
+	}
+}

@@ -15,7 +15,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -498,6 +501,14 @@ func setupTestNodeServer(t *testing.T, execImpl gitexec.GitExecutor, wh WriteHan
 	}
 	t.Cleanup(mat.Close)
 
+	// Pre-warm the bare repo layout so concurrent test requests exercise the
+	// upload-pack semaphore rather than cold git-init startup.
+	warm, err := mat.SyncAndPin(context.Background(), rk)
+	if err != nil {
+		t.Fatalf("warm SyncAndPin: %v", err)
+	}
+	warm.Handle.Release()
+
 	metrics := NewMetrics(tp, "us-east-1")
 	srv, err := NewServer(ServerConfig{
 		Materializer: mat,
@@ -770,5 +781,349 @@ func TestServer_ReceivePackSanitizesInvalidUTF8Error(t *testing.T) {
 	counts := collectNodeRequestCounts(t, tp, "push")
 	if counts["error"] != 1 {
 		t.Errorf("stravin_node_requests_total[push,error] = %d, want 1 (all=%v)", counts["error"], counts)
+	}
+}
+
+func setupTestNodeServerWithLimits(
+	t *testing.T,
+	execImpl gitexec.GitExecutor,
+	maxUploadPacks int,
+	queueTimeout time.Duration,
+) (tenant.RepoKey, rpc.GitWireClient, *telemetry.Provider, *Metrics) {
+	t.Helper()
+	rk, err := tenant.NewRepoKey("acme", "limit-test")
+	if err != nil {
+		t.Fatalf("NewRepoKey: %v", err)
+	}
+	metaStore := newFakeMetadataStore()
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	})
+	c, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	tp, err := telemetry.NewInMemoryProvider("stravin-node")
+	if err != nil {
+		t.Fatalf("NewInMemoryProvider: %v", err)
+	}
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:      metaStore,
+		Packs:     newFakePackFetcher(),
+		Cache:     c,
+		Telemetry: tp,
+	})
+	if err != nil {
+		t.Fatalf("NewMaterializer: %v", err)
+	}
+	t.Cleanup(mat.Close)
+
+	// Pre-warm the bare repo layout so concurrent test requests exercise the
+	// upload-pack semaphore rather than cold git-init startup.
+	warm, err := mat.SyncAndPin(context.Background(), rk)
+	if err != nil {
+		t.Fatalf("warm SyncAndPin: %v", err)
+	}
+	warm.Handle.Release()
+
+	metrics := NewMetrics(tp, "us-east-1")
+	srv, err := NewServer(ServerConfig{
+		Materializer:           mat,
+		GitExecutor:            execImpl,
+		Telemetry:              tp,
+		Metrics:                metrics,
+		Region:                 "us-east-1",
+		MaxUploadPacks:         maxUploadPacks,
+		UploadPackQueueTimeout: queueTimeout,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	return rk, startBufconnNode(t, srv), tp, metrics
+}
+
+func TestServer_NewServerRejectsInvalidUploadPackConfig(t *testing.T) {
+	c, _ := cache.New(cache.Config{Root: t.TempDir()})
+	mat, _ := NewMaterializer(MaterializerConfig{
+		Meta:  newFakeMetadataStore(),
+		Packs: newFakePackFetcher(),
+		Cache: c,
+	})
+	t.Cleanup(mat.Close)
+
+	if _, err := NewServer(ServerConfig{
+		Materializer:   mat,
+		GitExecutor:    &fakeGitExecutor{},
+		MaxUploadPacks: -1,
+	}); err == nil {
+		t.Error("expected error for negative MaxUploadPacks")
+	}
+	if _, err := NewServer(ServerConfig{
+		Materializer:           mat,
+		GitExecutor:            &fakeGitExecutor{},
+		UploadPackQueueTimeout: -time.Second,
+	}); err == nil {
+		t.Error("expected error for negative UploadPackQueueTimeout")
+	}
+}
+
+func TestServer_UploadPackConcurrencyCapAndQueueing(t *testing.T) {
+	const maxConcurrent = 2
+	const totalReqs = 4
+
+	var active atomic.Int32
+	var maxObserved atomic.Int32
+	entered := make(chan struct{}, totalReqs)
+	release := make(chan struct{})
+
+	execImpl := &fakeGitExecutor{
+		uploadPackFn: func(_ context.Context, _ gitexec.UploadPackRequest) error {
+			cur := active.Add(1)
+			for {
+				prev := maxObserved.Load()
+				if cur <= prev || maxObserved.CompareAndSwap(prev, cur) {
+					break
+				}
+			}
+			entered <- struct{}{}
+			<-release
+			active.Add(-1)
+			return nil
+		},
+	}
+
+	rk, client, tp, _ := setupTestNodeServerWithLimits(t, execImpl, maxConcurrent, 2*time.Second)
+
+	errCh := make(chan error, totalReqs)
+	var wg sync.WaitGroup
+	for range totalReqs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			stream, err := client.OpenStream(context.Background(), rpc.RequestMeta{
+				TenantID:  rk.TenantID,
+				RepoID:    rk.RepoID,
+				Operation: rpc.OpUploadPack,
+			})
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if err := stream.Send(&rpc.Frame{EOF: true}); err != nil {
+				errCh <- err
+				return
+			}
+			for {
+				_, recvErr := stream.Recv()
+				if errors.Is(recvErr, io.EOF) {
+					return
+				}
+				if recvErr != nil {
+					errCh <- recvErr
+					return
+				}
+			}
+		}()
+	}
+
+	// Wait until exactly maxConcurrent requests are inside ExecUploadPack.
+	for range maxConcurrent {
+		select {
+		case <-entered:
+		case err := <-errCh:
+			close(release)
+			t.Fatalf("upload-pack failed before filling semaphore slots: %v", err)
+		case <-time.After(5 * time.Second):
+			close(release)
+			t.Fatal("timed out waiting for initial upload-pack slots to fill")
+		}
+	}
+
+	// Briefly confirm no 3rd request bypasses the semaphore while slots are held.
+	select {
+	case <-entered:
+		t.Fatal("more than maxConcurrent upload-packs entered simultaneously")
+	case <-time.After(40 * time.Millisecond):
+	}
+
+	close(release)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("unexpected upload-pack error: %v", err)
+	}
+
+	if got := maxObserved.Load(); got > maxConcurrent {
+		t.Fatalf("maxObserved concurrency = %d, want <= %d", got, maxConcurrent)
+	}
+
+	var rm metricdata.ResourceMetrics
+	if err := tp.MetricReader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	var waitCount uint64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == "stravin_node_upload_pack_queue_wait_seconds" {
+				if hist, ok := m.Data.(metricdata.Histogram[float64]); ok && len(hist.DataPoints) > 0 {
+					waitCount = hist.DataPoints[0].Count
+				}
+			}
+		}
+	}
+	if waitCount != totalReqs {
+		t.Errorf("queue wait histogram count = %d, want %d", waitCount, totalReqs)
+	}
+}
+
+func TestServer_UploadPackQueueTimeoutReturnsResourceExhausted(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+
+	execImpl := &fakeGitExecutor{
+		uploadPackFn: func(_ context.Context, _ gitexec.UploadPackRequest) error {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-release
+			return nil
+		},
+	}
+
+	rk, client, _, metrics := setupTestNodeServerWithLimits(t, execImpl, 1, 50*time.Millisecond)
+
+	// Start request 1 to hold the single semaphore slot.
+	req1Done := make(chan error, 1)
+	go func() {
+		stream, err := client.OpenStream(context.Background(), rpc.RequestMeta{
+			TenantID:  rk.TenantID,
+			RepoID:    rk.RepoID,
+			Operation: rpc.OpUploadPack,
+		})
+		if err != nil {
+			req1Done <- err
+			return
+		}
+		_ = stream.Send(&rpc.Frame{EOF: true})
+		for {
+			_, recvErr := stream.Recv()
+			if errors.Is(recvErr, io.EOF) {
+				req1Done <- nil
+				return
+			}
+			if recvErr != nil {
+				req1Done <- recvErr
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for request 1 to enter ExecUploadPack")
+	}
+
+	// Request 2 should time out waiting in the queue with ResourceExhausted.
+	stream2, err := client.OpenStream(context.Background(), rpc.RequestMeta{
+		TenantID:  rk.TenantID,
+		RepoID:    rk.RepoID,
+		Operation: rpc.OpUploadPack,
+	})
+	if err != nil {
+		t.Fatalf("OpenStream req2: %v", err)
+	}
+	_, recvErr := stream2.Recv()
+	if status.Code(recvErr) != codes.ResourceExhausted {
+		t.Fatalf("req2 status code = %v (err=%v), want ResourceExhausted", status.Code(recvErr), recvErr)
+	}
+
+	rec := httptest.NewRecorder()
+	metrics.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	wantProm := `stravin_node_upload_pack_queue_timeouts_total{region="us-east-1"} 1`
+	if !strings.Contains(rec.Body.String(), wantProm) {
+		t.Errorf("Prometheus /metrics missing %q:\n%s", wantProm, rec.Body.String())
+	}
+}
+
+func TestServer_UploadPackQueueRespectsContextCancellation(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+
+	execImpl := &fakeGitExecutor{
+		uploadPackFn: func(_ context.Context, _ gitexec.UploadPackRequest) error {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-release
+			return nil
+		},
+	}
+
+	rk, client, _, metrics := setupTestNodeServerWithLimits(t, execImpl, 1, 5*time.Second)
+
+	go func() {
+		stream, err := client.OpenStream(context.Background(), rpc.RequestMeta{
+			TenantID:  rk.TenantID,
+			RepoID:    rk.RepoID,
+			Operation: rpc.OpUploadPack,
+		})
+		if err != nil {
+			return
+		}
+		_ = stream.Send(&rpc.Frame{EOF: true})
+		for {
+			if _, recvErr := stream.Recv(); recvErr != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for request 1 to enter ExecUploadPack")
+	}
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	stream2, err := client.OpenStream(cancelCtx, rpc.RequestMeta{
+		TenantID:  rk.TenantID,
+		RepoID:    rk.RepoID,
+		Operation: rpc.OpUploadPack,
+	})
+	if err != nil {
+		t.Fatalf("OpenStream req2: %v", err)
+	}
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	_, recvErr := stream2.Recv()
+	if status.Code(recvErr) != codes.Canceled {
+		t.Fatalf("req2 status code = %v (err=%v), want Canceled", status.Code(recvErr), recvErr)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("canceled request took %v, expected prompt cancellation", elapsed)
+	}
+
+	rec := httptest.NewRecorder()
+	metrics.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	wantProm := `stravin_node_upload_pack_queue_timeouts_total{region="us-east-1"} 0`
+	if !strings.Contains(rec.Body.String(), wantProm) {
+		t.Errorf("expected 0 queue timeouts on client cancel, got:\n%s", rec.Body.String())
 	}
 }

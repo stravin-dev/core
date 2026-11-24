@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -32,14 +33,19 @@ import (
 )
 
 const (
-	defaultRegion               = "us-east-1"
-	defaultGRPCAddr             = ":9090"
-	defaultHealthAddr           = ":8081"
-	defaultCacheDir             = "/var/lib/stravin/cache"
-	defaultDDBTable             = "stravin-core"
-	defaultDaemonShutdownWindow = 5 * time.Second
-	defaultGitExecTimeout       = 5 * time.Minute
+	defaultRegion                 = "us-east-1"
+	defaultGRPCAddr               = ":9090"
+	defaultHealthAddr             = ":8081"
+	defaultCacheDir               = "/var/lib/stravin/cache"
+	defaultDDBTable               = "stravin-core"
+	defaultDaemonShutdownWindow   = 5 * time.Second
+	defaultGitExecTimeout         = 5 * time.Minute
+	defaultUploadPackQueueTimeout = 15 * time.Second
 )
+
+func defaultMaxUploadPacks() int {
+	return max(runtime.GOMAXPROCS(0), 2)
+}
 
 // DaemonConfig configures the full stravin-node process.
 type DaemonConfig struct {
@@ -54,6 +60,8 @@ type DaemonConfig struct {
 	DDBTable                 string
 	AWSEndpointURL           string
 	LeaseRefreshInterval     time.Duration
+	MaxUploadPacks           int
+	UploadPackQueueTimeout   time.Duration
 	ShutdownTimeout          time.Duration
 	DrainDelay               time.Duration
 	TelemetryShutdownTimeout time.Duration
@@ -62,6 +70,30 @@ type DaemonConfig struct {
 	GitExec                  gitexec.Config
 	WriteHandler             WriteHandler
 	OnReady                  func(grpcAddr, healthAddr string)
+}
+
+// ParseUploadPackLimitsFromEnv parses and validates STRAVIN_NODE_MAX_UPLOAD_PACKS
+// and STRAVIN_NODE_UPLOAD_PACK_QUEUE_TIMEOUT.
+func ParseUploadPackLimitsFromEnv() (int, time.Duration, error) {
+	maxUploads := defaultMaxUploadPacks()
+	if raw := strings.TrimSpace(os.Getenv("STRAVIN_NODE_MAX_UPLOAD_PACKS")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return 0, 0, fmt.Errorf("invalid STRAVIN_NODE_MAX_UPLOAD_PACKS %q: must be integer >= 1", raw)
+		}
+		maxUploads = n
+	}
+
+	queueTimeout := defaultUploadPackQueueTimeout
+	if raw := strings.TrimSpace(os.Getenv("STRAVIN_NODE_UPLOAD_PACK_QUEUE_TIMEOUT")); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return 0, 0, fmt.Errorf("invalid STRAVIN_NODE_UPLOAD_PACK_QUEUE_TIMEOUT %q: must be positive duration", raw)
+		}
+		queueTimeout = d
+	}
+
+	return maxUploads, queueTimeout, nil
 }
 
 // LoadDaemonConfigFromEnv reads stravin-node configuration from environment variables.
@@ -83,6 +115,20 @@ func LoadDaemonConfigFromEnv() DaemonConfig {
 		}
 	}
 
+	maxUploadPacks := defaultMaxUploadPacks()
+	if raw := strings.TrimSpace(os.Getenv("STRAVIN_NODE_MAX_UPLOAD_PACKS")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 1 {
+			maxUploadPacks = n
+		}
+	}
+
+	queueTimeout := defaultUploadPackQueueTimeout
+	if raw := strings.TrimSpace(os.Getenv("STRAVIN_NODE_UPLOAD_PACK_QUEUE_TIMEOUT")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			queueTimeout = d
+		}
+	}
+
 	return DaemonConfig{
 		Region:                   lease.Region(region),
 		GRPCAddr:                 envOrDefault("STRAVIN_GRPC_ADDR", defaultGRPCAddr),
@@ -95,6 +141,8 @@ func LoadDaemonConfigFromEnv() DaemonConfig {
 		DDBTable:                 envOrDefault("STRAVIN_DDB_TABLE", defaultDDBTable),
 		AWSEndpointURL:           strings.TrimSpace(os.Getenv("AWS_ENDPOINT_URL")),
 		LeaseRefreshInterval:     refreshInterval,
+		MaxUploadPacks:           maxUploadPacks,
+		UploadPackQueueTimeout:   queueTimeout,
 		ShutdownTimeout:          defaultDaemonShutdownWindow,
 		TelemetryShutdownTimeout: telemetry.ShutdownTimeoutFromEnv(),
 		GRPCTransport:            rpc.LoadTransportConfigFromEnv(),
@@ -254,15 +302,17 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 	}
 
 	nodeSrv, err := NewServer(ServerConfig{
-		Materializer:   materializer,
-		GitExecutor:    gitExec,
-		WriteHandler:   writeHandler,
-		BundleResolver: NewS3BundleURIResolver(s3Store, 0),
-		LeaseRefresher: refresher,
-		Telemetry:      tp,
-		Metrics:        metrics,
-		Logger:         logger,
-		Region:         string(cfg.Region),
+		Materializer:           materializer,
+		GitExecutor:            gitExec,
+		WriteHandler:           writeHandler,
+		BundleResolver:         NewS3BundleURIResolver(s3Store, 0),
+		LeaseRefresher:         refresher,
+		Telemetry:              tp,
+		Metrics:                metrics,
+		Logger:                 logger,
+		Region:                 string(cfg.Region),
+		MaxUploadPacks:         cfg.MaxUploadPacks,
+		UploadPackQueueTimeout: cfg.UploadPackQueueTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("node: init server: %w", err)
@@ -371,6 +421,9 @@ func resolveGitExecConfig(cfg gitexec.Config, logger *slog.Logger) gitexec.Confi
 	}
 	if cfg.DefaultTimeout <= 0 {
 		cfg.DefaultTimeout = defaultGitExecTimeout
+	}
+	if cfg.Pack == (gitexec.PackConfig{}) {
+		cfg.Pack = gitexec.DefaultPackConfig()
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = logger

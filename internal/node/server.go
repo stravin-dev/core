@@ -102,28 +102,32 @@ func (r *S3BundleURIResolver) ResolveBundleURI(ctx context.Context, repo tenant.
 
 // ServerConfig configures the stravin-node gRPC GitWire server.
 type ServerConfig struct {
-	Materializer   *Materializer
-	GitExecutor    gitexec.GitExecutor
-	WriteHandler   WriteHandler
-	BundleResolver BundleURIResolver
-	LeaseRefresher *LeaseRefresher
-	Telemetry      *telemetry.Provider
-	Metrics        *Metrics
-	Logger         *slog.Logger
-	Region         string
+	Materializer           *Materializer
+	GitExecutor            gitexec.GitExecutor
+	WriteHandler           WriteHandler
+	BundleResolver         BundleURIResolver
+	LeaseRefresher         *LeaseRefresher
+	Telemetry              *telemetry.Provider
+	Metrics                *Metrics
+	Logger                 *slog.Logger
+	Region                 string
+	MaxUploadPacks         int
+	UploadPackQueueTimeout time.Duration
 }
 
 // Server implements rpc.GitWireHandler for stravin-node.
 type Server struct {
-	materializer   *Materializer
-	gitExec        gitexec.GitExecutor
-	writeHandler   WriteHandler
-	bundleResolver BundleURIResolver
-	leaseRefresher *LeaseRefresher
-	tracer         trace.Tracer
-	metrics        *Metrics
-	logger         *slog.Logger
-	region         string
+	materializer           *Materializer
+	gitExec                gitexec.GitExecutor
+	writeHandler           WriteHandler
+	bundleResolver         BundleURIResolver
+	leaseRefresher         *LeaseRefresher
+	tracer                 trace.Tracer
+	metrics                *Metrics
+	logger                 *slog.Logger
+	region                 string
+	uploadPackSem          chan struct{}
+	uploadPackQueueTimeout time.Duration
 }
 
 var _ rpc.GitWireHandler = (*Server)(nil)
@@ -135,6 +139,20 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	if cfg.GitExecutor == nil {
 		return nil, errors.New("node: git executor is required")
+	}
+	if cfg.MaxUploadPacks < 0 {
+		return nil, errors.New("node: max upload-packs must be >= 1")
+	}
+	if cfg.UploadPackQueueTimeout < 0 {
+		return nil, errors.New("node: upload-pack queue timeout must be > 0")
+	}
+	maxUploadPacks := cfg.MaxUploadPacks
+	if maxUploadPacks == 0 {
+		maxUploadPacks = defaultMaxUploadPacks()
+	}
+	queueTimeout := cfg.UploadPackQueueTimeout
+	if queueTimeout == 0 {
+		queueTimeout = defaultUploadPackQueueTimeout
 	}
 	wh := cfg.WriteHandler
 	if wh == nil {
@@ -153,15 +171,17 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		logger = slog.Default()
 	}
 	return &Server{
-		materializer:   cfg.Materializer,
-		gitExec:        cfg.GitExecutor,
-		writeHandler:   wh,
-		bundleResolver: cfg.BundleResolver,
-		leaseRefresher: cfg.LeaseRefresher,
-		tracer:         tp.Tracer("stravin-node"),
-		metrics:        metrics,
-		logger:         logger,
-		region:         cfg.Region,
+		materializer:           cfg.Materializer,
+		gitExec:                cfg.GitExecutor,
+		writeHandler:           wh,
+		bundleResolver:         cfg.BundleResolver,
+		leaseRefresher:         cfg.LeaseRefresher,
+		tracer:                 tp.Tracer("stravin-node"),
+		metrics:                metrics,
+		logger:                 logger,
+		region:                 cfg.Region,
+		uploadPackSem:          make(chan struct{}, maxUploadPacks),
+		uploadPackQueueTimeout: queueTimeout,
 	}, nil
 }
 
@@ -217,6 +237,12 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 	if boolHeader(ctx, HeaderAdvertiseRefs) {
 		return nil, s.serveAdvertiseRefs(ctx, repo, meta.GitProtocol, stream)
 	}
+
+	releaseSlot, err := s.acquireUploadPackSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSlot()
 
 	syncRes, err := s.materializer.SyncAndPin(ctx, repo)
 	if err != nil {
@@ -328,6 +354,36 @@ func (s *Server) handleUploadPack(ctx context.Context, meta rpc.RequestMeta, str
 		"packs_cached", syncRes.PacksCached,
 	)
 	return nil, stream.Send(&rpc.Frame{EOF: true, ExitCode: 0})
+}
+
+func (s *Server) acquireUploadPackSlot(ctx context.Context) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+
+	waitStart := time.Now()
+	select {
+	case s.uploadPackSem <- struct{}{}:
+		s.metrics.RecordUploadPackQueueWait(ctx, time.Since(waitStart))
+		return func() { <-s.uploadPackSem }, nil
+	default:
+	}
+
+	timer := time.NewTimer(s.uploadPackQueueTimeout)
+	defer timer.Stop()
+
+	select {
+	case s.uploadPackSem <- struct{}{}:
+		s.metrics.RecordUploadPackQueueWait(ctx, time.Since(waitStart))
+		return func() { <-s.uploadPackSem }, nil
+	case <-timer.C:
+		s.metrics.RecordUploadPackQueueWait(ctx, time.Since(waitStart))
+		s.metrics.RecordUploadPackQueueTimeout(ctx)
+		return nil, status.Errorf(codes.ResourceExhausted, "node: upload-pack queue timed out after %s", s.uploadPackQueueTimeout)
+	case <-ctx.Done():
+		s.metrics.RecordUploadPackQueueWait(ctx, time.Since(waitStart))
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
 }
 
 func (s *Server) serveAdvertiseRefs(ctx context.Context, repoKey tenant.RepoKey, gitProtocol string, stream rpc.GitWireStream) error {
