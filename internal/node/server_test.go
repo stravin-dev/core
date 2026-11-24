@@ -501,6 +501,14 @@ func setupTestNodeServer(t *testing.T, execImpl gitexec.GitExecutor, wh WriteHan
 	}
 	t.Cleanup(mat.Close)
 
+	// Pre-warm the bare repo layout so concurrent test requests exercise the
+	// upload-pack semaphore rather than cold git-init startup.
+	warm, err := mat.SyncAndPin(context.Background(), rk)
+	if err != nil {
+		t.Fatalf("warm SyncAndPin: %v", err)
+	}
+	warm.Handle.Release()
+
 	metrics := NewMetrics(tp, "us-east-1")
 	srv, err := NewServer(ServerConfig{
 		Materializer: mat,
@@ -818,6 +826,14 @@ func setupTestNodeServerWithLimits(
 	}
 	t.Cleanup(mat.Close)
 
+	// Pre-warm the bare repo layout so concurrent test requests exercise the
+	// upload-pack semaphore rather than cold git-init startup.
+	warm, err := mat.SyncAndPin(context.Background(), rk)
+	if err != nil {
+		t.Fatalf("warm SyncAndPin: %v", err)
+	}
+	warm.Handle.Release()
+
 	metrics := NewMetrics(tp, "us-east-1")
 	srv, err := NewServer(ServerConfig{
 		Materializer:           mat,
@@ -922,7 +938,11 @@ func TestServer_UploadPackConcurrencyCapAndQueueing(t *testing.T) {
 	for range maxConcurrent {
 		select {
 		case <-entered:
-		case <-time.After(2 * time.Second):
+		case err := <-errCh:
+			close(release)
+			t.Fatalf("upload-pack failed before filling semaphore slots: %v", err)
+		case <-time.After(5 * time.Second):
+			close(release)
 			t.Fatal("timed out waiting for initial upload-pack slots to fill")
 		}
 	}
