@@ -14,6 +14,7 @@ docker compose up -d --build
 
 Services started:
 - **Floci** (`:4566`): Local S3, DynamoDB, DynamoDB Streams, and KMS emulator (`floci-init` creates `git-objects-us-east-1`, `stravin-core`, `alias/stravin-local-dev`, and seeds `local/demo` and `local/repo-1`..`local/repo-3`).
+- **NATS JetStream** (`:4222` client, `:8222` monitoring): Local async event bus with persistent JetStream storage (`nats-init` idempotently creates the `STRAVIN_CORE` stream for `stravin.core.>`).
 - **`stravin-edge`** (`:8080` Smart HTTP, `:2222` SSH): Stateless Git ingress proxy. Default local HTTP token: `stravin-local-dev-token` (tenant `local`).
 - **`stravin-node`** (`:8081` health/metrics, `:9090` gRPC): Git read/write engine with NVMe pack cache and Tier 1 Wasm hook runtime.
 - **`stravin-pack`** (`:8082`): Sharded pack compaction (`.midx` + `commit-graph`) and delayed GC daemon.

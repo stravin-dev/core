@@ -83,12 +83,71 @@ func TestComposeFiles_ProbeReadyz(t *testing.T) {
 			t.Fatalf("read %s: %v", tc.name, err)
 		}
 		content := string(raw)
-		if strings.Contains(content, "/healthz") {
-			t.Errorf("%s still references /healthz; expected /readyz", tc.name)
+		for _, line := range strings.Split(content, "\n") {
+			if strings.Contains(line, "/healthz") && !strings.Contains(line, ":8222/healthz") {
+				t.Errorf("%s still references /healthz; expected /readyz: %s", tc.name, strings.TrimSpace(line))
+			}
 		}
 		got := strings.Count(content, "/readyz")
 		if got != tc.wantCount {
 			t.Errorf("%s has %d /readyz healthcheck(s), want %d", tc.name, got, tc.wantCount)
+		}
+	}
+}
+
+func TestComposeFiles_NATSJetStreamConfigured(t *testing.T) {
+	root := repoRoot(t)
+
+	for _, name := range []string{"docker-compose.yml", "docker-compose.chaos.yml"} {
+		raw, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		content := string(raw)
+		for _, tok := range []string{
+			"nats:",
+			"nats:2.10-alpine",
+			"-js",
+			"nats-data:/data/jetstream",
+			"http://127.0.0.1:8222/healthz?js-enabled-only=true",
+			"nats-init:",
+			"./scripts/bootstrap-nats.sh:/scripts/bootstrap-nats.sh:ro",
+			"STRAVIN_CORE",
+			"stravin.core.>",
+			"nats-exporter:",
+			"prometheus-nats-exporter",
+			"http://nats:8222",
+		} {
+			if !strings.Contains(content, tok) {
+				t.Errorf("%s missing required NATS JetStream setting %q", name, tok)
+			}
+		}
+	}
+
+	scriptPath := filepath.Join(root, "scripts", "bootstrap-nats.sh")
+	info, err := os.Stat(scriptPath)
+	if err != nil {
+		t.Fatalf("stat bootstrap-nats.sh: %v", err)
+	}
+	if info.Mode()&0o111 == 0 {
+		t.Errorf("scripts/bootstrap-nats.sh must be executable (mode=%o)", info.Mode())
+	}
+	scriptRaw, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("read bootstrap-nats.sh: %v", err)
+	}
+	script := string(scriptRaw)
+	for _, tok := range []string{
+		"stream info",
+		"stream add",
+		"--subjects",
+		"--storage file",
+		"--retention limits",
+		"--max-age",
+		"--dupe-window",
+	} {
+		if !strings.Contains(script, tok) {
+			t.Errorf("scripts/bootstrap-nats.sh missing required token %q", tok)
 		}
 	}
 }
