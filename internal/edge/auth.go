@@ -12,20 +12,51 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"stravin.dev/core/internal/rpc"
 	"stravin.dev/core/internal/tenant"
+)
+
+const (
+	// ScopeGitRead grants read access for git-upload-pack / ls-refs operations.
+	ScopeGitRead = "git:read"
+	// ScopeGitWrite grants write access for git-receive-pack operations.
+	ScopeGitWrite = "git:write"
+	// ScopeGitBundleRead grants read access for Git bundle downloads.
+	ScopeGitBundleRead = "git:bundle:read"
 )
 
 var (
 	// ErrUnauthorized indicates missing or invalid authentication credentials.
 	ErrUnauthorized = errors.New("edge: unauthorized")
-	// ErrForbidden indicates an authenticated principal is not allowed to access the requested tenant.
+	// ErrTokenRevoked indicates a token whose jti has been explicitly revoked.
+	ErrTokenRevoked = errors.New("edge: token revoked")
+	// ErrAuthUnavailable indicates an auth dependency (e.g. Valkey jti store) failed closed.
+	ErrAuthUnavailable = errors.New("edge: auth service unavailable")
+	// ErrForbidden indicates an authenticated principal is not allowed to access the requested resource.
 	ErrForbidden = errors.New("edge: forbidden")
 )
 
-// Principal represents an authenticated caller bound to a specific tenant.
+// Principal represents an authenticated caller bound to a specific tenant and optional
+// repository/operation scopes minted by stravin-auth.
 type Principal struct {
-	ActorID  string
-	TenantID tenant.TenantID
+	ActorID   string
+	TenantID  tenant.TenantID
+	JTI       string
+	RepoID    tenant.RepoID
+	CommitOID string
+	RefGlobs  []string
+	Scopes    []string
+	RevEpoch  int64
+}
+
+// HasScope reports whether the principal carries the exact scope string.
+func (p Principal) HasScope(scope string) bool {
+	for _, s := range p.Scopes {
+		if subtle.ConstantTimeCompare([]byte(s), []byte(scope)) == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // Validate checks that the principal carries a valid TenantID and non-empty ActorID.
@@ -50,6 +81,37 @@ func AuthorizeTenant(p Principal, requested tenant.TenantID) error {
 	}
 	if subtle.ConstantTimeCompare([]byte(p.TenantID), []byte(requested)) != 1 {
 		return ErrForbidden
+	}
+	return nil
+}
+
+// AuthorizeRepoOperation enforces tenant isolation plus optional repository pinning,
+// commit_oid read-only pinning, and operation scope checks (git:read / git:write).
+// Principals with empty RepoID and Scopes (e.g. StaticAuthenticator) retain full
+// tenant-scoped access for standalone backward compatibility.
+func AuthorizeRepoOperation(p Principal, repo tenant.RepoKey, op rpc.Operation) error {
+	if err := AuthorizeTenant(p, repo.TenantID); err != nil {
+		return err
+	}
+	if p.RepoID != "" {
+		if err := repo.RepoID.Validate(); err != nil {
+			return ErrForbidden
+		}
+		if subtle.ConstantTimeCompare([]byte(p.RepoID), []byte(repo.RepoID)) != 1 {
+			return ErrForbidden
+		}
+	}
+	if p.CommitOID != "" && op == rpc.OpReceivePack {
+		return ErrForbidden
+	}
+	if len(p.Scopes) > 0 {
+		required := ScopeGitRead
+		if op == rpc.OpReceivePack {
+			required = ScopeGitWrite
+		}
+		if !p.HasScope(required) {
+			return ErrForbidden
+		}
 	}
 	return nil
 }

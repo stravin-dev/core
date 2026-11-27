@@ -90,10 +90,11 @@ func run() error {
 	}
 	resolver.SetMetrics(edgeMetrics)
 
-	auth, err := loadAuthenticatorFromEnv()
+	auth, closeAuth, err := loadAuthenticatorFromEnv(ctx, logger)
 	if err != nil {
 		return fmt.Errorf("init authenticator: %w", err)
 	}
+	defer closeAuth()
 
 	hostKey, err := edge.LoadOrGenerateHostKey(os.Getenv("STRAVIN_SSH_HOST_KEY_PATH"))
 	if err != nil {
@@ -148,39 +149,122 @@ func run() error {
 	return srv.Run(ctx)
 }
 
-func loadAuthenticatorFromEnv() (edge.Authenticator, error) {
-	var tokens []edge.TokenEntry
-	if raw := strings.TrimSpace(os.Getenv("STRAVIN_AUTH_TOKENS")); raw != "" {
-		parsed, err := edge.ParseTokens(raw)
-		if err != nil {
-			return nil, err
-		}
-		tokens = append(tokens, parsed...)
-	}
-	if path := strings.TrimSpace(os.Getenv("STRAVIN_AUTH_TOKENS_FILE")); path != "" {
-		parsed, err := edge.LoadTokensFile(path)
-		if err != nil {
-			return nil, err
-		}
-		tokens = append(tokens, parsed...)
-	}
-
+func loadAuthenticatorFromEnv(ctx context.Context, logger *slog.Logger) (edge.Authenticator, func(), error) {
 	var keys []edge.SSHKeyEntry
 	if raw := strings.TrimSpace(os.Getenv("STRAVIN_SSH_AUTHORIZED_KEYS")); raw != "" {
 		parsed, err := edge.ParseAuthorizedKeys([]byte(raw))
 		if err != nil {
-			return nil, err
+			return nil, func() {}, err
 		}
 		keys = append(keys, parsed...)
 	}
 	if path := strings.TrimSpace(os.Getenv("STRAVIN_SSH_AUTHORIZED_KEYS_FILE")); path != "" {
 		parsed, err := edge.LoadAuthorizedKeysFile(path)
 		if err != nil {
-			return nil, err
+			return nil, func() {}, err
 		}
 		keys = append(keys, parsed...)
 	}
-	return edge.NewStaticAuthenticator(tokens, keys)
+
+	authMode := strings.ToLower(strings.TrimSpace(os.Getenv("STRAVIN_AUTH_MODE")))
+	jwksURL := strings.TrimSpace(os.Getenv("STRAVIN_AUTH_JWKS_URL"))
+	jwksStatic := strings.TrimSpace(os.Getenv("STRAVIN_AUTH_JWKS_STATIC"))
+	if authMode == "" {
+		if jwksURL != "" || jwksStatic != "" {
+			authMode = "jwks"
+		} else {
+			authMode = "static"
+		}
+	}
+
+	switch authMode {
+	case "static":
+		var tokens []edge.TokenEntry
+		if raw := strings.TrimSpace(os.Getenv("STRAVIN_AUTH_TOKENS")); raw != "" {
+			parsed, err := edge.ParseTokens(raw)
+			if err != nil {
+				return nil, func() {}, err
+			}
+			tokens = append(tokens, parsed...)
+		}
+		if path := strings.TrimSpace(os.Getenv("STRAVIN_AUTH_TOKENS_FILE")); path != "" {
+			parsed, err := edge.LoadTokensFile(path)
+			if err != nil {
+				return nil, func() {}, err
+			}
+			tokens = append(tokens, parsed...)
+		}
+		staticAuth, err := edge.NewStaticAuthenticator(tokens, keys)
+		if err != nil {
+			return nil, func() {}, err
+		}
+		return staticAuth, func() {}, nil
+
+	case "jwks":
+		var closers []func()
+		cleanup := func() {
+			for i := len(closers) - 1; i >= 0; i-- {
+				closers[i]()
+			}
+		}
+
+		ks, err := edge.NewJWKSKeySet(ctx, edge.JWKSKeySetConfig{
+			URL:             jwksURL,
+			StaticJWKS:      []byte(jwksStatic),
+			RefreshInterval: envDurationOrDefault("STRAVIN_AUTH_JWKS_REFRESH_INTERVAL", 5*time.Minute),
+			Logger:          logger,
+		})
+		if err != nil {
+			return nil, func() {}, err
+		}
+		closers = append(closers, func() { _ = ks.Close() })
+
+		var revChecker edge.RevocationChecker
+		requireRevocation := false
+		if valkeyAddr := strings.TrimSpace(os.Getenv("STRAVIN_AUTH_VALKEY_ADDR")); valkeyAddr != "" {
+			timeout := envDurationOrDefault("STRAVIN_AUTH_VALKEY_TIMEOUT", edge.DefaultValkeyRevocationTimeout)
+			vc, err := edge.NewValkeyRevocationChecker(edge.ValkeyRevocationConfig{
+				Addr:         valkeyAddr,
+				KeyPrefix:    strings.TrimSpace(os.Getenv("STRAVIN_AUTH_JTI_KEY_PREFIX")),
+				ReadTimeout:  timeout,
+				WriteTimeout: timeout,
+			})
+			if err != nil {
+				cleanup()
+				return nil, func() {}, err
+			}
+			revChecker = vc
+			requireRevocation = true
+			closers = append(closers, func() { _ = vc.Close() })
+		}
+
+		var sshFallback edge.Authenticator
+		if len(keys) > 0 {
+			sshFallback, err = edge.NewStaticAuthenticator(nil, keys)
+			if err != nil {
+				cleanup()
+				return nil, func() {}, err
+			}
+		}
+
+		jwksAuth, err := edge.NewJWKSAuthenticator(edge.JWKSAuthenticatorConfig{
+			Issuer:            envOrDefault("STRAVIN_AUTH_ISSUER", "stravin-auth"),
+			Audience:          envOrDefault("STRAVIN_AUTH_AUDIENCE", "stravin-edge"),
+			ClockSkew:         envDurationOrDefault("STRAVIN_AUTH_CLOCK_SKEW", 30*time.Second),
+			KeyProvider:       ks,
+			RevocationChecker: revChecker,
+			RequireRevocation: requireRevocation,
+			SSHFallback:       sshFallback,
+		})
+		if err != nil {
+			cleanup()
+			return nil, func() {}, err
+		}
+		return jwksAuth, cleanup, nil
+
+	default:
+		return nil, func() {}, fmt.Errorf("unsupported STRAVIN_AUTH_MODE %q (expected static or jwks)", authMode)
+	}
 }
 
 func initPackCacheFromEnv(awsCfg aws.Config, metrics *edge.Metrics, logger *slog.Logger) (*edge.PackCacheCoordinator, func(), error) {
