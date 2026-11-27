@@ -1,3 +1,11 @@
+# [1.13.0](https://github.com/stravin-dev/core/compare/v1.12.1...v1.13.0) (2026-11-27)
+
+
+### Features
+
+* **infra:** add local NATS JetStream container and STRAVIN_CORE bootstrap ([0d786f4](https://github.com/stravin-dev/core/commit/0d786f4a54c38988b99e4549a4df361c409aa47a))
+* **infra:** add local NATS JetStream container and STRAVIN_CORE bootstrap ([#191](https://github.com/stravin-dev/core/issues/191)) ([9591311](https://github.com/stravin-dev/core/commit/9591311de703e3da2eceffe3f21546e09bf101b2))
+
 ## [1.12.1](https://github.com/stravin-dev/core/compare/v1.12.0...v1.12.1) (2026-11-24)
 
 
