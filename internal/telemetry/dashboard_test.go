@@ -861,6 +861,8 @@ func TestOTelAndLGTMConfigs_TracesMetricsLogsPipelines(t *testing.T) {
 		"service.name",
 		"job_name: valkey",
 		"valkey-exporter:9121",
+		"job_name: nats",
+		"nats-exporter:7777",
 	} {
 		if !strings.Contains(promCfg, tok) {
 			t.Errorf("prometheus.yml missing required setting %q", tok)

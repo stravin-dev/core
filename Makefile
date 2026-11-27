@@ -8,7 +8,7 @@ DOCKER_COMPOSE ?= $(shell if docker compose version >/dev/null 2>&1; then echo "
 HOST_GOOS ?= $(shell uname -s | tr '[:upper:]' '[:lower:]')
 HOST_GOARCH ?= $(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
 
-.PHONY: test e2e vet lint build build-loadgen build-chaos load-test chaos-up chaos-down chaos-e2e docker-build build-floci-test-tools multi-region-up multi-region-down multi-region-e2e clean pre-commit install-hooks
+.PHONY: up down test e2e vet lint build build-loadgen build-chaos load-test chaos-up chaos-down chaos-e2e docker-build build-floci-test-tools multi-region-up multi-region-down multi-region-e2e clean pre-commit install-hooks
 
 DEVS ?= 4
 AGENTS ?= 6
@@ -23,6 +23,12 @@ OTEL_ENDPOINT ?=
 SEED ?= 0
 SCENARIOS ?=
 LOADGEN_ARGS ?=
+
+up:
+	$(DOCKER_COMPOSE) $(if $(filter 1 true yes,$(TELEMETRY)),--profile telemetry,) up -d --build
+
+down:
+	$(DOCKER_COMPOSE) --profile telemetry down -v --remove-orphans
 
 test:
 	$(GO) test -race -v ./...

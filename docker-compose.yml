@@ -65,6 +65,47 @@ services:
     networks:
       - stravin-net
 
+  nats:
+    image: nats:2.10-alpine
+    command:
+      - "-js"
+      - "-sd"
+      - "/data/jetstream"
+      - "-m"
+      - "8222"
+    ports:
+      - "4222:4222" # NATS client
+      - "8222:8222" # NATS HTTP monitoring
+    volumes:
+      - nats-data:/data/jetstream
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      - stravin-net
+
+  nats-init:
+    image: natsio/nats-box:0.16.0
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      NATS_URL: "nats://nats:4222"
+      STRAVIN_NATS_STREAM: "${STRAVIN_NATS_STREAM:-STRAVIN_CORE}"
+      STRAVIN_NATS_SUBJECTS: "${STRAVIN_NATS_SUBJECTS:-stravin.core.>}"
+      STRAVIN_NATS_MAX_AGE: "${STRAVIN_NATS_MAX_AGE:-168h}"
+      STRAVIN_NATS_DUPE_WINDOW: "${STRAVIN_NATS_DUPE_WINDOW:-2m}"
+      STRAVIN_NATS_REPLICAS: "${STRAVIN_NATS_REPLICAS:-1}"
+    entrypoint: ["/bin/sh", "/scripts/bootstrap-nats.sh"]
+    volumes:
+      - ./scripts/bootstrap-nats.sh:/scripts/bootstrap-nats.sh:ro
+    restart: "no"
+    networks:
+      - stravin-net
+
   stravin-edge:
     build:
       context: .
@@ -282,6 +323,21 @@ services:
     networks:
       - stravin-net
 
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:0.16.0
+    profiles: ["telemetry"]
+    depends_on:
+      nats:
+        condition: service_healthy
+    command:
+      - "-varz"
+      - "-jsz=all"
+      - "-connz"
+      - "-subz"
+      - "http://nats:8222"
+    networks:
+      - stravin-net
+
   prometheus:
     image: prom/prometheus:v3.2.1
     profiles: ["telemetry"]
@@ -340,6 +396,7 @@ services:
 
 volumes:
   floci-data:
+  nats-data:
   node-nvme-cache:
 
 networks:
