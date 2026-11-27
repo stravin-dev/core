@@ -318,6 +318,18 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 		return fmt.Errorf("node: init server: %w", err)
 	}
 
+	gitDataSrv, err := NewGitDataServer(GitDataServerConfig{
+		Materializer: materializer,
+		GitDataExec:  gitExec,
+		Telemetry:    tp,
+		Metrics:      metrics,
+		Logger:       logger,
+		Region:       string(cfg.Region),
+	})
+	if err != nil {
+		return fmt.Errorf("node: init gitdata server: %w", err)
+	}
+
 	grpcLn, err := net.Listen("tcp", cfg.GRPCAddr)
 	if err != nil {
 		return fmt.Errorf("node: listen grpc %s: %w", cfg.GRPCAddr, err)
@@ -330,6 +342,7 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 
 	grpcSrv := grpc.NewServer(grpcOpts...)
 	rpc.RegisterGitWireServer(grpcSrv, nodeSrv)
+	rpc.RegisterGitDataServer(grpcSrv, gitDataSrv)
 
 	probes := cfg.Probes
 	if probes == nil {

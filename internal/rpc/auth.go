@@ -59,19 +59,39 @@ func LoadTransportConfigFromEnv() TransportConfig {
 func StreamAuthInterceptor(secret string) grpc.StreamServerInterceptor {
 	expected := strings.TrimSpace(secret)
 	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		if expected == "" {
-			return status.Error(codes.Unauthenticated, "rpc: internal auth token not configured")
-		}
-		md, ok := metadata.FromIncomingContext(ss.Context())
-		if !ok {
-			return status.Error(codes.Unauthenticated, "rpc: missing authentication metadata")
-		}
-		presented := extractPresentedToken(md)
-		if presented == "" || subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) != 1 {
-			return status.Error(codes.Unauthenticated, "rpc: invalid internal auth token")
+		if err := authorizeIncomingToken(ss.Context(), expected); err != nil {
+			return err
 		}
 		return handler(srv, ss)
 	}
+}
+
+// UnaryAuthInterceptor returns a gRPC unary server interceptor that enforces
+// constant-time comparison against secret. When secret is empty or whitespace,
+// it fails closed and rejects all incoming unary RPCs with codes.Unauthenticated.
+func UnaryAuthInterceptor(secret string) grpc.UnaryServerInterceptor {
+	expected := strings.TrimSpace(secret)
+	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if err := authorizeIncomingToken(ctx, expected); err != nil {
+			return nil, err
+		}
+		return handler(ctx, req)
+	}
+}
+
+func authorizeIncomingToken(ctx context.Context, expected string) error {
+	if expected == "" {
+		return status.Error(codes.Unauthenticated, "rpc: internal auth token not configured")
+	}
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return status.Error(codes.Unauthenticated, "rpc: missing authentication metadata")
+	}
+	presented := extractPresentedToken(md)
+	if presented == "" || subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) != 1 {
+		return status.Error(codes.Unauthenticated, "rpc: invalid internal auth token")
+	}
+	return nil
 }
 
 func extractPresentedToken(md metadata.MD) string {
@@ -216,7 +236,10 @@ func ServerOptions(cfg TransportConfig) ([]grpc.ServerOption, error) {
 	}
 
 	if token != "" {
-		opts = append(opts, grpc.StreamInterceptor(StreamAuthInterceptor(token)))
+		opts = append(opts,
+			grpc.StreamInterceptor(StreamAuthInterceptor(token)),
+			grpc.UnaryInterceptor(UnaryAuthInterceptor(token)),
+		)
 	} else if !hasMTLS && !cfg.AllowInsecure {
 		return nil, errors.New("rpc: STRAVIN_INTERNAL_GRPC_TOKEN or mTLS (STRAVIN_GRPC_TLS_CA) required unless STRAVIN_GRPC_ALLOW_INSECURE=true")
 	}
