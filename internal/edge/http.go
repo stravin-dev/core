@@ -169,11 +169,16 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	principal, err := h.auth.AuthenticateToken(ctx, token)
 	if err != nil {
+		if errors.Is(err, ErrAuthUnavailable) {
+			h.metrics.RecordRequest(ctx, "http", route.metricOp, strconv.Itoa(http.StatusServiceUnavailable), "auth_unavailable", time.Since(start))
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		h.writeUnauthorized(w, ctx, route.metricOp, start)
 		return
 	}
 
-	if err := AuthorizeTenant(principal, route.repo.TenantID); err != nil {
+	if err := AuthorizeRepoOperation(principal, route.repo, route.op); err != nil {
 		h.metrics.RecordRequest(ctx, "http", route.metricOp, strconv.Itoa(http.StatusForbidden), "forbidden", time.Since(start))
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
