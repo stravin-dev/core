@@ -15,18 +15,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
-	"github.com/aws/aws-sdk-go-v2/service/kms"
 
-	"stravin.dev/core/internal/crypto"
 	"stravin.dev/core/internal/daemon"
-	"stravin.dev/core/internal/hooks/async"
+	"stravin.dev/core/internal/relay"
 	"stravin.dev/core/internal/storage/ddb"
 	"stravin.dev/core/internal/telemetry"
 )
 
 func main() {
 	if err := run(); err != nil {
-		slog.Error("stravin-hook exited with error", "error", err)
+		slog.Error("stravin-relay exited with error", "error", err)
 		os.Exit(1)
 	}
 }
@@ -37,16 +35,15 @@ func run() error {
 
 	region := envOrDefault("STRAVIN_REGION", envOrDefault("AWS_REGION", "us-east-1"))
 	tableName := envOrDefault("STRAVIN_DDB_TABLE", "stravin-core")
-	kmsKeyID := envOrDefault("STRAVIN_KMS_KEY_ID", envOrDefault("STRAVIN_KMS_ALIAS", "alias/stravin-local-dev"))
 	healthAddr := daemon.ListenAddrFromEnv(":8084")
-	consumerID := envOrDefault("STRAVIN_HOOK_CONSUMER_ID", "stravin-hook")
-	pollInterval := envDurationOrDefault("STRAVIN_HOOK_POLL_INTERVAL", 500*time.Millisecond)
-	requestTimeout := envDurationOrDefault("STRAVIN_WEBHOOK_TIMEOUT", 10*time.Second)
-	maxAttempts := envIntOrDefault("STRAVIN_WEBHOOK_MAX_ATTEMPTS", 3)
-	allowPrivateNetworks := allowPrivateNetworksFromEnv()
+	consumerID := consumerIDFromEnv()
+	pollInterval := pollIntervalFromEnv()
+	natsURL := natsURLFromEnv()
+	publishTimeout := envDurationOrDefault("STRAVIN_NATS_PUBLISH_TIMEOUT", 5*time.Second)
+	maxAttempts := envIntOrDefault("STRAVIN_RELAY_MAX_ATTEMPTS", 3)
 
 	telProvider, err := telemetry.Init(ctx, telemetry.Config{
-		ServiceName: "stravin-hook",
+		ServiceName: "stravin-relay",
 		Region:      region,
 		Mode:        telemetry.ModeOTLP,
 		SetGlobal:   true,
@@ -58,15 +55,12 @@ func run() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeoutFromEnv())
 		defer cancel()
 		if shutErr := telProvider.Shutdown(shutdownCtx); shutErr != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "stravin-hook: telemetry shutdown warning: %v\n", shutErr)
+			_, _ = fmt.Fprintf(os.Stderr, "stravin-relay: telemetry shutdown warning: %v\n", shutErr)
 		}
 	}()
 
 	logger := telProvider.Logger(os.Stdout, slog.LevelInfo)
 	slog.SetDefault(logger)
-	if allowPrivateNetworks {
-		logger.Warn("webhook private network delivery enabled via STRAVIN_WEBHOOK_ALLOW_PRIVATE_NETWORKS; do not enable in production")
-	}
 
 	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
@@ -84,58 +78,59 @@ func run() error {
 			o.BaseEndpoint = aws.String(endpoint)
 		}
 	})
-	kmsClient := kms.NewFromConfig(awsCfg, func(o *kms.Options) {
-		if endpoint != "" {
-			o.BaseEndpoint = aws.String(endpoint)
-		}
-	})
 
 	ddbRepo, err := ddb.NewRepository(ddbClient, tableName)
 	if err != nil {
 		return fmt.Errorf("init ddb repository: %w", err)
 	}
 
-	cipher, err := crypto.NewKMSEnvelopeCipher(kmsClient, kmsKeyID)
+	var pub relay.Publisher
+	if natsURL == "" {
+		logger.Warn("STRAVIN_NATS_URL not set; running stravin-relay in degraded no-op publish mode")
+		pub = relay.NewNoopPublisher(logger)
+	} else {
+		jsPub, jsErr := relay.NewJetStreamPublisher(relay.JetStreamConfig{
+			URL:            natsURL,
+			ClientName:     consumerID,
+			PublishTimeout: publishTimeout,
+		})
+		if jsErr != nil {
+			return fmt.Errorf("init nats jetstream publisher: %w", jsErr)
+		}
+		pub = jsPub
+	}
+	defer func() {
+		if closeErr := pub.Close(); closeErr != nil {
+			logger.Warn("stravin-relay publisher close warning", "error", closeErr)
+		}
+	}()
+
+	relayMetrics, err := relay.NewMetrics(telProvider)
 	if err != nil {
-		return fmt.Errorf("init kms cipher: %w", err)
+		return fmt.Errorf("init relay metrics: %w", err)
 	}
 
-	ddbDLQ, err := async.NewDynamoDBDLQSink(ddbClient, tableName)
-	if err != nil {
-		return fmt.Errorf("init dynamodb dlq sink: %w", err)
-	}
-	dlqSink := async.NewMultiDLQSink(async.NewLoggingDLQSink(logger), ddbDLQ)
-
-	hookMetrics, err := async.NewMetrics(telProvider)
-	if err != nil {
-		return fmt.Errorf("init hook metrics: %w", err)
-	}
-
-	dispatcher, err := async.NewWebhookDispatcher(async.DispatcherConfig{
-		Webhooks:             ddbRepo,
-		Cipher:               cipher,
-		DLQ:                  dlqSink,
-		Telemetry:            telProvider,
-		Metrics:              hookMetrics,
-		Logger:               logger,
-		RequestTimeout:       requestTimeout,
-		MaxAttempts:          maxAttempts,
-		AllowPrivateNetworks: allowPrivateNetworks,
+	dispatcher, err := relay.NewRelayDispatcher(relay.DispatcherConfig{
+		Publisher:   pub,
+		Telemetry:   telProvider,
+		Metrics:     relayMetrics,
+		Logger:      logger,
+		MaxAttempts: maxAttempts,
 	})
 	if err != nil {
-		return fmt.Errorf("init webhook dispatcher: %w", err)
+		return fmt.Errorf("init relay dispatcher: %w", err)
 	}
 
-	consumer, err := async.NewConsumer(async.ConsumerConfig{
+	consumer, err := relay.NewConsumer(relay.ConsumerConfig{
 		TableName:    tableName,
 		ConsumerID:   consumerID,
 		PollInterval: pollInterval,
 		Tables:       ddbClient,
 		Streams:      streamsClient,
 		Checkpoints:  ddbRepo,
-		Observers:    []async.EventObserver{dispatcher},
+		Observers:    []relay.EventObserver{dispatcher},
 		Telemetry:    telProvider,
-		Metrics:      hookMetrics,
+		Metrics:      relayMetrics,
 		Logger:       logger,
 	})
 	if err != nil {
@@ -148,7 +143,7 @@ func run() error {
 	errCh := make(chan error, 2)
 	go func() {
 		errCh <- daemon.Run(runCtx, daemon.Config{
-			ServiceName: "stravin-hook",
+			ServiceName: "stravin-relay",
 			ListenAddr:  healthAddr,
 		})
 	}()
@@ -163,6 +158,23 @@ func run() error {
 		return firstErr
 	}
 	return secondErr
+}
+
+func consumerIDFromEnv() string {
+	return envOrDefault("STRAVIN_RELAY_CONSUMER_ID", envOrDefault("STRAVIN_HOOK_CONSUMER_ID", "stravin-relay"))
+}
+
+func pollIntervalFromEnv() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("STRAVIN_RELAY_POLL_INTERVAL")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return envDurationOrDefault("STRAVIN_HOOK_POLL_INTERVAL", 500*time.Millisecond)
+}
+
+func natsURLFromEnv() string {
+	return envOrDefault("STRAVIN_NATS_URL", envOrDefault("NATS_URL", ""))
 }
 
 func envOrDefault(key, fallback string) string {
@@ -188,13 +200,4 @@ func envIntOrDefault(key string, fallback int) int {
 		}
 	}
 	return fallback
-}
-
-func allowPrivateNetworksFromEnv() bool {
-	if v := strings.TrimSpace(os.Getenv("STRAVIN_WEBHOOK_ALLOW_PRIVATE_NETWORKS")); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			return b
-		}
-	}
-	return false
 }

@@ -1,5 +1,5 @@
 GO := ./scripts/go.sh
-DAEMONS := edge node pack ctrl hook
+DAEMONS := edge node pack ctrl relay
 BINARIES := $(DAEMONS) admin
 FLOCI_TEST_TOOLS := floci-test-s3-sync floci-test-ddb-sync
 BIN_DIR := bin

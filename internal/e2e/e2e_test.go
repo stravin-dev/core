@@ -10,27 +10,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"stravin.dev/core/internal/admin"
 	"stravin.dev/core/internal/compaction"
 	"stravin.dev/core/internal/ctrl"
 	"stravin.dev/core/internal/gitexec"
-	"stravin.dev/core/internal/hooks/async"
 	"stravin.dev/core/internal/lease"
 	"stravin.dev/core/internal/pack"
+	"stravin.dev/core/internal/relay"
 	"stravin.dev/core/internal/storage/ddb"
 	"stravin.dev/core/internal/storage/s3"
 	"stravin.dev/core/internal/tenant"
@@ -265,12 +262,29 @@ func TestE2E_Scenario3_Tier1WasmHookAllowAndReject(t *testing.T) {
 	}
 }
 
-// Scenario 4: Tier 2 stravin-hook async outbox -> HMAC-SHA256 webhook delivery + retry & DLQ.
-func TestE2E_Scenario4_Tier2AsyncWebhookAndDLQ(t *testing.T) {
+// Scenario 4: stravin-relay DynamoDB Streams -> NATS JetStream STRAVIN_CORE outbox envelopes.
+func TestE2E_Scenario4_StravinRelayJetStreamOutbox(t *testing.T) {
 	env := newStackEnv(t)
-	env.checkHealthz(t, env.hookURL)
+	env.checkHealthz(t, env.relayURL)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	nc, err := nats.Connect(env.natsURL)
+	if err != nil {
+		t.Fatalf("nats.Connect(%s): %v", env.natsURL, err)
+	}
+	defer nc.Close()
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream.New: %v", err)
+	}
+	stream, err := js.Stream(ctx, "STRAVIN_CORE")
+	if err != nil {
+		t.Fatalf("js.Stream(STRAVIN_CORE): %v", err)
+	}
+
 	repoID := uniqueRepoID("e2e-s4")
 	if _, err := env.adminSvc.RegisterRepo(ctx, admin.RegisterRepoInput{
 		TenantID:       "local",
@@ -282,134 +296,71 @@ func TestE2E_Scenario4_Tier2AsyncWebhookAndDLQ(t *testing.T) {
 		t.Fatalf("RegisterRepo: %v", err)
 	}
 
-	var (
-		mu             sync.Mutex
-		deliveredBody  []byte
-		deliveredSig   string
-		deliveredEvent string
-		okHits         atomic.Int32
-		failHits       atomic.Int32
-	)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ok", func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		mu.Lock()
-		deliveredBody = body
-		deliveredSig = r.Header.Get(async.HeaderSignature256)
-		deliveredEvent = r.Header.Get(async.HeaderEvent)
-		mu.Unlock()
-		okHits.Add(1)
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/fail", func(w http.ResponseWriter, _ *http.Request) {
-		failHits.Add(1)
-		w.WriteHeader(http.StatusInternalServerError)
-	})
-
-	// Bind on 0.0.0.0 so the stravin-hook Docker container can connect via host.docker.internal.
-	ln, err := net.Listen("tcp4", "0.0.0.0:0")
-	if err != nil {
-		t.Fatalf("listen webhook receiver: %v", err)
-	}
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	go func() { _ = srv.Serve(ln) }()
-	t.Cleanup(func() { _ = srv.Close() })
-
-	port := ln.Addr().(*net.TCPAddr).Port
-	baseCallback := fmt.Sprintf("http://%s:%d", env.webhookHost, port)
-	secret := "e2e-kms-webhook-secret-" + repoID
-
-	if _, err := env.adminSvc.ConfigureWebhook(ctx, admin.ConfigureWebhookInput{
-		TenantID:         "local",
-		RepoID:           repoID,
-		WebhookID:        "wh-ok",
-		URL:              baseCallback + "/ok",
-		Secret:           secret,
-		KMSKeyID:         env.kmsKeyID,
-		RefGlob:          "refs/heads/*",
-		Enabled:          true,
-		MaxAttempts:      2,
-		InitialBackoffMS: 25,
-		MaxBackoffMS:     100,
-	}); err != nil {
-		t.Fatalf("ConfigureWebhook(wh-ok): %v", err)
-	}
-	if _, err := env.adminSvc.ConfigureWebhook(ctx, admin.ConfigureWebhookInput{
-		TenantID:         "local",
-		RepoID:           repoID,
-		WebhookID:        "wh-fail",
-		URL:              baseCallback + "/fail",
-		Secret:           secret,
-		KMSKeyID:         env.kmsKeyID,
-		RefGlob:          "refs/heads/*",
-		Enabled:          true,
-		MaxAttempts:      2,
-		InitialBackoffMS: 25,
-		MaxBackoffMS:     100,
-		Append:           true,
-	}); err != nil {
-		t.Fatalf("ConfigureWebhook(wh-fail): %v", err)
-	}
-
-	// Push via Smart HTTP to trigger DDB Ref History -> Floci Streams -> stravin-hook container.
+	// Push via Smart HTTP to trigger DDB Ref History -> Floci Streams -> stravin-relay -> STRAVIN_CORE.
 	httpURL := env.smartHTTPRepoURL("local", repoID)
-	workDir, commitSHA := initLocalRepoWithCommit(t, httpURL, "hook.txt", "trigger webhook\n", "trigger tier 2 webhook")
+	workDir, commitSHA := initLocalRepoWithCommit(t, httpURL, "relay.txt", "trigger jetstream outbox\n", "trigger stravin-relay")
 	mustRunGit(t, workDir, nil, "push", "origin", "main")
 
+	wantRefSubject := fmt.Sprintf("stravin.core.local.%s.ref.updated", repoID)
+	wantCreatedSubject := fmt.Sprintf("stravin.core.local.%s.repo.created", repoID)
+
+	var (
+		gotRefMsg     *jetstream.RawStreamMsg
+		gotCreatedMsg *jetstream.RawStreamMsg
+	)
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		if okHits.Load() >= 1 && failHits.Load() >= 2 {
+		if gotCreatedMsg == nil {
+			if msg, getErr := stream.GetLastMsgForSubject(ctx, wantCreatedSubject); getErr == nil {
+				gotCreatedMsg = msg
+			}
+		}
+		if gotRefMsg == nil {
+			if msg, getErr := stream.GetLastMsgForSubject(ctx, wantRefSubject); getErr == nil {
+				gotRefMsg = msg
+			}
+		}
+		if gotCreatedMsg != nil && gotRefMsg != nil {
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if okHits.Load() < 1 {
-		t.Fatalf("expected signed webhook delivery to %s/ok, got %d hits", baseCallback, okHits.Load())
-	}
-	if failHits.Load() < 2 {
-		t.Fatalf("expected >=2 retry attempts to %s/fail, got %d hits", baseCallback, failHits.Load())
+		time.Sleep(150 * time.Millisecond)
 	}
 
-	mu.Lock()
-	bodyCopy := append([]byte(nil), deliveredBody...)
-	sigCopy := deliveredSig
-	eventCopy := deliveredEvent
-	mu.Unlock()
-
-	if eventCopy != async.EventPush {
-		t.Fatalf("X-Stravin-Event = %q, want %q", eventCopy, async.EventPush)
+	if gotCreatedMsg == nil {
+		t.Fatalf("timed out waiting for %s on STRAVIN_CORE", wantCreatedSubject)
 	}
-	if !async.VerifySignature([]byte(secret), bodyCopy, sigCopy) {
-		t.Fatalf("HMAC-SHA256 signature verification failed (sig=%q body=%s)", sigCopy, string(bodyCopy))
-	}
-	var payload async.WebhookPayload
-	if err := json.Unmarshal(bodyCopy, &payload); err != nil {
-		t.Fatalf("unmarshal webhook payload: %v", err)
-	}
-	if payload.TenantID != "local" || payload.RepoID != repoID || payload.Ref != "refs/heads/main" || payload.OID != commitSHA {
-		t.Fatalf("unexpected webhook payload: %+v (want OID %s)", payload, commitSHA)
+	if gotRefMsg == nil {
+		t.Fatalf("timed out waiting for %s on STRAVIN_CORE", wantRefSubject)
 	}
 
-	// Verify DLQ entry persisted in Floci DynamoDB for wh-fail.
-	var dlqFound bool
-	dlqDeadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(dlqDeadline) {
-		qOut, err := env.ddbClient.Query(ctx, &dynamodb.QueryInput{
-			TableName:              aws.String(env.ddbTable),
-			KeyConditionExpression: aws.String("PK = :pk AND begins_with(SK, :sk)"),
-			ExpressionAttributeValues: map[string]ddbtypes.AttributeValue{
-				":pk": &ddbtypes.AttributeValueMemberS{Value: fmt.Sprintf("T#local#REPO#%s#DLQ", repoID)},
-				":sk": &ddbtypes.AttributeValueMemberS{Value: "HOOK#wh-fail#"},
-			},
-		})
-		if err == nil && len(qOut.Items) > 0 {
-			dlqFound = true
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
+	if gotRefMsg.Header.Get(relay.HeaderNatsMsgID) == "" {
+		t.Fatalf("ref.updated missing %s header", relay.HeaderNatsMsgID)
 	}
-	if !dlqFound {
-		t.Fatal("expected DLQ record in Floci DynamoDB for failing webhook wh-fail")
+	if gotRefMsg.Header.Get(relay.HeaderTraceparent) == "" {
+		t.Fatalf("ref.updated missing %s header", relay.HeaderTraceparent)
+	}
+	if gotRefMsg.Header.Get(relay.HeaderEventType) != relay.EventTypeRefUpdated {
+		t.Fatalf("ref.updated %s = %q, want %q", relay.HeaderEventType, gotRefMsg.Header.Get(relay.HeaderEventType), relay.EventTypeRefUpdated)
+	}
+
+	var refEnv struct {
+		EventID        string               `json:"event_id"`
+		EventType      string               `json:"event_type"`
+		SchemaVersion  string               `json:"schema_version"`
+		TenantID       string               `json:"tenant_id"`
+		RepoID         string               `json:"repo_id"`
+		TraceParent    string               `json:"traceparent"`
+		IdempotencyKey string               `json:"idempotency_key"`
+		Data           relay.RefUpdatedData `json:"data"`
+	}
+	if err := json.Unmarshal(gotRefMsg.Data, &refEnv); err != nil {
+		t.Fatalf("unmarshal ref.updated envelope: %v", err)
+	}
+	if refEnv.TenantID != "local" || refEnv.RepoID != repoID || refEnv.Data.RefName != "refs/heads/main" || refEnv.Data.OID != commitSHA {
+		t.Fatalf("unexpected ref.updated envelope: %+v (want OID %s)", refEnv, commitSHA)
+	}
+	if refEnv.IdempotencyKey != gotRefMsg.Header.Get(relay.HeaderNatsMsgID) {
+		t.Fatalf("idempotency_key %q != Nats-Msg-Id %q", refEnv.IdempotencyKey, gotRefMsg.Header.Get(relay.HeaderNatsMsgID))
 	}
 }
 

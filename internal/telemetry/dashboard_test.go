@@ -261,7 +261,7 @@ func assertCoreDashboardRowsAndGrid(t *testing.T, dash grafanaDashboard) {
 		"Node & Cache Layer",
 		"Compaction & GC Layer",
 		"Control Plane & Recovery Layer",
-		"Async Webhooks Layer",
+		"Event Relay Layer",
 	}
 	wantAllRows := append([]string{"Overview"}, append(append([]string{}, wantMetricRows...), "Logs & Trace Correlation")...)
 
@@ -533,10 +533,10 @@ func TestGrafanaDashboards_StravinCoreAndLoadTester(t *testing.T) {
 		"stravin_ctrl_scrub_duration_seconds_bucket",
 		"stravin_ctrl_recovery_runs_total",
 		"stravin_ctrl_recovery_refs_published_total",
-		// Async Webhooks Layer (stravin-hook)
-		"stravin_hook_deliveries_total",
-		"stravin_hook_delivery_duration_seconds_bucket",
-		"stravin_hook_stream_records_total",
+		// Event Relay Layer (stravin-relay)
+		"stravin_relay_publishes_total",
+		"stravin_relay_publish_duration_seconds_bucket",
+		"stravin_relay_stream_records_total",
 	}, `{service_name=~"stravin-.*"}`)
 	assertCoreDashboardRowsAndGrid(t, coreDash)
 

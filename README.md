@@ -19,7 +19,7 @@ Services started:
 - **`stravin-node`** (`:8081` health/metrics, `:9090` gRPC): Git read/write engine with NVMe pack cache and Tier 1 Wasm hook runtime.
 - **`stravin-pack`** (`:8082`): Sharded pack compaction (`.midx` + `commit-graph`) and delayed GC daemon.
 - **`stravin-ctrl`** (`:8083`): Regional write-lease manager, `failover_epoch` fencing, and S3 integrity scrub/rewind API.
-- **`stravin-hook`** (`:8084`): DynamoDB Streams consumer dispatching KMS-encrypted, HMAC-SHA256-signed Tier 2 webhooks with retry and DLQ.
+- **`stravin-relay`** (`:8084`): Pure DynamoDB Streams -> NATS JetStream (`STRAVIN_CORE`) transactional outbox emitting Standard Async Event Envelopes with deterministic `Nats-Msg-Id` deduplication and W3C `traceparent` headers.
 
 ### 2. Push and clone over Smart HTTP
 
@@ -63,7 +63,7 @@ make e2e
 1. Smart HTTP (`:8080`) + SSH (`:2222`) Git lifecycle (initial + incremental thin-pack push/clone/fetch).
 2. Concurrent Ref-CAS conflict resolution (exactly one winner, zero lost commits).
 3. Tier 1 Wasm hook `ALLOW` and `REJECT` (S3 upload cancelled, zero DDB writes, Git side-band stderr).
-4. Tier 2 `stravin-hook` async outbox (DynamoDB Streams -> HMAC-SHA256 webhook delivery + retry/DLQ).
+4. `stravin-relay` async outbox (DynamoDB Streams -> `STRAVIN_CORE` NATS JetStream Standard Async Event Envelopes with `Nats-Msg-Id` & `traceparent`).
 5. `stravin-pack` sharded lease compaction (`.midx` + `commit-graph` + 2-phase swap) and delayed GC.
 6. `stravin-ctrl` `failover_epoch` fencing and fault-injected S3 pack deletion `HeadObject` scrub + deterministic `Ref History` rewind + audit trail.
 

@@ -157,7 +157,7 @@ func TestCIAndReleaseWorkflows(t *testing.T) {
 		"stravin-node",
 		"stravin-pack",
 		"stravin-ctrl",
-		"stravin-hook",
+		"stravin-relay",
 		"stravin-admin",
 		"stravin-loadgen",
 		"stravin-chaos",

@@ -35,10 +35,10 @@ type stackEnv struct {
 	packURL        string
 	ctrlURL        string
 	ctrlAdminToken string
-	hookURL        string
+	relayURL       string
+	natsURL        string
 	authToken      string
 	sshKeyPath     string
-	webhookHost    string
 
 	ddbClient *dynamodb.Client
 	ddbRepo   *ddb.Repository
@@ -105,10 +105,10 @@ func newStackEnv(t *testing.T) *stackEnv {
 		packURL:        strings.TrimRight(envOrDefault("STRAVIN_PACK_URL", "http://127.0.0.1:8082"), "/"),
 		ctrlURL:        strings.TrimRight(envOrDefault("STRAVIN_CTRL_URL", "http://127.0.0.1:8083"), "/"),
 		ctrlAdminToken: envOrDefault("STRAVIN_CTRL_ADMIN_TOKEN", "stravin-local-ctrl-admin-token"),
-		hookURL:        strings.TrimRight(envOrDefault("STRAVIN_HOOK_URL", "http://127.0.0.1:8084"), "/"),
+		relayURL:       strings.TrimRight(envOrDefault("STRAVIN_RELAY_URL", envOrDefault("STRAVIN_HOOK_URL", "http://127.0.0.1:8084")), "/"),
+		natsURL:        envOrDefault("STRAVIN_NATS_URL", "nats://127.0.0.1:4222"),
 		authToken:      envOrDefault("STRAVIN_E2E_TOKEN", "stravin-local-dev-token"),
 		sshKeyPath:     strings.TrimSpace(os.Getenv("STRAVIN_E2E_SSH_KEY")),
-		webhookHost:    envOrDefault("STRAVIN_E2E_WEBHOOK_HOST", "host.docker.internal"),
 		ddbClient:      ddbClient,
 		ddbRepo:        ddbRepo,
 		s3Store:        s3Store,

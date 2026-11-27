@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Stravin Core health overview and per-layer metrics (stravin-edge, stravin-node, stravin-pack, stravin-ctrl, stravin-hook) with collapsible rows, Tempo trace exemplars, and correlated Loki logs.",
+  "description": "Stravin Core health overview and per-layer metrics (stravin-edge, stravin-node, stravin-pack, stravin-ctrl, stravin-relay) with collapsible rows, Tempo trace exemplars, and correlated Loki logs.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -1489,24 +1489,24 @@
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 69 },
       "id": 35,
       "panels": [],
-      "title": "Async Webhooks Layer (stravin-hook)",
+      "title": "Event Relay Layer (stravin-relay)",
       "type": "row"
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Async webhook delivery rate by result (ok, retry, dlq, error) on stravin-hook.",
+      "description": "NATS JetStream outbox publish rate by result (ok, duplicate, retry, error) on stravin-relay.",
       "fieldConfig": {
         "defaults": {
           "links": [
             {
               "targetBlank": true,
-              "title": "Explore Tempo Traces (stravin-hook)",
-              "url": "/explore?left=%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7Bresource.service.name%3D%5C%22stravin-hook%5C%22%7D%22%7D%5D%7D"
+              "title": "Explore Tempo Traces (stravin-relay)",
+              "url": "/explore?left=%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7Bresource.service.name%3D%5C%22stravin-relay%5C%22%7D%22%7D%5D%7D"
             },
             {
               "targetBlank": true,
-              "title": "Explore Loki Logs (stravin-hook)",
-              "url": "/explore?left=%7B%22datasource%22%3A%22loki%22%2C%22queries%22%3A%5B%7B%22expr%22%3A%22%7Bservice_name%3D%5C%22stravin-hook%5C%22%7D%22%7D%5D%7D"
+              "title": "Explore Loki Logs (stravin-relay)",
+              "url": "/explore?left=%7B%22datasource%22%3A%22loki%22%2C%22queries%22%3A%5B%7B%22expr%22%3A%22%7Bservice_name%3D%5C%22stravin-relay%5C%22%7D%22%7D%5D%7D"
             }
           ],
           "unit": "ops"
@@ -1522,17 +1522,17 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum by (result) (rate(stravin_hook_deliveries_total[5m]))",
-          "legendFormat": "delivery ({{result}})",
+          "expr": "sum by (result) (rate(stravin_relay_publishes_total[5m]))",
+          "legendFormat": "publish ({{result}})",
           "refId": "A"
         }
       ],
-      "title": "Hook Delivery Rate (by Result)",
+      "title": "Relay Publish Rate (by Result)",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "End-to-end async webhook delivery p50/p95/p99 latency with Tempo exemplars on stravin-hook.",
+      "description": "End-to-end NATS JetStream outbox publish p50/p95/p99 latency with Tempo exemplars on stravin-relay.",
       "fieldConfig": {
         "defaults": {
           "unit": "s"
@@ -1549,31 +1549,31 @@
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "exemplar": true,
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(stravin_hook_delivery_duration_seconds_bucket[5m])))",
-          "legendFormat": "p50 delivery",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(stravin_relay_publish_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50 publish",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "exemplar": true,
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(stravin_hook_delivery_duration_seconds_bucket[5m])))",
-          "legendFormat": "p95 delivery",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(stravin_relay_publish_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 publish",
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "exemplar": true,
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(stravin_hook_delivery_duration_seconds_bucket[5m])))",
-          "legendFormat": "p99 delivery",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(stravin_relay_publish_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99 publish",
           "refId": "C"
         }
       ],
-      "title": "Hook Delivery Latency p50 / p95 / p99",
+      "title": "Relay Publish Latency p50 / p95 / p99",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Async webhook retry, DLQ, and internal error rates on stravin-hook.",
+      "description": "JetStream publish retry and error rates on stravin-relay.",
       "fieldConfig": {
         "defaults": {
           "unit": "ops"
@@ -1589,17 +1589,17 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum by (result) (rate(stravin_hook_deliveries_total{result=~\"retry|dlq|error\"}[5m]))",
+          "expr": "sum by (result) (rate(stravin_relay_publishes_total{result=~\"retry|error\"}[5m]))",
           "legendFormat": "{{result}}/s",
           "refId": "A"
         }
       ],
-      "title": "Hook Retries, DLQ & Errors",
+      "title": "Relay Retries & Errors",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "DynamoDB Streams Ref History records processed by result (ok, error) on stravin-hook.",
+      "description": "DynamoDB Streams outbox records processed by result (ok, error) on stravin-relay.",
       "fieldConfig": {
         "defaults": {
           "unit": "ops"
@@ -1615,12 +1615,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum by (result) (rate(stravin_hook_stream_records_total[5m]))",
+          "expr": "sum by (result) (rate(stravin_relay_stream_records_total[5m]))",
           "legendFormat": "stream records ({{result}})",
           "refId": "A"
         }
       ],
-      "title": "Hook Stream Records Processed",
+      "title": "Relay Stream Records Processed",
       "type": "timeseries"
     },
     {

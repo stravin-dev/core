@@ -140,7 +140,7 @@ wait_http "stravin-node" "http://127.0.0.1:8081/healthz"
 wait_http "stravin-edge" "http://127.0.0.1:8080/healthz"
 wait_http "stravin-edge (via toxiproxy)" "http://127.0.0.1:18080/healthz"
 wait_http "stravin-pack" "http://127.0.0.1:8082/healthz"
-wait_http "stravin-hook" "http://127.0.0.1:8084/healthz"
+wait_http "stravin-relay" "http://127.0.0.1:8084/healthz"
 
 echo "[chaos-e2e] Seeding ${REPOS} test repositories (repo-1..repo-${REPOS}) via stravin-admin..."
 for i in $(seq 1 "${REPOS}"); do
