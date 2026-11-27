@@ -1,3 +1,13 @@
+# [1.14.0](https://github.com/stravin-dev/core/compare/v1.13.0...v1.14.0) (2026-11-27)
+
+
+### Features
+
+* **auth:** add local JWKS JWT verification and Valkey jti deny-list in stravin-edge ([f7d14ca](https://github.com/stravin-dev/core/commit/f7d14ca9526e199a6a2120c7950fbb29ea32699e))
+* **auth:** local JWKS JWT verification and Valkey jti deny-list in stravin-edge ([#193](https://github.com/stravin-dev/core/issues/193)) ([d696f9a](https://github.com/stravin-dev/core/commit/d696f9a92960fa8d0e9ad75d91076860ec04b083))
+* **gitdata:** implement read-only GitData gRPC service (GetDiff, GetBlob, ListTree) ([7c284c1](https://github.com/stravin-dev/core/commit/7c284c13d52d989958b764427c4eb6527f6a70e0))
+* **gitdata:** implement read-only GitData gRPC service (GetDiff, GetBlob, ListTree) ([#192](https://github.com/stravin-dev/core/issues/192)) ([c9fb36a](https://github.com/stravin-dev/core/commit/c9fb36afff0243df8d5b9217327399ddc3bbc46e))
+
 # [1.13.0](https://github.com/stravin-dev/core/compare/v1.12.1...v1.13.0) (2026-11-27)
 
 
