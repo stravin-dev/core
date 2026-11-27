@@ -1,3 +1,11 @@
+# [1.15.0](https://github.com/stravin-dev/core/compare/v1.14.0...v1.15.0) (2026-11-27)
+
+
+### Features
+
+* **relay:** evolve stravin-hook to stravin-relay NATS JetStream outbox ([50aca91](https://github.com/stravin-dev/core/commit/50aca91d819a461964e01cc0b308315920c7bfeb))
+* **relay:** evolve stravin-hook to stravin-relay NATS JetStream outbox ([#194](https://github.com/stravin-dev/core/issues/194)) ([021584e](https://github.com/stravin-dev/core/commit/021584ef610ea99b729d95c420cb6f8781ee56ed))
+
 # [1.14.0](https://github.com/stravin-dev/core/compare/v1.13.0...v1.14.0) (2026-11-27)
 
 
