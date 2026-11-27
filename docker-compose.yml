@@ -265,24 +265,24 @@ services:
     networks:
       - stravin-net
 
-  stravin-hook:
+  stravin-relay:
     build:
       context: .
       dockerfile: Dockerfile
-      target: hook
+      target: relay
     depends_on:
       floci-init:
         condition: service_completed_successfully
+      nats-init:
+        condition: service_completed_successfully
     ports:
       - "8084:8084" # Health
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     environment:
       STRAVIN_REGION: "us-east-1"
       STRAVIN_DDB_TABLE: "stravin-core"
-      STRAVIN_KMS_KEY_ID: "alias/stravin-local-dev"
-      STRAVIN_HOOK_POLL_INTERVAL: "${STRAVIN_HOOK_POLL_INTERVAL:-250ms}"
-      STRAVIN_WEBHOOK_ALLOW_PRIVATE_NETWORKS: "${STRAVIN_WEBHOOK_ALLOW_PRIVATE_NETWORKS:-true}"
+      STRAVIN_NATS_URL: "${STRAVIN_NATS_URL:-nats://nats:4222}"
+      STRAVIN_NATS_STREAM: "${STRAVIN_NATS_STREAM:-STRAVIN_CORE}"
+      STRAVIN_RELAY_POLL_INTERVAL: "${STRAVIN_RELAY_POLL_INTERVAL:-250ms}"
       AWS_ENDPOINT_URL: "http://floci:4566"
       AWS_REGION: "us-east-1"
       AWS_ACCESS_KEY_ID: "test"

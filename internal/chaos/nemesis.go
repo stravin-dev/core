@@ -27,7 +27,7 @@ var DefaultRestartTargets = []string{
 	"stravin-node",
 	"stravin-edge",
 	"stravin-pack",
-	"stravin-hook",
+	"stravin-relay",
 }
 
 // Config configures the Nemesis fault-injection loop.

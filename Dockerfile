@@ -13,7 +13,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-edge ./cmd
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-node ./cmd/stravin-node \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-pack ./cmd/stravin-pack \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-ctrl ./cmd/stravin-ctrl \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-hook ./cmd/stravin-hook \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-relay ./cmd/stravin-relay \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/stravin-admin ./cmd/stravin-admin
 
 FROM alpine:3.22 AS runtime-base
@@ -58,13 +58,13 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
   CMD wget -q -O /dev/null http://127.0.0.1:8083/readyz || exit 1
 ENTRYPOINT ["/usr/local/bin/stravin-ctrl"]
 
-FROM runtime-base AS hook
-COPY --from=builder /out/stravin-hook /usr/local/bin/stravin-hook
+FROM runtime-base AS relay
+COPY --from=builder /out/stravin-relay /usr/local/bin/stravin-relay
 USER stravin
 EXPOSE 8084
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
   CMD wget -q -O /dev/null http://127.0.0.1:8084/readyz || exit 1
-ENTRYPOINT ["/usr/local/bin/stravin-hook"]
+ENTRYPOINT ["/usr/local/bin/stravin-relay"]
 
 FROM runtime-base AS admin
 COPY --from=builder /out/stravin-admin /usr/local/bin/stravin-admin

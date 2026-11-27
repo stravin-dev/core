@@ -19,7 +19,7 @@ cleanup() {
   local exit_code=$?
   if [ "${exit_code}" -ne 0 ]; then
     echo "--- E2E failed (exit=${exit_code}); dumping service logs ---" >&2
-    "${COMPOSE[@]}" logs --tail=80 floci floci-init stravin-ctrl stravin-node stravin-edge stravin-pack stravin-hook || true
+    "${COMPOSE[@]}" logs --tail=80 floci floci-init nats nats-init stravin-ctrl stravin-node stravin-edge stravin-pack stravin-relay || true
   fi
   if [ "${STRAVIN_E2E_KEEP_STACK:-0}" != "1" ]; then
     "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
@@ -44,7 +44,7 @@ export AWS_DEFAULT_REGION="us-east-1"
 
 echo "[e2e] Starting full Docker Compose + Floci stack..."
 "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-"${COMPOSE[@]}" up -d --build floci floci-init stravin-ctrl stravin-node stravin-edge stravin-pack stravin-hook
+"${COMPOSE[@]}" up -d --build floci floci-init nats nats-init stravin-ctrl stravin-node stravin-edge stravin-pack stravin-relay
 
 wait_http() {
   local name="$1"
@@ -62,11 +62,12 @@ wait_http() {
   return 1
 }
 
+wait_http "nats" "http://127.0.0.1:8222/healthz?js-enabled-only=true"
 wait_http "stravin-ctrl" "http://127.0.0.1:8083/healthz"
 wait_http "stravin-node" "http://127.0.0.1:8081/healthz"
 wait_http "stravin-edge" "http://127.0.0.1:8080/healthz"
 wait_http "stravin-pack" "http://127.0.0.1:8082/healthz"
-wait_http "stravin-hook" "http://127.0.0.1:8084/healthz"
+wait_http "stravin-relay" "http://127.0.0.1:8084/healthz"
 
 echo "[e2e] Running 6/6 Go E2E suite (-race -tags=e2e)..."
 ./scripts/go.sh test -race -v -tags=e2e -count=1 -run "${STRAVIN_E2E_RUN:-.}" ./internal/e2e/...
