@@ -1,3 +1,16 @@
+# [1.16.0](https://github.com/stravin-dev/core/compare/v1.15.0...v1.16.0) (2026-11-28)
+
+
+### Bug Fixes
+
+* **gitexec:** avoid unchecked uint64-to-int64 conversion in ExecCatFileBatch ([d38824b](https://github.com/stravin-dev/core/commit/d38824b158c7da85039cfec179c88380e88b3c16))
+
+
+### Features
+
+* **gitdata:** add read-only ListRefs and GetCommitLog RPCs ([dd1ba7e](https://github.com/stravin-dev/core/commit/dd1ba7e0e7580a1ee323fc26be446f420e995ddd))
+* **gitdata:** add read-only ListRefs and GetCommitLog RPCs ([#196](https://github.com/stravin-dev/core/issues/196)) ([233b73e](https://github.com/stravin-dev/core/commit/233b73e72360676c26332eb85eeec13806b06d61))
+
 # [1.15.0](https://github.com/stravin-dev/core/compare/v1.14.0...v1.15.0) (2026-11-27)
 
 
