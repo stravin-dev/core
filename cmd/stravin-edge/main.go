@@ -126,6 +126,12 @@ func run() error {
 	}
 	defer closePackCache()
 
+	routeResolver, closeRouteResolver, err := initRouteResolverFromEnv(ctx, logger)
+	if err != nil {
+		return fmt.Errorf("init route resolver: %w", err)
+	}
+	defer closeRouteResolver()
+
 	srv, err := edge.NewServer(edge.ServerConfig{
 		SSHAddr:                  sshAddr,
 		HTTPAddr:                 httpAddr,
@@ -135,6 +141,8 @@ func run() error {
 		Authenticator:            auth,
 		Limiter:                  limiter,
 		Resolver:                 resolver,
+		RouteResolver:            routeResolver,
+		MaxOrgDepth:              envIntOrDefault("STRAVIN_EDGE_MAX_ORG_DEPTH", edge.DefaultMaxOrgDepth),
 		Router:                   router,
 		Proxy:                    proxy,
 		PackCache:                packCache,
@@ -334,6 +342,64 @@ func initPackCacheFromEnv(awsCfg aws.Config, metrics *edge.Metrics, logger *slog
 		Metrics:         metrics,
 	})
 	return coord, cleanup, nil
+}
+
+func initRouteResolverFromEnv(ctx context.Context, logger *slog.Logger) (edge.RouteResolver, func(), error) {
+	valkeyAddr := strings.TrimSpace(os.Getenv("STRAVIN_ROUTE_MAP_VALKEY_ADDR"))
+	if valkeyAddr == "" {
+		return nil, func() {}, nil
+	}
+
+	timeout := envDurationOrDefault("STRAVIN_ROUTE_MAP_TIMEOUT", edge.DefaultValkeyRouteTimeout)
+	cacheTTL := edge.DefaultRouteCacheTTL
+	if rawTTL := strings.TrimSpace(os.Getenv("STRAVIN_ROUTE_MAP_CACHE_TTL")); rawTTL != "" {
+		if d, err := time.ParseDuration(rawTTL); err == nil && d >= 0 {
+			cacheTTL = d
+		}
+	}
+
+	vr, err := edge.NewValkeyRouteResolver(edge.ValkeyRouteResolverConfig{
+		Addr:         valkeyAddr,
+		KeyPrefix:    strings.TrimSpace(os.Getenv("STRAVIN_ROUTE_MAP_KEY_PREFIX")),
+		ReadTimeout:  timeout,
+		WriteTimeout: timeout,
+		CacheTTL:     cacheTTL,
+		Logger:       logger,
+	})
+	if err != nil {
+		return nil, func() {}, err
+	}
+
+	closers := []func(){func() { _ = vr.Close() }}
+	cleanup := func() {
+		for i := len(closers) - 1; i >= 0; i-- {
+			closers[i]()
+		}
+	}
+
+	natsURL := strings.TrimSpace(os.Getenv("STRAVIN_ROUTE_MAP_NATS_URL"))
+	if natsURL == "" {
+		natsURL = strings.TrimSpace(os.Getenv("STRAVIN_NATS_URL"))
+	}
+	if natsURL != "" && cacheTTL > 0 {
+		inv, invErr := edge.StartRouteInvalidator(ctx, edge.RouteInvalidatorConfig{
+			NATSURL:    natsURL,
+			StreamName: strings.TrimSpace(os.Getenv("STRAVIN_AUTH_STREAM")),
+			Resolver:   vr,
+			Logger:     logger,
+		})
+		if invErr != nil {
+			logger.Warn("stravin-edge: route invalidator unavailable, relying on route cache TTL",
+				"nats_url", natsURL,
+				"cache_ttl", cacheTTL,
+				"error", invErr,
+			)
+		} else {
+			closers = append(closers, func() { _ = inv.Close() })
+		}
+	}
+
+	return vr, cleanup, nil
 }
 
 func envOrDefault(key, fallback string) string {

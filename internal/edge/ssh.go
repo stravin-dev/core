@@ -56,28 +56,54 @@ func LoadOrGenerateHostKey(path string) (ssh.Signer, error) {
 	return signer, nil
 }
 
-// ParseSSHExecCommand parses and validates a Git SSH exec command of the form:
+// ParseSSHExecCommand parses and validates a legacy 2-segment Git SSH exec command of the form:
 //
 //	git-upload-pack '/{tenant}/{repo}.git'
 //	git-receive-pack '/{tenant}/{repo}.git'
 //
 // It strictly rejects shell metacharacters, path traversal, extra arguments, and invalid IDs.
 func ParseSSHExecCommand(cmd string) (rpc.Operation, tenant.RepoKey, error) {
+	op, parsed, err := ParseSSHExecCommandPath(cmd, 1)
+	if err != nil {
+		return "", tenant.RepoKey{}, err
+	}
+	repoKey, err := parsed.LegacyRepoKey()
+	if err != nil {
+		return "", tenant.RepoKey{}, errors.New("edge: repository path must be /{tenant}/{repo}.git")
+	}
+	return op, repoKey, nil
+}
+
+// ParseSSHExecCommandPath parses and validates a bounded multi-segment Git SSH exec command
+// of the form:
+//
+//	git-upload-pack '/{org_path}/{repo}.git'
+//	git-receive-pack '/{org_path}/{repo}.git'
+//
+// It accepts 2..(maxOrgDepth+1) path segments (default 2..5) and strictly rejects shell
+// metacharacters, control characters, path traversal, extra arguments, and invalid IDs.
+func ParseSSHExecCommandPath(cmd string, maxOrgDepth int) (rpc.Operation, ParsedRepoPath, error) {
+	for i := range len(cmd) {
+		c := cmd[i]
+		if c < 0x20 || c == 0x7f {
+			return "", ParsedRepoPath{}, errors.New("edge: illegal control characters in ssh command")
+		}
+	}
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
-		return "", tenant.RepoKey{}, errors.New("edge: empty ssh exec command")
+		return "", ParsedRepoPath{}, errors.New("edge: empty ssh exec command")
 	}
 	if strings.ContainsAny(cmd, ";|&`$()<>\n\r\x00\\") {
-		return "", tenant.RepoKey{}, errors.New("edge: illegal characters in ssh command")
+		return "", ParsedRepoPath{}, errors.New("edge: illegal characters in ssh command")
 	}
 
 	idx := strings.IndexByte(cmd, ' ')
 	if idx <= 0 {
-		return "", tenant.RepoKey{}, errors.New("edge: malformed ssh exec command")
+		return "", ParsedRepoPath{}, errors.New("edge: malformed ssh exec command")
 	}
 	op := rpc.Operation(cmd[:idx])
 	if err := op.Validate(); err != nil {
-		return "", tenant.RepoKey{}, err
+		return "", ParsedRepoPath{}, err
 	}
 
 	arg := strings.TrimSpace(cmd[idx+1:])
@@ -86,35 +112,30 @@ func ParseSSHExecCommand(cmd string) (rpc.Operation, tenant.RepoKey, error) {
 			arg = arg[1 : len(arg)-1]
 		}
 	}
-	if strings.ContainsAny(arg, " \t'\"") || strings.Contains(arg, "..") {
-		return "", tenant.RepoKey{}, errors.New("edge: invalid repository argument")
+	if strings.ContainsAny(arg, " \t'\"") {
+		return "", ParsedRepoPath{}, errors.New("edge: invalid repository argument")
 	}
 
-	arg = strings.TrimPrefix(arg, "/")
-	parts := strings.Split(arg, "/")
-	if len(parts) != 2 {
-		return "", tenant.RepoKey{}, errors.New("edge: repository path must be /{tenant}/{repo}.git")
-	}
-
-	repoRaw := strings.TrimSuffix(parts[1], ".git")
-	repoKey, err := tenant.NewRepoKey(parts[0], repoRaw)
+	parsed, err := ParseRepoPath(arg, false, maxOrgDepth)
 	if err != nil {
-		return "", tenant.RepoKey{}, err
+		return "", ParsedRepoPath{}, err
 	}
-	return op, repoKey, nil
+	return op, parsed, nil
 }
 
 // SSHServer terminates Git SSH connections on :2222 and streams git-upload-pack /
 // git-receive-pack sessions to stravin-node via WireProxy.
 type SSHServer struct {
-	sshCfg   *ssh.ServerConfig
-	auth     Authenticator
-	limiter  Limiter
-	resolver *Resolver
-	router   NodeSelector
-	proxy    *WireProxy
-	metrics  *Metrics
-	logger   *slog.Logger
+	sshCfg        *ssh.ServerConfig
+	auth          Authenticator
+	limiter       Limiter
+	resolver      *Resolver
+	routeResolver RouteResolver
+	maxOrgDepth   int
+	router        NodeSelector
+	proxy         *WireProxy
+	metrics       *Metrics
+	logger        *slog.Logger
 
 	handshakeTimeout   time.Duration
 	execIdleTimeout    time.Duration
@@ -173,6 +194,7 @@ func NewSSHServer(
 		auth:               auth,
 		limiter:            limiter,
 		resolver:           resolver,
+		maxOrgDepth:        DefaultMaxOrgDepth,
 		router:             router,
 		proxy:              proxy,
 		metrics:            metrics,
@@ -203,6 +225,20 @@ func NewSSHServer(
 	cfg.AddHostKey(hostKey)
 	s.sshCfg = cfg
 	return s, nil
+}
+
+// SetRouteResolver attaches an optional Valkey-backed RouteResolver for nested
+// organization Git SSH paths.
+func (s *SSHServer) SetRouteResolver(r RouteResolver) {
+	s.routeResolver = r
+}
+
+// SetMaxOrgDepth overrides the maximum organization segment depth allowed in
+// Git SSH commands (default DefaultMaxOrgDepth = 4 -> max 5 path segments).
+func (s *SSHServer) SetMaxOrgDepth(depth int) {
+	if depth > 0 {
+		s.maxOrgDepth = depth
+	}
 }
 
 // Serve accepts incoming SSH connections on ln until Shutdown or Close is called or ln fails.
@@ -435,7 +471,7 @@ func (s *SSHServer) handleSession(connCtx context.Context, principal Principal, 
 
 func (s *SSHServer) executeGitCommand(connCtx context.Context, principal Principal, cmd, gitProtocol string, ch ssh.Channel) uint32 {
 	start := time.Now()
-	op, repoKey, err := ParseSSHExecCommand(cmd)
+	op, parsedPath, err := ParseSSHExecCommandPath(cmd, s.maxOrgDepth)
 	if err != nil {
 		s.metrics.RecordRequest(connCtx, "ssh", "unknown", "error", "invalid_request", time.Since(start))
 		_, _ = io.WriteString(ch.Stderr(), "fatal: invalid git command or repository path\n")
@@ -445,6 +481,18 @@ func (s *SSHServer) executeGitCommand(connCtx context.Context, principal Princip
 	metricOp := "fetch"
 	if op == rpc.OpReceivePack {
 		metricOp = "push"
+	}
+
+	repoKey, err := ResolveRepoPath(connCtx, s.routeResolver, parsedPath)
+	if err != nil {
+		if errors.Is(err, ErrRouteNotFound) {
+			s.metrics.RecordRequest(connCtx, "ssh", metricOp, "error", "not_found", time.Since(start))
+			_, _ = io.WriteString(ch.Stderr(), "fatal: repository not found\n")
+			return 1
+		}
+		s.metrics.RecordRequest(connCtx, "ssh", metricOp, "error", "route_unavailable", time.Since(start))
+		_, _ = io.WriteString(ch.Stderr(), "fatal: service unavailable\n")
+		return 1
 	}
 
 	ctx, span := s.metrics.StartIngressSpan(connCtx, "ssh", metricOp, string(repoKey.TenantID), string(repoKey.RepoID), "")
