@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +39,7 @@ type GitDataExecutor interface {
 	ExecLog(ctx context.Context, req LogRequest) error
 	ExecRevListCount(ctx context.Context, req RevListCountRequest) (uint64, error)
 	ExecCatFileBatch(ctx context.Context, req CatFileBatchRequest) (map[string][]byte, error)
+	ExecInitRepoCommit(ctx context.Context, req InitRepoCommitRequest) (InitRepoCommitResult, error)
 }
 
 // RevParseRequest configures `git rev-parse --verify`.
@@ -144,6 +147,33 @@ type CatFileBatchRequest struct {
 	OIDs           []string
 	MaxObjectBytes uint64
 	Timeout        time.Duration
+}
+
+// InitRepoFile describes a single relative file path and raw bytes for ExecInitRepoCommit.
+type InitRepoFile struct {
+	Path    string
+	Content []byte
+}
+
+// InitRepoCommitRequest configures creating an initial root commit and packfile
+// in a clean temporary bare repository using sandboxed git plumbing subprocesses.
+type InitRepoCommitRequest struct {
+	Repo          tenant.RepoKey
+	ObjectFormat  string
+	DefaultBranch string
+	AuthorName    string
+	AuthorEmail   string
+	CommitMessage string
+	Files         []InitRepoFile
+	Timeout       time.Duration
+}
+
+// InitRepoCommitResult returns the generated root commit OID, root tree OID,
+// and self-contained packfile bytes.
+type InitRepoCommitResult struct {
+	CommitOID string
+	TreeOID   string
+	PackBytes []byte
 }
 
 // ExecRevParse resolves a revision expression to a full object ID.
@@ -494,6 +524,136 @@ func (e *SubprocessExecutor) ExecCatFileBatch(ctx context.Context, req CatFileBa
 		result[oid] = payload
 	}
 	return result, nil
+}
+
+// ExecInitRepoCommit creates blobs, a root tree, a root commit, and a complete
+// packfile in an ephemeral temporary bare repository without writing user paths
+// to the host filesystem.
+func (e *SubprocessExecutor) ExecInitRepoCommit(ctx context.Context, req InitRepoCommitRequest) (InitRepoCommitResult, error) {
+	objFmt, err := validateInitRepoCommitRequest(req)
+	if err != nil {
+		return InitRepoCommitResult{}, err
+	}
+
+	tmpDir, err := os.MkdirTemp("", "stravin-initrepo-*")
+	if err != nil {
+		return InitRepoCommitResult{}, fmt.Errorf("gitexec: create temp init dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	spec := SandboxSpec{Repo: req.Repo, RepoDir: tmpDir, ReadOnly: false}
+	initArgs := []string{
+		"init", "--bare", "--quiet",
+		"--object-format=" + objFmt,
+		"--initial-branch=" + req.DefaultBranch,
+		tmpDir,
+	}
+	if err := e.run(ctx, "init", spec, tmpDir, initArgs, nil, nil, nil, nil, req.Timeout); err != nil {
+		return InitRepoCommitResult{}, err
+	}
+
+	var indexBuf bytes.Buffer
+	for _, f := range req.Files {
+		var blobOut bytes.Buffer
+		hashArgs := []string{"--git-dir", tmpDir, "hash-object", "-w", "--stdin"}
+		if err := e.run(ctx, "hash-object", spec, tmpDir, hashArgs, nil, bytes.NewReader(f.Content), &blobOut, nil, req.Timeout); err != nil {
+			return InitRepoCommitResult{}, err
+		}
+		blobOID := strings.TrimSpace(blobOut.String())
+		if !IsValidHexOID(blobOID) {
+			return InitRepoCommitResult{}, fmt.Errorf("gitexec: unexpected blob OID %q for %s", blobOID, f.Path)
+		}
+		fmt.Fprintf(&indexBuf, "100644 blob %s\t%s\x00", blobOID, f.Path)
+	}
+
+	indexEnv := []string{"GIT_INDEX_FILE=" + filepath.Join(tmpDir, "tmp-index")}
+	updateIdxArgs := []string{"--git-dir", tmpDir, "update-index", "-z", "--index-info"}
+	if err := e.run(ctx, "update-index", spec, tmpDir, updateIdxArgs, indexEnv, &indexBuf, nil, nil, req.Timeout); err != nil {
+		return InitRepoCommitResult{}, err
+	}
+
+	var treeOut bytes.Buffer
+	writeTreeArgs := []string{"--git-dir", tmpDir, "write-tree"}
+	if err := e.run(ctx, "write-tree", spec, tmpDir, writeTreeArgs, indexEnv, nil, &treeOut, nil, req.Timeout); err != nil {
+		return InitRepoCommitResult{}, err
+	}
+	treeOID := strings.TrimSpace(treeOut.String())
+	if !IsValidHexOID(treeOID) {
+		return InitRepoCommitResult{}, fmt.Errorf("gitexec: unexpected tree OID %q", treeOID)
+	}
+
+	commitEnv := []string{
+		"GIT_AUTHOR_NAME=" + req.AuthorName,
+		"GIT_AUTHOR_EMAIL=" + req.AuthorEmail,
+		"GIT_COMMITTER_NAME=" + req.AuthorName,
+		"GIT_COMMITTER_EMAIL=" + req.AuthorEmail,
+	}
+	var commitOut bytes.Buffer
+	commitArgs := []string{"--git-dir", tmpDir, "commit-tree", treeOID}
+	if err := e.run(ctx, "commit-tree", spec, tmpDir, commitArgs, commitEnv, strings.NewReader(req.CommitMessage), &commitOut, nil, req.Timeout); err != nil {
+		return InitRepoCommitResult{}, err
+	}
+	commitOID := strings.TrimSpace(commitOut.String())
+	if !IsValidHexOID(commitOID) {
+		return InitRepoCommitResult{}, fmt.Errorf("gitexec: unexpected commit OID %q", commitOID)
+	}
+
+	var revListOut bytes.Buffer
+	revListArgs := []string{"--git-dir", tmpDir, "rev-list", "--objects", commitOID}
+	if err := e.run(ctx, "rev-list", spec, tmpDir, revListArgs, nil, nil, &revListOut, nil, req.Timeout); err != nil {
+		return InitRepoCommitResult{}, err
+	}
+
+	var packOut bytes.Buffer
+	packArgs := []string{"--git-dir", tmpDir, "pack-objects", "--stdout", "--quiet"}
+	if err := e.run(ctx, "pack-objects", spec, tmpDir, packArgs, nil, &revListOut, &packOut, nil, req.Timeout); err != nil {
+		return InitRepoCommitResult{}, err
+	}
+	if packOut.Len() == 0 {
+		return InitRepoCommitResult{}, errors.New("gitexec: pack-objects produced empty packfile")
+	}
+
+	return InitRepoCommitResult{
+		CommitOID: commitOID,
+		TreeOID:   treeOID,
+		PackBytes: packOut.Bytes(),
+	}, nil
+}
+
+func validateInitRepoCommitRequest(req InitRepoCommitRequest) (string, error) {
+	objFmt := strings.ToLower(strings.TrimSpace(req.ObjectFormat))
+	if objFmt == "" {
+		objFmt = "sha1"
+	}
+	if objFmt != "sha1" && objFmt != "sha256" {
+		return "", fmt.Errorf("%w: unsupported object format %q", ErrInvalidRequest, req.ObjectFormat)
+	}
+	if !isSafeGitToken(req.DefaultBranch) || strings.HasPrefix(req.DefaultBranch, "-") || strings.Contains(req.DefaultBranch, "..") {
+		return "", fmt.Errorf("%w: invalid default branch %q", ErrInvalidRequest, req.DefaultBranch)
+	}
+	if req.AuthorName == "" || strings.ContainsAny(req.AuthorName, "\x00\r\n") {
+		return "", fmt.Errorf("%w: invalid author name", ErrInvalidRequest)
+	}
+	if req.AuthorEmail == "" || strings.ContainsAny(req.AuthorEmail, "\x00\r\n") {
+		return "", fmt.Errorf("%w: invalid author email", ErrInvalidRequest)
+	}
+	if req.CommitMessage == "" || strings.ContainsRune(req.CommitMessage, '\x00') {
+		return "", fmt.Errorf("%w: invalid commit message", ErrInvalidRequest)
+	}
+	if len(req.Files) == 0 {
+		return "", fmt.Errorf("%w: at least one file is required", ErrInvalidRequest)
+	}
+	for _, f := range req.Files {
+		if f.Path == "" || strings.HasPrefix(f.Path, "/") || strings.HasSuffix(f.Path, "/") || strings.ContainsAny(f.Path, "\x00\r\n\\") {
+			return "", fmt.Errorf("%w: invalid init file path %q", ErrInvalidRequest, f.Path)
+		}
+		for _, seg := range strings.Split(f.Path, "/") {
+			if seg == "" || seg == "." || seg == ".." || strings.EqualFold(seg, ".git") {
+				return "", fmt.Errorf("%w: invalid init file path segment in %q", ErrInvalidRequest, f.Path)
+			}
+		}
+	}
+	return objFmt, nil
 }
 
 // IsValidHexOID reports whether oid is a valid 40-char (SHA-1) or 64-char (SHA-256) lowercase hex string.

@@ -3,7 +3,10 @@ package node
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -14,7 +17,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"stravin.dev/core/internal/cache"
 	"stravin.dev/core/internal/gitexec"
+	"stravin.dev/core/internal/lease"
+	"stravin.dev/core/internal/pack"
 	"stravin.dev/core/internal/rpc"
 	"stravin.dev/core/internal/storage/ddb"
 	"stravin.dev/core/internal/telemetry"
@@ -38,36 +44,64 @@ const (
 	maxTreePathEntries       = 200
 	treePathScanCommitLimit  = 200
 	gitDataSubprocessTimeout = 10 * time.Second
+	maxInitRepoFiles         = 50
+	maxInitRepoTotalBytes    = 2 << 20 // 2 MiB
+	maxInitRepoPathBytes     = 1024
+	maxInitRepoBranchBytes   = 255
+	maxInitRepoAuthorBytes   = 256
+	maxInitRepoMessageBytes  = 65536
+	defaultInitBranch        = "main"
+	defaultInitAuthorName    = "Stravin"
+	defaultInitAuthorEmail   = "noreply@stravin.dev"
+	defaultInitCommitMessage = "Initial commit"
 	commitLogFormat          = "%H%x00%T%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%s%x00%b"
 	commitSummaryFormat      = "%H%x00%an%x00%aI%x00%s"
 	treePathNameOnlyFormat   = "%x1e%H%x00%an%x00%aI%x00%s%x00"
 )
 
-// GitDataServerConfig configures the read-only GitData gRPC service on stravin-node.
-type GitDataServerConfig struct {
-	Materializer *Materializer
-	GitDataExec  gitexec.GitDataExecutor
-	Telemetry    *telemetry.Provider
-	Metrics      *Metrics
-	Logger       *slog.Logger
-	Region       string
-	BlobChunkSz  int
+// MetaUpdater is the narrow DynamoDB write seam for updating repository META
+// (such as setting DefaultBranch when InitRepo initializes a custom branch).
+// *ddb.Repository satisfies this interface directly.
+type MetaUpdater interface {
+	UpdateMeta(ctx context.Context, meta ddb.RepoMeta, expectedEpoch lease.Epoch) error
 }
 
-// GitDataServer implements rpc.GitDataHandler backed by the warm NVMe Materializer
-// and sandboxed read-only git subprocesses.
+// GitDataServerConfig configures the GitData gRPC service on stravin-node.
+type GitDataServerConfig struct {
+	Materializer   *Materializer
+	GitDataExec    gitexec.GitDataExecutor
+	Cache          *cache.Cache
+	Packs          PackPutter
+	Committer      PushCommitter
+	MetaUpdater    MetaUpdater
+	LeaseRefresher *LeaseRefresher
+	Telemetry      *telemetry.Provider
+	Metrics        *Metrics
+	Logger         *slog.Logger
+	Region         string
+	BlobChunkSz    int
+}
+
+// GitDataServer implements rpc.GitDataHandler backed by the warm NVMe Materializer,
+// sandboxed git subprocesses, and the S3/DynamoDB pack + ref-CAS persistence path.
 type GitDataServer struct {
-	materializer *Materializer
-	gitExec      gitexec.GitDataExecutor
-	tracer       trace.Tracer
-	metrics      *Metrics
-	logger       *slog.Logger
-	blobChunkSz  int
+	materializer   *Materializer
+	gitExec        gitexec.GitDataExecutor
+	cache          *cache.Cache
+	packs          PackPutter
+	committer      PushCommitter
+	metaUpdater    MetaUpdater
+	leaseRefresher *LeaseRefresher
+	region         lease.Region
+	tracer         trace.Tracer
+	metrics        *Metrics
+	logger         *slog.Logger
+	blobChunkSz    int
 }
 
 var _ rpc.GitDataHandler = (*GitDataServer)(nil)
 
-// NewGitDataServer constructs a read-only GitData gRPC handler.
+// NewGitDataServer constructs a GitData gRPC handler.
 func NewGitDataServer(cfg GitDataServerConfig) (*GitDataServer, error) {
 	if cfg.Materializer == nil {
 		return nil, errors.New("node: materializer is required for GitDataServer")
@@ -92,12 +126,18 @@ func NewGitDataServer(cfg GitDataServerConfig) (*GitDataServer, error) {
 		chunkSz = blobStreamChunkBytes
 	}
 	return &GitDataServer{
-		materializer: cfg.Materializer,
-		gitExec:      cfg.GitDataExec,
-		tracer:       tp.Tracer("stravin-node"),
-		metrics:      metrics,
-		logger:       logger,
-		blobChunkSz:  chunkSz,
+		materializer:   cfg.Materializer,
+		gitExec:        cfg.GitDataExec,
+		cache:          cfg.Cache,
+		packs:          cfg.Packs,
+		committer:      cfg.Committer,
+		metaUpdater:    cfg.MetaUpdater,
+		leaseRefresher: cfg.LeaseRefresher,
+		region:         lease.Region(strings.TrimSpace(cfg.Region)),
+		tracer:         tp.Tracer("stravin-node"),
+		metrics:        metrics,
+		logger:         logger,
+		blobChunkSz:    chunkSz,
 	}, nil
 }
 
@@ -909,6 +949,289 @@ func (s *GitDataServer) resolveTreePathCommits(
 		}
 	}
 	return result, nil
+}
+
+// InitRepo initializes an empty repository with a root commit containing req.Files,
+// persists the packfile to S3 + DynamoDB manifest, and atomically creates
+// refs/heads/<default_branch> via Ref-CAS.
+func (s *GitDataServer) InitRepo(ctx context.Context, req *rpc.InitRepoRequest) (*rpc.InitRepoResponse, error) {
+	start := time.Now()
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "gitdata: request is nil")
+	}
+	repoKey, err := resolveAuthorizedRepoKey(ctx, req.TenantID, req.RepoID)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx = telemetry.ExtractGRPC(ctx)
+	ctx, span := s.tracer.Start(ctx, "node.gitdata.init_repo", trace.WithAttributes(
+		telemetry.NewSpanAttrs().
+			TenantID(string(repoKey.TenantID)).
+			RepoID(string(repoKey.RepoID)).
+			GitOperation("gitdata_init_repo").
+			Build()...,
+	))
+	defer span.End()
+
+	resp, err := s.handleInitRepo(ctx, repoKey, req)
+	s.recordMetricsAndSpan(ctx, span, "gitdata_init_repo", start, err)
+	return resp, err
+}
+
+type normalizedInitRepo struct {
+	branch        string
+	fullRef       string
+	authorName    string
+	authorEmail   string
+	commitMessage string
+	files         []gitexec.InitRepoFile
+}
+
+func (s *GitDataServer) handleInitRepo(ctx context.Context, repoKey tenant.RepoKey, req *rpc.InitRepoRequest) (*rpc.InitRepoResponse, error) {
+	if s.packs == nil || s.committer == nil || s.cache == nil {
+		return nil, status.Error(codes.Unimplemented, "gitdata: InitRepo write persistence is not configured")
+	}
+
+	norm, err := normalizeAndValidateInitRepoRequest(req)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "gitdata: %v", err)
+	}
+
+	var currentLease ddb.RegionalWriteLease
+	if s.leaseRefresher != nil {
+		if err := s.leaseRefresher.CheckWriteAllowed(); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "gitdata: regional write lease unavailable: %v", err)
+		}
+		currentLease, err = s.leaseRefresher.Current()
+		if err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "gitdata: regional write lease unavailable: %v", err)
+		}
+	}
+
+	repoMeta, refs, err := s.materializer.LoadAuthoritativeRefs(ctx, repoKey)
+	if err != nil {
+		return nil, mapSyncError(repoKey, err)
+	}
+	if repoMeta.WriteState != lease.ModeActive {
+		return nil, status.Errorf(codes.FailedPrecondition, "gitdata: repository %s write state is %s", repoKey, repoMeta.WriteState)
+	}
+	if s.region != "" && repoMeta.HomeRegion != s.region {
+		return nil, status.Errorf(codes.FailedPrecondition, "gitdata: region %s is not home region %s for %s", s.region, repoMeta.HomeRegion, repoKey)
+	}
+	if s.leaseRefresher != nil {
+		if err := s.leaseRefresher.CheckEpochFence(repoMeta.FailoverEpoch); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "gitdata: failover_epoch fenced: %v", err)
+		}
+	}
+	if len(refs) > 0 {
+		return nil, status.Errorf(codes.AlreadyExists, "gitdata: repository %s is already initialized", repoKey)
+	}
+
+	objFormat := repoMeta.EffectiveObjectFormat()
+	initRes, err := s.gitExec.ExecInitRepoCommit(ctx, gitexec.InitRepoCommitRequest{
+		Repo:          repoKey,
+		ObjectFormat:  string(objFormat),
+		DefaultBranch: norm.branch,
+		AuthorName:    norm.authorName,
+		AuthorEmail:   norm.authorEmail,
+		CommitMessage: norm.commitMessage,
+		Files:         norm.files,
+		Timeout:       gitDataSubprocessTimeout,
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "gitdata: build initial commit: %v", err)
+	}
+
+	algo, err := pack.HashAlgorithmForFormat(string(objFormat))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "gitdata: object format: %v", err)
+	}
+	parsed, err := pack.Parse(bytes.NewReader(initRes.PackBytes), pack.ParseOptions{
+		Limits:        pack.DefaultLimits(),
+		HashAlgorithm: algo,
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "gitdata: parse initial pack: %v", err)
+	}
+	idxBytes, err := pack.BuildIdx(parsed)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "gitdata: index initial pack: %v", err)
+	}
+	packSum := sha256.Sum256(initRes.PackBytes)
+	packSHA256 := hex.EncodeToString(packSum[:])
+
+	if err := s.packs.PutPack(ctx, repoKey, packSHA256, initRes.PackBytes, idxBytes); err != nil {
+		return nil, status.Errorf(codes.Internal, "gitdata: s3 put pack %s: %v", repoKey, err)
+	}
+
+	originRegion := s.region
+	if originRegion == "" {
+		originRegion = repoMeta.HomeRegion
+	}
+	commitEpoch := currentLease.Epoch
+	if commitEpoch == 0 {
+		commitEpoch = repoMeta.FailoverEpoch
+	}
+
+	cmds := []ddb.RefUpdate{{
+		RefName: norm.fullRef,
+		OldOID:  ddb.ZeroOIDForFormat(objFormat),
+		NewOID:  initRes.CommitOID,
+	}}
+	if _, err := s.committer.CommitPush(ctx, ddb.CommitPushInput{
+		Repo:           repoKey,
+		RefShards:      repoMeta.RefShards,
+		ManifestShards: repoMeta.ManifestShards,
+		Epoch:          commitEpoch,
+		OriginRegion:   originRegion,
+		TraceParent:    telemetry.TraceparentFromContext(ctx),
+		ObjectFormat:   objFormat,
+		Updates:        cmds,
+		Pack: &ddb.PackUpload{
+			PackID:       packSHA256,
+			SizeBytes:    int64(len(initRes.PackBytes)),
+			OriginRegion: originRegion,
+		},
+	}); err != nil {
+		if errors.Is(err, ddb.ErrRefCASConflict) {
+			return nil, status.Errorf(codes.AlreadyExists, "gitdata: repository %s is already initialized", repoKey)
+		}
+		return nil, status.Errorf(codes.Internal, "gitdata: commit initial ref %s: %v", repoKey, err)
+	}
+
+	if s.metaUpdater != nil && normalizeDefaultBranch(repoMeta.DefaultBranch) != norm.fullRef {
+		updatedMeta := repoMeta
+		updatedMeta.DefaultBranch = norm.fullRef
+		if err := s.metaUpdater.UpdateMeta(ctx, updatedMeta, repoMeta.FailoverEpoch); err != nil {
+			return nil, status.Errorf(codes.Internal, "gitdata: update default branch %s: %v", repoKey, err)
+		}
+	}
+
+	installedPack := false
+	if err := s.cache.InstallPack(repoKey, packSHA256, initRes.PackBytes, idxBytes); err != nil {
+		s.logger.WarnContext(ctx, "gitdata: warm cache install after init failed",
+			"tenant_id", string(repoKey.TenantID),
+			"repo_id", string(repoKey.RepoID),
+			"pack_id", packSHA256,
+			"error", err,
+		)
+	} else {
+		installedPack = true
+		if s.metrics != nil {
+			s.metrics.RecordCacheBytes(ctx, s.cache.Stats().TotalBytes)
+		}
+	}
+	s.materializer.RecordLocalPush(repoKey, repoMeta.RefVersion, repoMeta.ManifestVersion, cmds, installedPack)
+
+	return &rpc.InitRepoResponse{
+		DefaultBranch: norm.branch,
+		CommitOID:     initRes.CommitOID,
+		TreeOID:       initRes.TreeOID,
+	}, nil
+}
+
+func normalizeAndValidateInitRepoRequest(req *rpc.InitRepoRequest) (normalizedInitRepo, error) {
+	branch := strings.TrimSpace(req.DefaultBranch)
+	if branch == "" {
+		branch = defaultInitBranch
+	}
+	branch = strings.TrimPrefix(branch, "refs/heads/")
+	if branch == "" || len(branch) > maxInitRepoBranchBytes || strings.HasPrefix(branch, "-") || strings.HasPrefix(branch, "/") || strings.HasSuffix(branch, "/") {
+		return normalizedInitRepo{}, fmt.Errorf("invalid default_branch %q", req.DefaultBranch)
+	}
+	fullRef := "refs/heads/" + branch
+	if !isSafeRefName(fullRef) {
+		return normalizedInitRepo{}, fmt.Errorf("invalid default_branch %q", req.DefaultBranch)
+	}
+
+	authorName := strings.TrimSpace(req.AuthorName)
+	if authorName == "" {
+		authorName = defaultInitAuthorName
+	}
+	if len(authorName) > maxInitRepoAuthorBytes || strings.ContainsAny(authorName, "\x00\r\n") {
+		return normalizedInitRepo{}, errors.New("invalid author_name")
+	}
+
+	authorEmail := strings.TrimSpace(req.AuthorEmail)
+	if authorEmail == "" {
+		authorEmail = defaultInitAuthorEmail
+	}
+	if len(authorEmail) > maxInitRepoAuthorBytes || strings.ContainsAny(authorEmail, "\x00\r\n") {
+		return normalizedInitRepo{}, errors.New("invalid author_email")
+	}
+
+	commitMessage := strings.TrimSpace(req.CommitMessage)
+	if commitMessage == "" {
+		commitMessage = defaultInitCommitMessage
+	}
+	if len(commitMessage) > maxInitRepoMessageBytes || strings.ContainsRune(commitMessage, '\x00') {
+		return normalizedInitRepo{}, errors.New("invalid commit_message")
+	}
+
+	if len(req.Files) == 0 {
+		return normalizedInitRepo{}, errors.New("at least one file is required")
+	}
+	if len(req.Files) > maxInitRepoFiles {
+		return normalizedInitRepo{}, fmt.Errorf("too many files: %d (max %d)", len(req.Files), maxInitRepoFiles)
+	}
+
+	var totalBytes int64
+	seenPaths := make(map[string]struct{}, len(req.Files))
+	dirPrefixes := make(map[string]struct{})
+	files := make([]gitexec.InitRepoFile, 0, len(req.Files))
+
+	for _, f := range req.Files {
+		if err := validateInitFilePath(f.Path); err != nil {
+			return normalizedInitRepo{}, err
+		}
+		if _, dup := seenPaths[f.Path]; dup {
+			return normalizedInitRepo{}, fmt.Errorf("duplicate file path %q", f.Path)
+		}
+		seenPaths[f.Path] = struct{}{}
+
+		totalBytes += int64(len(f.Content))
+		if totalBytes > maxInitRepoTotalBytes {
+			return normalizedInitRepo{}, fmt.Errorf("total file content exceeds max %d bytes", maxInitRepoTotalBytes)
+		}
+
+		for idx := strings.LastIndexByte(f.Path, '/'); idx > 0; idx = strings.LastIndexByte(f.Path[:idx], '/') {
+			dirPrefixes[f.Path[:idx]] = struct{}{}
+		}
+		files = append(files, gitexec.InitRepoFile{
+			Path:    f.Path,
+			Content: f.Content,
+		})
+	}
+	for p := range seenPaths {
+		if _, collides := dirPrefixes[p]; collides {
+			return normalizedInitRepo{}, fmt.Errorf("file/directory path collision at %q", p)
+		}
+	}
+
+	return normalizedInitRepo{
+		branch:        branch,
+		fullRef:       fullRef,
+		authorName:    authorName,
+		authorEmail:   authorEmail,
+		commitMessage: commitMessage,
+		files:         files,
+	}, nil
+}
+
+func validateInitFilePath(p string) error {
+	if p == "" || len(p) > maxInitRepoPathBytes {
+		return fmt.Errorf("invalid file path %q", p)
+	}
+	if strings.HasPrefix(p, "/") || strings.HasSuffix(p, "/") || strings.ContainsAny(p, "\x00\r\n\\") {
+		return fmt.Errorf("invalid file path %q", p)
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "" || seg == "." || seg == ".." || strings.EqualFold(seg, ".git") {
+			return fmt.Errorf("invalid file path segment in %q", p)
+		}
+	}
+	return nil
 }
 
 func isDefaultOrHeadRef(ref, defaultBranch string) bool {

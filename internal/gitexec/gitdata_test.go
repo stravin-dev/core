@@ -232,3 +232,79 @@ func TestIsValidHexOID(t *testing.T) {
 		}
 	}
 }
+
+func TestSubprocessExecutor_ExecInitRepoCommit(t *testing.T) {
+	e := NewSubprocessExecutor(Config{})
+	rk, _ := tenant.NewRepoKey("acme", "init-test")
+	ctx := context.Background()
+
+	res, err := e.ExecInitRepoCommit(ctx, InitRepoCommitRequest{
+		Repo:          rk,
+		ObjectFormat:  "sha1",
+		DefaultBranch: "main",
+		AuthorName:    "Stravin",
+		AuthorEmail:   "noreply@stravin.dev",
+		CommitMessage: "Initial commit",
+		Files: []InitRepoFile{
+			{Path: "README.md", Content: []byte("# Hello Stravin\n")},
+			{Path: "docs/LICENSE", Content: []byte("Apache-2.0\n")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecInitRepoCommit: %v", err)
+	}
+	if !IsValidHexOID(res.CommitOID) || len(res.CommitOID) != 40 {
+		t.Fatalf("CommitOID = %q, want 40-char sha1", res.CommitOID)
+	}
+	if !IsValidHexOID(res.TreeOID) || len(res.TreeOID) != 40 {
+		t.Fatalf("TreeOID = %q, want 40-char sha1", res.TreeOID)
+	}
+	if !bytes.HasPrefix(res.PackBytes, []byte("PACK")) {
+		t.Fatalf("PackBytes missing PACK header (len=%d)", len(res.PackBytes))
+	}
+
+	// Verify the generated packfile unpacks cleanly into a fresh bare repo and contains both files.
+	verifyDir := filepath.Join(t.TempDir(), "verify.git")
+	if err := e.ExecInitBare(ctx, InitBareRequest{Repo: rk, RepoDir: verifyDir, ObjectFormat: "sha1", RefFormat: "files", DefaultBranch: "main"}); err != nil {
+		t.Fatalf("ExecInitBare: %v", err)
+	}
+	if err := e.ExecIndexPack(ctx, IndexPackRequest{
+		Repo:           rk,
+		RepoDir:        verifyDir,
+		FromStdin:      true,
+		OutputPackPath: filepath.Join(verifyDir, "objects", "pack", "init.pack"),
+		Stdin:          bytes.NewReader(res.PackBytes),
+	}); err != nil {
+		t.Fatalf("ExecIndexPack: %v", err)
+	}
+
+	gotTree, err := e.ExecRevParse(ctx, RevParseRequest{Repo: rk, RepoDir: verifyDir, Rev: res.CommitOID + "^{tree}"})
+	if err != nil || gotTree != res.TreeOID {
+		t.Fatalf("rev-parse tree = (%q, %v), want (%q, nil)", gotTree, err, res.TreeOID)
+	}
+	readmeOID, err := e.ExecRevParse(ctx, RevParseRequest{Repo: rk, RepoDir: verifyDir, Rev: res.CommitOID + ":README.md"})
+	if err != nil {
+		t.Fatalf("rev-parse README.md: %v", err)
+	}
+	var blobBuf bytes.Buffer
+	if err := e.ExecCatFileBlob(ctx, CatFileBlobRequest{Repo: rk, RepoDir: verifyDir, BlobOID: readmeOID, Stdout: &blobBuf}); err != nil {
+		t.Fatalf("ExecCatFileBlob: %v", err)
+	}
+	if blobBuf.String() != "# Hello Stravin\n" {
+		t.Fatalf("README.md = %q, want %q", blobBuf.String(), "# Hello Stravin\n")
+	}
+
+	// Reject invalid inputs before spawning git.
+	invalidCases := []InitRepoCommitRequest{
+		{Repo: rk, DefaultBranch: "-bad", AuthorName: "A", AuthorEmail: "a@b", CommitMessage: "m", Files: []InitRepoFile{{Path: "README.md", Content: []byte("x")}}},
+		{Repo: rk, DefaultBranch: "main", AuthorName: "A", AuthorEmail: "a@b", CommitMessage: "m", Files: nil},
+		{Repo: rk, DefaultBranch: "main", AuthorName: "A", AuthorEmail: "a@b", CommitMessage: "m", Files: []InitRepoFile{{Path: "../escape", Content: []byte("x")}}},
+		{Repo: rk, DefaultBranch: "main", AuthorName: "A", AuthorEmail: "a@b", CommitMessage: "m", Files: []InitRepoFile{{Path: ".git/config", Content: []byte("x")}}},
+		{Repo: rk, DefaultBranch: "main", AuthorName: "A", AuthorEmail: "a@b", CommitMessage: "m", Files: []InitRepoFile{{Path: "/abs.txt", Content: []byte("x")}}},
+	}
+	for i, tc := range invalidCases {
+		if _, err := e.ExecInitRepoCommit(ctx, tc); err == nil {
+			t.Errorf("invalid case %d unexpectedly succeeded", i)
+		}
+	}
+}

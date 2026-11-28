@@ -319,12 +319,17 @@ func RunDaemon(ctx context.Context, cfg DaemonConfig) error {
 	}
 
 	gitDataSrv, err := NewGitDataServer(GitDataServerConfig{
-		Materializer: materializer,
-		GitDataExec:  gitExec,
-		Telemetry:    tp,
-		Metrics:      metrics,
-		Logger:       logger,
-		Region:       string(cfg.Region),
+		Materializer:   materializer,
+		GitDataExec:    gitExec,
+		Cache:          nvmeCache,
+		Packs:          s3Store,
+		Committer:      ddbRepo,
+		MetaUpdater:    ddbRepo,
+		LeaseRefresher: refresher,
+		Telemetry:      tp,
+		Metrics:        metrics,
+		Logger:         logger,
+		Region:         string(cfg.Region),
 	})
 	if err != nil {
 		return fmt.Errorf("node: init gitdata server: %w", err)

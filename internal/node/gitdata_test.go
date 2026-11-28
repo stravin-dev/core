@@ -1165,3 +1165,397 @@ func TestGitData_EmptyRepositoryGracefulResponses(t *testing.T) {
 		t.Fatalf("unexpected empty repo GetCommitLog response: %+v", logResp)
 	}
 }
+
+type fakeInitPackStore struct {
+	fetcher *fakePackFetcher
+}
+
+func (s *fakeInitPackStore) PutPack(_ context.Context, _ tenant.RepoKey, packSHA256 string, packData, idxData []byte) error {
+	s.fetcher.Put(packSHA256, packData, idxData)
+	return nil
+}
+
+type fakeInitCommitter struct {
+	metaStore *fakeMetadataStore
+}
+
+func (c *fakeInitCommitter) CommitPush(_ context.Context, in ddb.CommitPushInput) (ddb.CommitPushResult, error) {
+	c.metaStore.mu.Lock()
+	defer c.metaStore.mu.Unlock()
+
+	existing := make(map[string]string)
+	for _, r := range c.metaStore.refs[in.Repo] {
+		existing[r.RefName] = r.OID
+	}
+	for _, u := range in.Updates {
+		if u.IsCreate() {
+			if _, ok := existing[u.RefName]; ok {
+				return ddb.CommitPushResult{}, &ddb.RefConflictError{ConflictingRefs: []string{u.RefName}}
+			}
+			existing[u.RefName] = u.NewOID
+		} else {
+			existing[u.RefName] = u.NewOID
+		}
+	}
+
+	nextRefs := make([]ddb.RefState, 0, len(existing))
+	for refName, oid := range existing {
+		nextRefs = append(nextRefs, ddb.RefState{
+			Repo:         in.Repo,
+			RefName:      refName,
+			OID:          oid,
+			Epoch:        in.Epoch,
+			OriginRegion: in.OriginRegion,
+		})
+	}
+	c.metaStore.refs[in.Repo] = nextRefs
+
+	meta := c.metaStore.metas[in.Repo]
+	meta.RefVersion++
+	if in.Pack != nil {
+		meta.ManifestVersion++
+		if c.metaStore.manifestsByShard[in.Repo] == nil {
+			c.metaStore.manifestsByShard[in.Repo] = make(map[int][]ddb.PackManifest)
+		}
+		ulid, err := ddb.NewULID(lease.RealClock{}.Now().UTC())
+		if err != nil {
+			return ddb.CommitPushResult{}, err
+		}
+		c.metaStore.manifestsByShard[in.Repo][0] = append(c.metaStore.manifestsByShard[in.Repo][0], ddb.PackManifest{
+			Repo:         in.Repo,
+			ULID:         ulid,
+			PackID:       in.Pack.PackID,
+			SizeBytes:    in.Pack.SizeBytes,
+			OriginRegion: in.Pack.OriginRegion,
+			Status:       ddb.PackStatusActive,
+		})
+	}
+	c.metaStore.metas[in.Repo] = meta
+
+	return ddb.CommitPushResult{RefCount: len(in.Updates)}, nil
+}
+
+func (c *fakeInitCommitter) UpdateMeta(_ context.Context, meta ddb.RepoMeta, expectedEpoch lease.Epoch) error {
+	c.metaStore.mu.Lock()
+	defer c.metaStore.mu.Unlock()
+	cur, ok := c.metaStore.metas[meta.Repo]
+	if !ok {
+		return ddb.ErrNotFound
+	}
+	if cur.FailoverEpoch != expectedEpoch {
+		return ddb.ErrEpochConflict
+	}
+	cur.DefaultBranch = meta.DefaultBranch
+	c.metaStore.metas[meta.Repo] = cur
+	return nil
+}
+
+func setupInitRepoTestServer(t *testing.T, repoID string) (tenant.RepoKey, rpc.GitDataClient) {
+	t.Helper()
+	rk, err := tenant.NewRepoKey("acme", repoID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metaStore := newFakeMetadataStore()
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	})
+	packFetcher := newFakePackFetcher()
+	nvmeCache, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitExec := gitexec.NewSubprocessExecutor(gitexec.Config{})
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta:                    metaStore,
+		Packs:                   packFetcher,
+		Cache:                   nvmeCache,
+		GitExecutor:             gitExec,
+		AuxIndexRefreshInterval: -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mat.Close)
+
+	committer := &fakeInitCommitter{metaStore: metaStore}
+	srv, err := NewGitDataServer(GitDataServerConfig{
+		Materializer: mat,
+		GitDataExec:  gitExec,
+		Cache:        nvmeCache,
+		Packs:        &fakeInitPackStore{fetcher: packFetcher},
+		Committer:    committer,
+		MetaUpdater:  committer,
+		Region:       "us-east-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lis := bufconn.Listen(1024 * 1024)
+	t.Cleanup(func() { _ = lis.Close() })
+	grpcSrv := grpc.NewServer()
+	rpc.RegisterGitDataServer(grpcSrv, srv)
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.Stop)
+
+	dialer := func(ctx context.Context, _ string) (net.Conn, error) {
+		return lis.DialContext(ctx)
+	}
+	cc, err := grpc.NewClient(
+		"passthrough:///bufnet",
+		grpc.WithContextDialer(dialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = cc.Close() })
+	return rk, rpc.NewGRPCGitDataClient(cc)
+}
+
+func TestGitData_InitRepo_EndToEndAndAlreadyExists(t *testing.T) {
+	rk, client := setupInitRepoTestServer(t, "brand-new-repo")
+	ctx := context.Background()
+
+	readmeContent := []byte("# Brand New Repo\n\nInitialized via InitRepo.\n")
+	licenseContent := []byte("Apache License 2.0\n")
+
+	initResp, err := client.InitRepo(ctx, &rpc.InitRepoRequest{
+		TenantID: string(rk.TenantID),
+		RepoID:   string(rk.RepoID),
+		Files: []rpc.InitFile{
+			{Path: "README.md", Content: readmeContent},
+			{Path: "LICENSE", Content: licenseContent},
+		},
+	})
+	if err != nil {
+		t.Fatalf("InitRepo: %v", err)
+	}
+	if initResp.DefaultBranch != "main" {
+		t.Fatalf("DefaultBranch = %q, want %q", initResp.DefaultBranch, "main")
+	}
+	if !gitexec.IsValidHexOID(initResp.CommitOID) || !gitexec.IsValidHexOID(initResp.TreeOID) {
+		t.Fatalf("invalid OIDs in InitRepoResponse: %+v", initResp)
+	}
+
+	// ListRefs immediately sees refs/heads/main and HEAD.
+	refsResp, err := client.ListRefs(ctx, &rpc.ListRefsRequest{
+		TenantID: string(rk.TenantID),
+		RepoID:   string(rk.RepoID),
+	})
+	if err != nil {
+		t.Fatalf("ListRefs after InitRepo: %v", err)
+	}
+	if refsResp.DefaultBranch != "refs/heads/main" || refsResp.HeadOID != initResp.CommitOID || refsResp.BranchCount != 1 {
+		t.Fatalf("unexpected ListRefs response: %+v", refsResp)
+	}
+	if len(refsResp.Refs) != 1 || refsResp.Refs[0].Name != "refs/heads/main" || refsResp.Refs[0].TargetOID != initResp.CommitOID || !refsResp.Refs[0].IsDefault {
+		t.Fatalf("unexpected refs list: %+v", refsResp.Refs)
+	}
+
+	// ListTree immediately sees README.md and LICENSE.
+	treeResp, err := client.ListTree(ctx, &rpc.ListTreeRequest{
+		TenantID:  string(rk.TenantID),
+		RepoID:    string(rk.RepoID),
+		CommitOID: initResp.CommitOID,
+	})
+	if err != nil {
+		t.Fatalf("ListTree after InitRepo: %v", err)
+	}
+	if treeResp.TreeOID != initResp.TreeOID || len(treeResp.Entries) != 2 {
+		t.Fatalf("unexpected ListTree response: %+v", treeResp)
+	}
+	var readmeOID string
+	for _, entry := range treeResp.Entries {
+		if entry.Path == "README.md" {
+			readmeOID = entry.OID
+		}
+	}
+	if readmeOID == "" {
+		t.Fatalf("README.md missing from ListTree: %+v", treeResp.Entries)
+	}
+
+	// GetCommitLog immediately reads back the initial commit via HEAD.
+	logResp, err := client.GetCommitLog(ctx, &rpc.GetCommitLogRequest{
+		TenantID: string(rk.TenantID),
+		RepoID:   string(rk.RepoID),
+		Ref:      "HEAD",
+	})
+	if err != nil {
+		t.Fatalf("GetCommitLog after InitRepo: %v", err)
+	}
+	if logResp.TotalCommits != 1 || len(logResp.Commits) != 1 {
+		t.Fatalf("unexpected GetCommitLog response: %+v", logResp)
+	}
+	c := logResp.Commits[0]
+	if c.OID != initResp.CommitOID || c.TreeOID != initResp.TreeOID || c.AuthorName != "Stravin" || c.AuthorEmail != "noreply@stravin.dev" || c.Subject != "Initial commit" {
+		t.Fatalf("unexpected initial commit metadata: %+v", c)
+	}
+
+	// GetBlob immediately streams back the exact README.md bytes.
+	blobStream, err := client.GetBlob(ctx, &rpc.GetBlobRequest{
+		TenantID: string(rk.TenantID),
+		RepoID:   string(rk.RepoID),
+		BlobOID:  readmeOID,
+	})
+	if err != nil {
+		t.Fatalf("GetBlob after InitRepo: %v", err)
+	}
+	var blobBuf bytes.Buffer
+	for {
+		chunk, recvErr := blobStream.Recv()
+		if recvErr == io.EOF {
+			break
+		}
+		if recvErr != nil {
+			t.Fatalf("GetBlob Recv: %v", recvErr)
+		}
+		blobBuf.Write(chunk.Data)
+		if chunk.EOF {
+			break
+		}
+	}
+	if !bytes.Equal(blobBuf.Bytes(), readmeContent) {
+		t.Fatalf("README.md blob = %q, want %q", blobBuf.String(), string(readmeContent))
+	}
+
+	// Calling InitRepo a second time must return AlreadyExists and never overwrite.
+	_, err = client.InitRepo(ctx, &rpc.InitRepoRequest{
+		TenantID: string(rk.TenantID),
+		RepoID:   string(rk.RepoID),
+		Files: []rpc.InitFile{
+			{Path: "README.md", Content: []byte("overwrite attempt")},
+		},
+	})
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("second InitRepo code = %v (%v), want AlreadyExists", status.Code(err), err)
+	}
+}
+
+func TestGitData_InitRepo_CustomDefaultBranch(t *testing.T) {
+	rk, client := setupInitRepoTestServer(t, "custom-branch-repo")
+	ctx := context.Background()
+
+	initResp, err := client.InitRepo(ctx, &rpc.InitRepoRequest{
+		TenantID:      string(rk.TenantID),
+		RepoID:        string(rk.RepoID),
+		DefaultBranch: "develop",
+		AuthorName:    "Alice",
+		AuthorEmail:   "alice@example.com",
+		CommitMessage: "Bootstrap repo",
+		Files: []rpc.InitFile{
+			{Path: "docs/README.md", Content: []byte("# Develop\n")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("InitRepo custom branch: %v", err)
+	}
+	if initResp.DefaultBranch != "develop" {
+		t.Fatalf("DefaultBranch = %q, want develop", initResp.DefaultBranch)
+	}
+
+	refsResp, err := client.ListRefs(ctx, &rpc.ListRefsRequest{
+		TenantID: string(rk.TenantID),
+		RepoID:   string(rk.RepoID),
+	})
+	if err != nil {
+		t.Fatalf("ListRefs: %v", err)
+	}
+	if refsResp.DefaultBranch != "refs/heads/develop" || refsResp.HeadOID != initResp.CommitOID {
+		t.Fatalf("unexpected ListRefs for custom branch: %+v", refsResp)
+	}
+}
+
+func TestGitData_InitRepo_ValidationAndIsolation(t *testing.T) {
+	rk, client := setupInitRepoTestServer(t, "validation-repo")
+	ctx := context.Background()
+
+	tooManyFiles := make([]rpc.InitFile, maxInitRepoFiles+1)
+	for i := range tooManyFiles {
+		tooManyFiles[i] = rpc.InitFile{Path: "f" + string(rune('a'+i%26)) + "/" + string(rune('a'+i/26)) + ".txt", Content: []byte("x")}
+	}
+
+	invalidReqs := []struct {
+		name string
+		req  *rpc.InitRepoRequest
+	}{
+		{
+			name: "empty files",
+			req:  &rpc.InitRepoRequest{TenantID: string(rk.TenantID), RepoID: string(rk.RepoID), Files: nil},
+		},
+		{
+			name: "parent traversal path",
+			req:  &rpc.InitRepoRequest{TenantID: string(rk.TenantID), RepoID: string(rk.RepoID), Files: []rpc.InitFile{{Path: "../escape", Content: []byte("x")}}},
+		},
+		{
+			name: "dotgit segment",
+			req:  &rpc.InitRepoRequest{TenantID: string(rk.TenantID), RepoID: string(rk.RepoID), Files: []rpc.InitFile{{Path: ".git/config", Content: []byte("x")}}},
+		},
+		{
+			name: "absolute path",
+			req:  &rpc.InitRepoRequest{TenantID: string(rk.TenantID), RepoID: string(rk.RepoID), Files: []rpc.InitFile{{Path: "/README.md", Content: []byte("x")}}},
+		},
+		{
+			name: "duplicate path",
+			req: &rpc.InitRepoRequest{TenantID: string(rk.TenantID), RepoID: string(rk.RepoID), Files: []rpc.InitFile{
+				{Path: "README.md", Content: []byte("a")},
+				{Path: "README.md", Content: []byte("b")},
+			}},
+		},
+		{
+			name: "file directory collision",
+			req: &rpc.InitRepoRequest{TenantID: string(rk.TenantID), RepoID: string(rk.RepoID), Files: []rpc.InitFile{
+				{Path: "docs", Content: []byte("a")},
+				{Path: "docs/README.md", Content: []byte("b")},
+			}},
+		},
+		{
+			name: "too many files",
+			req:  &rpc.InitRepoRequest{TenantID: string(rk.TenantID), RepoID: string(rk.RepoID), Files: tooManyFiles},
+		},
+		{
+			name: "exceeds max total bytes",
+			req: &rpc.InitRepoRequest{TenantID: string(rk.TenantID), RepoID: string(rk.RepoID), Files: []rpc.InitFile{
+				{Path: "big.bin", Content: make([]byte, maxInitRepoTotalBytes+1)},
+			}},
+		},
+		{
+			name: "invalid branch leading dash",
+			req:  &rpc.InitRepoRequest{TenantID: string(rk.TenantID), RepoID: string(rk.RepoID), DefaultBranch: "-main", Files: []rpc.InitFile{{Path: "README.md", Content: []byte("x")}}},
+		},
+		{
+			name: "invalid branch double dot",
+			req:  &rpc.InitRepoRequest{TenantID: string(rk.TenantID), RepoID: string(rk.RepoID), DefaultBranch: "a..b", Files: []rpc.InitFile{{Path: "README.md", Content: []byte("x")}}},
+		},
+	}
+
+	for _, tc := range invalidReqs {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := client.InitRepo(ctx, tc.req)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("%s: code = %v (%v), want InvalidArgument", tc.name, status.Code(err), err)
+			}
+		})
+	}
+
+	// Mismatched tenant/repo metadata is rejected with PermissionDenied.
+	badCtx := metadata.AppendToOutgoingContext(ctx,
+		rpc.HeaderTenantID, "other-tenant",
+		rpc.HeaderRepoID, string(rk.RepoID),
+	)
+	_, err := client.InitRepo(badCtx, &rpc.InitRepoRequest{
+		TenantID: string(rk.TenantID),
+		RepoID:   string(rk.RepoID),
+		Files:    []rpc.InitFile{{Path: "README.md", Content: []byte("x")}},
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("tenant mismatch code = %v (%v), want PermissionDenied", status.Code(err), err)
+	}
+}

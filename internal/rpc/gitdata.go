@@ -28,6 +28,8 @@ const (
 	GitDataListRefsMethod = "/" + GitDataServiceName + "/ListRefs"
 	// GitDataGetCommitLogMethod is the full gRPC method path for GetCommitLog.
 	GitDataGetCommitLogMethod = "/" + GitDataServiceName + "/GetCommitLog"
+	// GitDataInitRepoMethod is the full gRPC method path for InitRepo.
+	GitDataInitRepoMethod = "/" + GitDataServiceName + "/InitRepo"
 	// GitDataCodecName is the registered gRPC codec name for GitData JSON messages.
 	GitDataCodecName = "stravin-gitdata"
 
@@ -233,6 +235,30 @@ type CommitSummary struct {
 	AuthorTime string `json:"author_time"`
 }
 
+// InitFile describes a single file to include in the initial repository commit.
+type InitFile struct {
+	Path    string `json:"path"`
+	Content []byte `json:"content"`
+}
+
+// InitRepoRequest requests initializing an empty repository with an initial commit.
+type InitRepoRequest struct {
+	TenantID      string     `json:"tenant_id"`
+	RepoID        string     `json:"repo_id"`
+	DefaultBranch string     `json:"default_branch,omitempty"` // default "main"
+	AuthorName    string     `json:"author_name,omitempty"`    // default "Stravin"
+	AuthorEmail   string     `json:"author_email,omitempty"`   // default "noreply@stravin.dev"
+	CommitMessage string     `json:"commit_message,omitempty"` // default "Initial commit"
+	Files         []InitFile `json:"files"`
+}
+
+// InitRepoResponse returns the initialized default branch, commit OID, and root tree OID.
+type InitRepoResponse struct {
+	DefaultBranch string `json:"default_branch"`
+	CommitOID     string `json:"commit_oid"`
+	TreeOID       string `json:"tree_oid"`
+}
+
 // GitDataBlobStream is the server-side stream for GetBlob responses.
 type GitDataBlobStream interface {
 	Send(*BlobChunk) error
@@ -245,22 +271,24 @@ type GitDataBlobClientStream interface {
 	Context() context.Context
 }
 
-// GitDataHandler handles incoming read-only GitData RPCs on stravin-node.
+// GitDataHandler handles incoming GitData RPCs on stravin-node.
 type GitDataHandler interface {
 	GetDiff(ctx context.Context, req *GetDiffRequest) (*GetDiffResponse, error)
 	GetBlob(ctx context.Context, req *GetBlobRequest, stream GitDataBlobStream) error
 	ListTree(ctx context.Context, req *ListTreeRequest) (*ListTreeResponse, error)
 	ListRefs(ctx context.Context, req *ListRefsRequest) (*ListRefsResponse, error)
 	GetCommitLog(ctx context.Context, req *GetCommitLogRequest) (*GetCommitLogResponse, error)
+	InitRepo(ctx context.Context, req *InitRepoRequest) (*InitRepoResponse, error)
 }
 
-// GitDataClient invokes read-only GitData RPCs on stravin-node.
+// GitDataClient invokes GitData RPCs on stravin-node.
 type GitDataClient interface {
 	GetDiff(ctx context.Context, req *GetDiffRequest, opts ...grpc.CallOption) (*GetDiffResponse, error)
 	GetBlob(ctx context.Context, req *GetBlobRequest, opts ...grpc.CallOption) (GitDataBlobClientStream, error)
 	ListTree(ctx context.Context, req *ListTreeRequest, opts ...grpc.CallOption) (*ListTreeResponse, error)
 	ListRefs(ctx context.Context, req *ListRefsRequest, opts ...grpc.CallOption) (*ListRefsResponse, error)
 	GetCommitLog(ctx context.Context, req *GetCommitLogRequest, opts ...grpc.CallOption) (*GetCommitLogResponse, error)
+	InitRepo(ctx context.Context, req *InitRepoRequest, opts ...grpc.CallOption) (*InitRepoResponse, error)
 }
 
 // InjectGitDataMetadata validates tenantID and repoID and attaches routing headers
@@ -346,6 +374,10 @@ func RegisterGitDataServer(s grpc.ServiceRegistrar, h GitDataHandler) {
 			{
 				MethodName: "GetCommitLog",
 				Handler:    gitDataGetCommitLogHandler,
+			},
+			{
+				MethodName: "InitRepo",
+				Handler:    gitDataInitRepoHandler,
 			},
 		},
 		Streams: []grpc.StreamDesc{
@@ -447,6 +479,29 @@ func gitDataGetCommitLogHandler(srv any, ctx context.Context, dec func(any) erro
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
 		FullMethod: GitDataGetCommitLogMethod,
+	}
+	return interceptor(ctx, in, info, invoke)
+}
+
+func gitDataInitRepoHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+	in := new(InitRepoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	invoke := func(callCtx context.Context, req any) (any, error) {
+		r := req.(*InitRepoRequest)
+		authedCtx, _, err := AuthorizeGitDataContext(callCtx, r.TenantID, r.RepoID)
+		if err != nil {
+			return nil, err
+		}
+		return srv.(GitDataHandler).InitRepo(authedCtx, r)
+	}
+	if interceptor == nil {
+		return invoke(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GitDataInitRepoMethod,
 	}
 	return interceptor(ctx, in, info, invoke)
 }
@@ -561,6 +616,22 @@ func (c *grpcGitDataClient) GetCommitLog(ctx context.Context, req *GetCommitLogR
 	out := new(GetCommitLogResponse)
 	callOpts := append([]grpc.CallOption{grpc.ForceCodec(GitDataCodec())}, opts...)
 	if err := c.cc.Invoke(outCtx, GitDataGetCommitLogMethod, req, out, callOpts...); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *grpcGitDataClient) InitRepo(ctx context.Context, req *InitRepoRequest, opts ...grpc.CallOption) (*InitRepoResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "rpc: InitRepo request is nil")
+	}
+	outCtx, err := ensureGitDataOutgoingMetadata(ctx, req.TenantID, req.RepoID)
+	if err != nil {
+		return nil, err
+	}
+	out := new(InitRepoResponse)
+	callOpts := append([]grpc.CallOption{grpc.ForceCodec(GitDataCodec())}, opts...)
+	if err := c.cc.Invoke(outCtx, GitDataInitRepoMethod, req, out, callOpts...); err != nil {
 		return nil, err
 	}
 	return out, nil
