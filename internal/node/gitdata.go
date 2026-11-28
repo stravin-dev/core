@@ -59,10 +59,11 @@ const (
 	treePathNameOnlyFormat   = "%x1e%H%x00%an%x00%aI%x00%s%x00"
 )
 
-// MetaUpdater is the narrow DynamoDB write seam for updating repository META
-// (such as setting DefaultBranch when InitRepo initializes a custom branch).
+// MetaUpdater is the narrow DynamoDB write seam for bootstrapping or updating
+// repository META (such as creating missing META or setting DefaultBranch during InitRepo).
 // *ddb.Repository satisfies this interface directly.
 type MetaUpdater interface {
+	CreateMeta(ctx context.Context, meta ddb.RepoMeta) error
 	UpdateMeta(ctx context.Context, meta ddb.RepoMeta, expectedEpoch lease.Epoch) error
 }
 
@@ -1011,7 +1012,13 @@ func (s *GitDataServer) handleInitRepo(ctx context.Context, repoKey tenant.RepoK
 
 	repoMeta, refs, err := s.materializer.LoadAuthoritativeRefs(ctx, repoKey)
 	if err != nil {
-		return nil, mapSyncError(repoKey, err)
+		if !errors.Is(err, ddb.ErrNotFound) || s.metaUpdater == nil {
+			return nil, mapSyncError(repoKey, err)
+		}
+		repoMeta, refs, err = s.bootstrapMissingRepoMeta(ctx, repoKey, norm.fullRef, currentLease.Epoch)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if repoMeta.WriteState != lease.ModeActive {
 		return nil, status.Errorf(codes.FailedPrecondition, "gitdata: repository %s write state is %s", repoKey, repoMeta.WriteState)
@@ -1129,6 +1136,43 @@ func (s *GitDataServer) handleInitRepo(ctx context.Context, repoKey tenant.RepoK
 		CommitOID:     initRes.CommitOID,
 		TreeOID:       initRes.TreeOID,
 	}, nil
+}
+
+func (s *GitDataServer) bootstrapMissingRepoMeta(
+	ctx context.Context,
+	repoKey tenant.RepoKey,
+	defaultBranchRef string,
+	leaseEpoch lease.Epoch,
+) (ddb.RepoMeta, []ddb.RefState, error) {
+	homeRegion := s.region
+	if homeRegion == "" {
+		homeRegion = defaultRegion
+	}
+	epoch := leaseEpoch
+	if epoch == 0 {
+		epoch = 1
+	}
+	meta := ddb.RepoMeta{
+		Repo:           repoKey,
+		HomeRegion:     homeRegion,
+		FailoverEpoch:  epoch,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  defaultBranchRef,
+		ObjectFormat:   ddb.ObjectFormatSHA1,
+	}
+	if err := s.metaUpdater.CreateMeta(ctx, meta); err != nil {
+		if errors.Is(err, ddb.ErrAlreadyExists) {
+			reloadedMeta, reloadedRefs, reloadErr := s.materializer.LoadAuthoritativeRefs(ctx, repoKey)
+			if reloadErr != nil {
+				return ddb.RepoMeta{}, nil, mapSyncError(repoKey, reloadErr)
+			}
+			return reloadedMeta, reloadedRefs, nil
+		}
+		return ddb.RepoMeta{}, nil, status.Errorf(codes.Internal, "gitdata: bootstrap repo meta %s: %v", repoKey, err)
+	}
+	return meta, nil, nil
 }
 
 func normalizeAndValidateInitRepoRequest(req *rpc.InitRepoRequest) (normalizedInitRepo, error) {
