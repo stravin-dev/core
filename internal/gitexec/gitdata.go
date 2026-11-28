@@ -33,6 +33,9 @@ type GitDataExecutor interface {
 	ExecCatFileBlob(ctx context.Context, req CatFileBlobRequest) error
 	ExecCatFileBlobHead(ctx context.Context, req CatFileBlobHeadRequest) ([]byte, error)
 	ExecLsTree(ctx context.Context, req LsTreeRequest) error
+	ExecLog(ctx context.Context, req LogRequest) error
+	ExecRevListCount(ctx context.Context, req RevListCountRequest) (uint64, error)
+	ExecCatFileBatch(ctx context.Context, req CatFileBatchRequest) (map[string][]byte, error)
 }
 
 // RevParseRequest configures `git rev-parse --verify`.
@@ -108,6 +111,38 @@ type LsTreeRequest struct {
 	Recursive bool
 	Stdout    io.Writer
 	Timeout   time.Duration
+}
+
+// LogRequest configures `git log -z --max-count=<N> --format=<fmt>`.
+type LogRequest struct {
+	Repo      tenant.RepoKey
+	RepoDir   string
+	CommitOID string
+	Path      string
+	MaxCount  uint32
+	Format    string
+	NameOnly  bool
+	Stdout    io.Writer
+	Timeout   time.Duration
+}
+
+// RevListCountRequest configures `git rev-list --count`.
+type RevListCountRequest struct {
+	Repo      tenant.RepoKey
+	RepoDir   string
+	CommitOID string
+	Path      string
+	MaxCount  uint64
+	Timeout   time.Duration
+}
+
+// CatFileBatchRequest configures `git cat-file --batch` for bounded raw object reads.
+type CatFileBatchRequest struct {
+	Repo           tenant.RepoKey
+	RepoDir        string
+	OIDs           []string
+	MaxObjectBytes uint64
+	Timeout        time.Duration
 }
 
 // ExecRevParse resolves a revision expression to a full object ID.
@@ -310,6 +345,151 @@ func (e *SubprocessExecutor) ExecLsTree(ctx context.Context, req LsTreeRequest) 
 	args = append(args, req.TreeOID)
 	spec := SandboxSpec{Repo: req.Repo, RepoDir: req.RepoDir, ReadOnly: true}
 	return e.run(ctx, "ls-tree", spec, req.RepoDir, args, nil, nil, req.Stdout, nil, req.Timeout)
+}
+
+const defaultCatFileBatchMaxBytes uint64 = 1 << 20 // 1 MiB
+
+// ExecLog outputs bounded, NUL-delimited `git log` records to req.Stdout.
+func (e *SubprocessExecutor) ExecLog(ctx context.Context, req LogRequest) error {
+	if strings.TrimSpace(req.RepoDir) == "" {
+		return ErrEmptyRepoDir
+	}
+	if !IsValidHexOID(req.CommitOID) {
+		return fmt.Errorf("%w: invalid log commit OID %q", ErrInvalidRequest, req.CommitOID)
+	}
+	if req.MaxCount == 0 {
+		return fmt.Errorf("%w: log max_count must be positive", ErrInvalidRequest)
+	}
+	if strings.ContainsRune(req.Format, '\x00') {
+		return fmt.Errorf("%w: invalid log format", ErrInvalidRequest)
+	}
+	if req.Path != "" && strings.ContainsRune(req.Path, '\x00') {
+		return fmt.Errorf("%w: invalid log path %q", ErrInvalidRequest, req.Path)
+	}
+	args := []string{
+		"--git-dir", req.RepoDir,
+		"log", "-z",
+		"--max-count=" + strconv.FormatUint(uint64(req.MaxCount), 10),
+	}
+	if req.Format != "" {
+		args = append(args, "--format="+req.Format)
+	}
+	if req.NameOnly {
+		args = append(args, "-m", "--first-parent", "--name-only")
+	}
+	args = append(args, req.CommitOID)
+	if req.Path != "" {
+		args = append(args, "--", req.Path)
+	}
+	spec := SandboxSpec{Repo: req.Repo, RepoDir: req.RepoDir, ReadOnly: true}
+	return e.run(ctx, "log", spec, req.RepoDir, args, nil, nil, req.Stdout, nil, req.Timeout)
+}
+
+// ExecRevListCount returns a bounded commit count reachable from req.CommitOID (optionally filtered by req.Path).
+func (e *SubprocessExecutor) ExecRevListCount(ctx context.Context, req RevListCountRequest) (uint64, error) {
+	if strings.TrimSpace(req.RepoDir) == "" {
+		return 0, ErrEmptyRepoDir
+	}
+	if !IsValidHexOID(req.CommitOID) {
+		return 0, fmt.Errorf("%w: invalid rev-list commit OID %q", ErrInvalidRequest, req.CommitOID)
+	}
+	if req.Path != "" && strings.ContainsRune(req.Path, '\x00') {
+		return 0, fmt.Errorf("%w: invalid rev-list path %q", ErrInvalidRequest, req.Path)
+	}
+	args := []string{"--git-dir", req.RepoDir, "rev-list", "--count"}
+	if req.MaxCount > 0 {
+		args = append(args, "--max-count="+strconv.FormatUint(req.MaxCount, 10))
+	}
+	args = append(args, req.CommitOID)
+	if req.Path != "" {
+		args = append(args, "--", req.Path)
+	}
+	var out bytes.Buffer
+	spec := SandboxSpec{Repo: req.Repo, RepoDir: req.RepoDir, ReadOnly: true}
+	if err := e.run(ctx, "rev-list", spec, req.RepoDir, args, nil, nil, &out, nil, req.Timeout); err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(out.String()), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("gitexec: parse rev-list count %q: %w", strings.TrimSpace(out.String()), err)
+	}
+	return n, nil
+}
+
+// ExecCatFileBatch reads raw Git object payloads for req.OIDs in a single `git cat-file --batch` subprocess.
+// Objects exceeding MaxObjectBytes (default 1 MiB) are skipped to keep memory bounded.
+func (e *SubprocessExecutor) ExecCatFileBatch(ctx context.Context, req CatFileBatchRequest) (map[string][]byte, error) {
+	if strings.TrimSpace(req.RepoDir) == "" {
+		return nil, ErrEmptyRepoDir
+	}
+	result := make(map[string][]byte, len(req.OIDs))
+	if len(req.OIDs) == 0 {
+		return result, nil
+	}
+	maxBytes := req.MaxObjectBytes
+	if maxBytes == 0 {
+		maxBytes = defaultCatFileBatchMaxBytes
+	}
+
+	var stdinBuf bytes.Buffer
+	seen := make(map[string]struct{}, len(req.OIDs))
+	for _, oid := range req.OIDs {
+		if !IsValidHexOID(oid) {
+			return nil, fmt.Errorf("%w: invalid object OID %q", ErrInvalidRequest, oid)
+		}
+		if _, dup := seen[oid]; dup {
+			continue
+		}
+		seen[oid] = struct{}{}
+		stdinBuf.WriteString(oid)
+		stdinBuf.WriteByte('\n')
+	}
+
+	var out bytes.Buffer
+	args := []string{"--git-dir", req.RepoDir, "cat-file", "--batch"}
+	spec := SandboxSpec{Repo: req.Repo, RepoDir: req.RepoDir, ReadOnly: true}
+	if err := e.run(ctx, "cat-file", spec, req.RepoDir, args, nil, &stdinBuf, &out, nil, req.Timeout); err != nil {
+		return nil, err
+	}
+
+	reader := bufio.NewReader(&out)
+	for {
+		header, err := reader.ReadString('\n')
+		if errors.Is(err, io.EOF) && header == "" {
+			break
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("gitexec: read cat-file batch header: %w", err)
+		}
+		fields := strings.Fields(header)
+		if len(fields) == 2 && fields[1] == "missing" {
+			continue
+		}
+		if len(fields) < 3 {
+			return nil, fmt.Errorf("gitexec: malformed cat-file batch header %q", strings.TrimSpace(header))
+		}
+		oid := fields[0]
+		sz, err := strconv.ParseUint(fields[2], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("gitexec: parse cat-file batch size %q: %w", fields[2], err)
+		}
+		if sz > maxBytes {
+			if _, err := io.CopyN(io.Discard, reader, int64(sz)+1); err != nil {
+				return nil, fmt.Errorf("gitexec: discard oversized object %s: %w", oid, err)
+			}
+			continue
+		}
+		payload := make([]byte, sz)
+		if _, err := io.ReadFull(reader, payload); err != nil {
+			return nil, fmt.Errorf("gitexec: read cat-file batch body %s: %w", oid, err)
+		}
+		// Consume trailing LF separator emitted by git cat-file --batch.
+		if _, err := reader.ReadByte(); err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("gitexec: read cat-file batch delimiter %s: %w", oid, err)
+		}
+		result[oid] = payload
+	}
+	return result, nil
 }
 
 // IsValidHexOID reports whether oid is a valid 40-char (SHA-1) or 64-char (SHA-256) lowercase hex string.

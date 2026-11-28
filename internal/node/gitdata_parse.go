@@ -429,3 +429,247 @@ func sanitizeTreePath(raw string) (string, error) {
 	}
 	return trimmed, nil
 }
+
+func validateRefPrefix(prefix string) error {
+	if prefix == "" {
+		return nil
+	}
+	if len(prefix) > 1024 || strings.HasPrefix(prefix, "-") || strings.ContainsAny(prefix, "\x00\r\n\\ \t") || strings.Contains(prefix, "..") {
+		return fmt.Errorf("invalid ref prefix %q", prefix)
+	}
+	return nil
+}
+
+func isSafeRefOrOID(ref string) bool {
+	if ref == "" || len(ref) > 1024 || strings.HasPrefix(ref, "-") {
+		return false
+	}
+	if strings.ContainsAny(ref, "\x00\r\n\\ \t") {
+		return false
+	}
+	if strings.Contains(ref, "..") || strings.Contains(ref, "@{") {
+		return false
+	}
+	return true
+}
+
+func normalizeDefaultBranch(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "refs/") {
+		return trimmed
+	}
+	return "refs/heads/" + trimmed
+}
+
+func classifyRef(refName string) (kind, shortName string) {
+	if s, ok := strings.CutPrefix(refName, "refs/heads/"); ok {
+		return "branch", s
+	}
+	if s, ok := strings.CutPrefix(refName, "refs/tags/"); ok {
+		return "tag", s
+	}
+	return "other", strings.TrimPrefix(refName, "refs/")
+}
+
+func shortOID(oid string) string {
+	if len(oid) > 7 {
+		return oid[:7]
+	}
+	return oid
+}
+
+const commitLogFieldsPerRecord = 11
+
+// parseCommitLogOutput parses NUL-delimited `git log -z` output using commitLogFormat.
+func parseCommitLogOutput(data []byte) ([]rpc.CommitEntry, error) {
+	if len(data) == 0 {
+		return []rpc.CommitEntry{}, nil
+	}
+	trimmed := bytes.TrimSuffix(data, []byte{0})
+	fields := bytes.Split(trimmed, []byte{0})
+	if len(fields)%commitLogFieldsPerRecord != 0 {
+		return nil, fmt.Errorf("gitdata: malformed commit log output (%d fields)", len(fields))
+	}
+	count := len(fields) / commitLogFieldsPerRecord
+	commits := make([]rpc.CommitEntry, 0, count)
+	for i := 0; i < len(fields); i += commitLogFieldsPerRecord {
+		oid := string(fields[i])
+		parents := strings.Fields(string(fields[i+2]))
+		if parents == nil {
+			parents = []string{}
+		}
+		commits = append(commits, rpc.CommitEntry{
+			OID:            oid,
+			ShortOID:       shortOID(oid),
+			TreeOID:        string(fields[i+1]),
+			ParentOIDs:     parents,
+			AuthorName:     string(fields[i+3]),
+			AuthorEmail:    string(fields[i+4]),
+			AuthorTime:     string(fields[i+5]),
+			CommitterName:  string(fields[i+6]),
+			CommitterEmail: string(fields[i+7]),
+			CommitterTime:  string(fields[i+8]),
+			Subject:        string(fields[i+9]),
+			Body:           strings.TrimRight(string(fields[i+10]), "\r\n"),
+		})
+	}
+	return commits, nil
+}
+
+// extractCommitSignature extracts the raw GPG/SSH signature armor and exact
+// signed commit payload (with the gpgsig header removed) from a raw Git commit object.
+func extractCommitSignature(raw []byte) (rawSig, signedPayload string) {
+	if len(raw) == 0 {
+		return "", ""
+	}
+	var headerSection, bodySection []byte
+	if idx := bytes.Index(raw, []byte("\n\n")); idx >= 0 {
+		headerSection = raw[:idx+1]
+		bodySection = raw[idx+1:]
+	} else {
+		headerSection = raw
+	}
+
+	var (
+		sigBuf     bytes.Buffer
+		payloadBuf bytes.Buffer
+		inSig      bool
+		foundSig   bool
+	)
+
+	rem := headerSection
+	for len(rem) > 0 {
+		nl := bytes.IndexByte(rem, '\n')
+		var line []byte
+		if nl >= 0 {
+			line = rem[:nl+1]
+			rem = rem[nl+1:]
+		} else {
+			line = rem
+			rem = nil
+		}
+
+		if inSig {
+			if len(line) > 0 && line[0] == ' ' {
+				sigBuf.Write(line[1:])
+				continue
+			}
+			inSig = false
+		}
+
+		if after, ok := bytes.CutPrefix(line, []byte("gpgsig ")); ok {
+			foundSig = true
+			inSig = true
+			sigBuf.Write(after)
+			continue
+		}
+		if after, ok := bytes.CutPrefix(line, []byte("gpgsig-sha256 ")); ok {
+			foundSig = true
+			inSig = true
+			sigBuf.Write(after)
+			continue
+		}
+
+		payloadBuf.Write(line)
+	}
+
+	if !foundSig {
+		return "", ""
+	}
+	payloadBuf.Write(bodySection)
+	return strings.TrimRight(sigBuf.String(), "\n"), payloadBuf.String()
+}
+
+// parseCommitSummaryOutput parses a single NUL-delimited `git log -z -n 1` summary record.
+func parseCommitSummaryOutput(data []byte) (rpc.CommitSummary, bool) {
+	if len(data) == 0 {
+		return rpc.CommitSummary{}, false
+	}
+	trimmed := bytes.TrimSuffix(data, []byte{0})
+	fields := bytes.Split(trimmed, []byte{0})
+	if len(fields) < 4 {
+		return rpc.CommitSummary{}, false
+	}
+	oid := string(fields[0])
+	if oid == "" {
+		return rpc.CommitSummary{}, false
+	}
+	return rpc.CommitSummary{
+		OID:        oid,
+		ShortOID:   shortOID(oid),
+		AuthorName: string(fields[1]),
+		AuthorTime: string(fields[2]),
+		Subject:    string(fields[3]),
+	}, true
+}
+
+// parseNameOnlyLogOutput maps each immediate directory entry in wanted to its
+// latest touching CommitSummary from `git log -z --name-only` output.
+func parseNameOnlyLogOutput(data []byte, basePath string, wanted map[string]struct{}) map[string]rpc.CommitSummary {
+	found := make(map[string]rpc.CommitSummary, len(wanted))
+	if len(data) == 0 || len(wanted) == 0 {
+		return found
+	}
+	records := bytes.Split(data, []byte{0x1e})
+	for _, rec := range records {
+		if len(rec) == 0 {
+			continue
+		}
+		fields := bytes.Split(rec, []byte{0})
+		if len(fields) < 5 {
+			continue
+		}
+		oid := string(fields[0])
+		if oid == "" {
+			continue
+		}
+		summary := rpc.CommitSummary{
+			OID:        oid,
+			ShortOID:   shortOID(oid),
+			AuthorName: string(fields[1]),
+			AuthorTime: string(fields[2]),
+			Subject:    string(fields[3]),
+		}
+		for _, rawPath := range fields[4:] {
+			p := strings.TrimLeft(string(rawPath), "\r\n")
+			if p == "" {
+				continue
+			}
+			entryName := immediateChildEntry(p, basePath)
+			if entryName == "" {
+				continue
+			}
+			if _, ok := wanted[entryName]; !ok {
+				continue
+			}
+			if _, exists := found[entryName]; !exists {
+				found[entryName] = summary
+				if len(found) == len(wanted) {
+					return found
+				}
+			}
+		}
+	}
+	return found
+}
+
+func immediateChildEntry(filePath, basePath string) string {
+	rel := filePath
+	if basePath != "" {
+		prefix := basePath + "/"
+		if !strings.HasPrefix(filePath, prefix) {
+			return ""
+		}
+		rel = strings.TrimPrefix(filePath, prefix)
+	}
+	if rel == "" {
+		return ""
+	}
+	if slash := strings.IndexByte(rel, '/'); slash >= 0 {
+		return rel[:slash]
+	}
+	return rel
+}

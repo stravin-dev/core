@@ -24,6 +24,10 @@ const (
 	GitDataGetBlobMethod = "/" + GitDataServiceName + "/GetBlob"
 	// GitDataListTreeMethod is the full gRPC method path for ListTree.
 	GitDataListTreeMethod = "/" + GitDataServiceName + "/ListTree"
+	// GitDataListRefsMethod is the full gRPC method path for ListRefs.
+	GitDataListRefsMethod = "/" + GitDataServiceName + "/ListRefs"
+	// GitDataGetCommitLogMethod is the full gRPC method path for GetCommitLog.
+	GitDataGetCommitLogMethod = "/" + GitDataServiceName + "/GetCommitLog"
 	// GitDataCodecName is the registered gRPC codec name for GitData JSON messages.
 	GitDataCodecName = "stravin-gitdata"
 
@@ -157,6 +161,78 @@ type TreeEntry struct {
 	SizeBytes uint64 `json:"size_bytes"`
 }
 
+// ListRefsRequest requests branches, tags, and other refs in a repository.
+type ListRefsRequest struct {
+	TenantID string `json:"tenant_id"`
+	RepoID   string `json:"repo_id"`
+	Prefix   string `json:"prefix,omitempty"`
+	Limit    uint32 `json:"limit,omitempty"`
+	Cursor   string `json:"cursor,omitempty"`
+}
+
+// ListRefsResponse returns refs, default branch resolution, counts, and pagination cursor.
+type ListRefsResponse struct {
+	DefaultBranch string     `json:"default_branch"`
+	HeadOID       string     `json:"head_oid,omitempty"`
+	Refs          []RefEntry `json:"refs"`
+	BranchCount   uint32     `json:"branch_count"`
+	TagCount      uint32     `json:"tag_count"`
+	NextCursor    string     `json:"next_cursor,omitempty"`
+}
+
+// RefEntry describes a single Git reference.
+type RefEntry struct {
+	Name      string `json:"name"`
+	ShortName string `json:"short_name"`
+	TargetOID string `json:"target_oid"`
+	Kind      string `json:"kind"` // "branch" | "tag" | "other"
+	IsDefault bool   `json:"is_default,omitempty"`
+}
+
+// GetCommitLogRequest requests commit history and optional per-path last commits.
+type GetCommitLogRequest struct {
+	TenantID               string `json:"tenant_id"`
+	RepoID                 string `json:"repo_id"`
+	Ref                    string `json:"ref,omitempty"`
+	Path                   string `json:"path,omitempty"`
+	Limit                  uint32 `json:"limit,omitempty"`
+	IncludePathLastCommits bool   `json:"include_path_last_commits,omitempty"`
+}
+
+// GetCommitLogResponse returns commit metadata, total commit count, and optional per-path last commits.
+type GetCommitLogResponse struct {
+	TotalCommits    uint64                   `json:"total_commits"`
+	Commits         []CommitEntry            `json:"commits"`
+	TreePathCommits map[string]CommitSummary `json:"tree_path_commits,omitempty"`
+}
+
+// CommitEntry describes a Git commit including optional raw cryptographic signature data.
+type CommitEntry struct {
+	OID            string   `json:"oid"`
+	ShortOID       string   `json:"short_oid"`
+	TreeOID        string   `json:"tree_oid"`
+	ParentOIDs     []string `json:"parent_oids"`
+	AuthorName     string   `json:"author_name"`
+	AuthorEmail    string   `json:"author_email"`
+	AuthorTime     string   `json:"author_time"`
+	CommitterName  string   `json:"committer_name"`
+	CommitterEmail string   `json:"committer_email"`
+	CommitterTime  string   `json:"committer_time"`
+	Subject        string   `json:"subject"`
+	Body           string   `json:"body,omitempty"`
+	RawSignature   string   `json:"raw_signature,omitempty"`
+	SignedPayload  string   `json:"signed_payload,omitempty"`
+}
+
+// CommitSummary holds concise commit metadata for file tree last-touching commit rows.
+type CommitSummary struct {
+	OID        string `json:"oid"`
+	ShortOID   string `json:"short_oid"`
+	Subject    string `json:"subject"`
+	AuthorName string `json:"author_name"`
+	AuthorTime string `json:"author_time"`
+}
+
 // GitDataBlobStream is the server-side stream for GetBlob responses.
 type GitDataBlobStream interface {
 	Send(*BlobChunk) error
@@ -174,6 +250,8 @@ type GitDataHandler interface {
 	GetDiff(ctx context.Context, req *GetDiffRequest) (*GetDiffResponse, error)
 	GetBlob(ctx context.Context, req *GetBlobRequest, stream GitDataBlobStream) error
 	ListTree(ctx context.Context, req *ListTreeRequest) (*ListTreeResponse, error)
+	ListRefs(ctx context.Context, req *ListRefsRequest) (*ListRefsResponse, error)
+	GetCommitLog(ctx context.Context, req *GetCommitLogRequest) (*GetCommitLogResponse, error)
 }
 
 // GitDataClient invokes read-only GitData RPCs on stravin-node.
@@ -181,6 +259,8 @@ type GitDataClient interface {
 	GetDiff(ctx context.Context, req *GetDiffRequest, opts ...grpc.CallOption) (*GetDiffResponse, error)
 	GetBlob(ctx context.Context, req *GetBlobRequest, opts ...grpc.CallOption) (GitDataBlobClientStream, error)
 	ListTree(ctx context.Context, req *ListTreeRequest, opts ...grpc.CallOption) (*ListTreeResponse, error)
+	ListRefs(ctx context.Context, req *ListRefsRequest, opts ...grpc.CallOption) (*ListRefsResponse, error)
+	GetCommitLog(ctx context.Context, req *GetCommitLogRequest, opts ...grpc.CallOption) (*GetCommitLogResponse, error)
 }
 
 // InjectGitDataMetadata validates tenantID and repoID and attaches routing headers
@@ -259,6 +339,14 @@ func RegisterGitDataServer(s grpc.ServiceRegistrar, h GitDataHandler) {
 				MethodName: "ListTree",
 				Handler:    gitDataListTreeHandler,
 			},
+			{
+				MethodName: "ListRefs",
+				Handler:    gitDataListRefsHandler,
+			},
+			{
+				MethodName: "GetCommitLog",
+				Handler:    gitDataGetCommitLogHandler,
+			},
 		},
 		Streams: []grpc.StreamDesc{
 			{
@@ -313,6 +401,52 @@ func gitDataListTreeHandler(srv any, ctx context.Context, dec func(any) error, i
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
 		FullMethod: GitDataListTreeMethod,
+	}
+	return interceptor(ctx, in, info, invoke)
+}
+
+func gitDataListRefsHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+	in := new(ListRefsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	invoke := func(callCtx context.Context, req any) (any, error) {
+		r := req.(*ListRefsRequest)
+		authedCtx, _, err := AuthorizeGitDataContext(callCtx, r.TenantID, r.RepoID)
+		if err != nil {
+			return nil, err
+		}
+		return srv.(GitDataHandler).ListRefs(authedCtx, r)
+	}
+	if interceptor == nil {
+		return invoke(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GitDataListRefsMethod,
+	}
+	return interceptor(ctx, in, info, invoke)
+}
+
+func gitDataGetCommitLogHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+	in := new(GetCommitLogRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	invoke := func(callCtx context.Context, req any) (any, error) {
+		r := req.(*GetCommitLogRequest)
+		authedCtx, _, err := AuthorizeGitDataContext(callCtx, r.TenantID, r.RepoID)
+		if err != nil {
+			return nil, err
+		}
+		return srv.(GitDataHandler).GetCommitLog(authedCtx, r)
+	}
+	if interceptor == nil {
+		return invoke(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GitDataGetCommitLogMethod,
 	}
 	return interceptor(ctx, in, info, invoke)
 }
@@ -395,6 +529,38 @@ func (c *grpcGitDataClient) ListTree(ctx context.Context, req *ListTreeRequest, 
 	out := new(ListTreeResponse)
 	callOpts := append([]grpc.CallOption{grpc.ForceCodec(GitDataCodec())}, opts...)
 	if err := c.cc.Invoke(outCtx, GitDataListTreeMethod, req, out, callOpts...); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *grpcGitDataClient) ListRefs(ctx context.Context, req *ListRefsRequest, opts ...grpc.CallOption) (*ListRefsResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "rpc: ListRefs request is nil")
+	}
+	outCtx, err := ensureGitDataOutgoingMetadata(ctx, req.TenantID, req.RepoID)
+	if err != nil {
+		return nil, err
+	}
+	out := new(ListRefsResponse)
+	callOpts := append([]grpc.CallOption{grpc.ForceCodec(GitDataCodec())}, opts...)
+	if err := c.cc.Invoke(outCtx, GitDataListRefsMethod, req, out, callOpts...); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *grpcGitDataClient) GetCommitLog(ctx context.Context, req *GetCommitLogRequest, opts ...grpc.CallOption) (*GetCommitLogResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "rpc: GetCommitLog request is nil")
+	}
+	outCtx, err := ensureGitDataOutgoingMetadata(ctx, req.TenantID, req.RepoID)
+	if err != nil {
+		return nil, err
+	}
+	out := new(GetCommitLogResponse)
+	callOpts := append([]grpc.CallOption{grpc.ForceCodec(GitDataCodec())}, opts...)
+	if err := c.cc.Invoke(outCtx, GitDataGetCommitLogMethod, req, out, callOpts...); err != nil {
 		return nil, err
 	}
 	return out, nil
