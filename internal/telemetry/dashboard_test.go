@@ -868,6 +868,33 @@ func TestOTelAndLGTMConfigs_TracesMetricsLogsPipelines(t *testing.T) {
 			t.Errorf("prometheus.yml missing required setting %q", tok)
 		}
 	}
+
+	coreCollectorRaw, err := os.ReadFile(deployLocalPath("core-otel-collector.yaml"))
+	if err != nil {
+		t.Fatalf("read core-otel-collector.yaml: %v", err)
+	}
+	coreCollectorCfg := string(coreCollectorRaw)
+	for _, tok := range []string{
+		"0.0.0.0:4317",
+		"0.0.0.0:4318",
+		"stravin-node:8081",
+		"valkey-exporter:9121",
+		"nats-exporter:7777",
+		"memory_limiter:",
+		"stravin.stack",
+		"value: core",
+		"otlp/gateway:",
+		"STRAVIN_OBS_OTLP_ENDPOINT:-otel-gateway:4317",
+		"sending_queue:",
+		"retry_on_failure:",
+		"traces:",
+		"metrics:",
+		"logs:",
+	} {
+		if !strings.Contains(coreCollectorCfg, tok) {
+			t.Errorf("core-otel-collector.yaml missing required setting %q", tok)
+		}
+	}
 }
 
 func TestGrafanaDashboards_StravinValkey(t *testing.T) {

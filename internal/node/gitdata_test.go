@@ -1746,3 +1746,99 @@ func TestGitData_InitRepo_BootstrapsMissingRepoMeta(t *testing.T) {
 		}
 	})
 }
+
+func TestGitData_TraceparentPropagation(t *testing.T) {
+	fx := setupGitDataFixture(t)
+
+	const (
+		wantTraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+		wantSpanID  = "00f067aa0ba902b7"
+		traceparent = "00-" + wantTraceID + "-" + wantSpanID + "-01"
+	)
+	ctx := metadata.AppendToOutgoingContext(context.Background(), rpc.HeaderTraceParent, traceparent)
+
+	if _, err := fx.client.GetDiff(ctx, &rpc.GetDiffRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+		HeadOID:  fx.secondCommit,
+	}); err != nil {
+		t.Fatalf("GetDiff: %v", err)
+	}
+
+	blobStream, err := fx.client.GetBlob(ctx, &rpc.GetBlobRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+		BlobOID:  fx.pngBlobOID,
+	})
+	if err != nil {
+		t.Fatalf("GetBlob: %v", err)
+	}
+	for {
+		_, recvErr := blobStream.Recv()
+		if recvErr == io.EOF {
+			break
+		}
+		if recvErr != nil {
+			t.Fatalf("GetBlob Recv: %v", recvErr)
+		}
+	}
+
+	if _, err := fx.client.ListTree(ctx, &rpc.ListTreeRequest{
+		TenantID:  string(fx.repoKey.TenantID),
+		RepoID:    string(fx.repoKey.RepoID),
+		CommitOID: fx.secondCommit,
+	}); err != nil {
+		t.Fatalf("ListTree: %v", err)
+	}
+
+	if _, err := fx.client.ListRefs(ctx, &rpc.ListRefsRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+	}); err != nil {
+		t.Fatalf("ListRefs: %v", err)
+	}
+
+	if _, err := fx.client.GetCommitLog(ctx, &rpc.GetCommitLogRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+		Ref:      "main",
+	}); err != nil {
+		t.Fatalf("GetCommitLog: %v", err)
+	}
+
+	// InitRepo extracts traceparent and starts node.gitdata.init_repo before checking persistence/state.
+	_, _ = fx.client.InitRepo(ctx, &rpc.InitRepoRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+		Files:    []rpc.InitFile{{Path: "README.md", Content: []byte("traceparent test")}},
+	})
+
+	// Await full server handler completion before inspecting recorded spans.
+	fx.grpcSrv.GracefulStop()
+
+	wantSpans := map[string]bool{
+		"node.gitdata.get_diff":       false,
+		"node.gitdata.get_blob":       false,
+		"node.gitdata.list_tree":      false,
+		"node.gitdata.list_refs":      false,
+		"node.gitdata.get_commit_log": false,
+		"node.gitdata.init_repo":      false,
+	}
+	for _, sp := range fx.tp.SpanExporter.GetSpans() {
+		if _, tracked := wantSpans[sp.Name]; !tracked {
+			continue
+		}
+		if got := sp.SpanContext.TraceID().String(); got != wantTraceID {
+			t.Errorf("span %q trace_id = %q, want %q", sp.Name, got, wantTraceID)
+		}
+		if got := sp.Parent.SpanID().String(); got != wantSpanID {
+			t.Errorf("span %q parent_span_id = %q, want %q", sp.Name, got, wantSpanID)
+		}
+		wantSpans[sp.Name] = true
+	}
+	for name, seen := range wantSpans {
+		if !seen {
+			t.Errorf("expected span %q to be recorded", name)
+		}
+	}
+}

@@ -1,0 +1,67 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: stravin-node
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["stravin-node:8081"]
+        - job_name: valkey
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["valkey-exporter:9121"]
+        - job_name: nats
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["nats-exporter:7777"]
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  resource:
+    attributes:
+      - key: stravin.stack
+        value: core
+        action: upsert
+  batch:
+    timeout: 1s
+    send_batch_size: 512
+
+exporters:
+  otlp/gateway:
+    endpoint: ${env:STRAVIN_OBS_OTLP_ENDPOINT:-otel-gateway:4317}
+    tls:
+      insecure: true
+    timeout: 5s
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      queue_size: 256
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_interval: 15s
+      max_elapsed_time: 30s
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlp/gateway]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlp/gateway]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlp/gateway]
