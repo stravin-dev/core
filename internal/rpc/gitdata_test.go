@@ -127,6 +127,23 @@ func (h *fakeGitDataHandler) GetCommitLog(ctx context.Context, req *rpc.GetCommi
 	return resp, nil
 }
 
+func (h *fakeGitDataHandler) InitRepo(ctx context.Context, req *rpc.InitRepoRequest) (*rpc.InitRepoResponse, error) {
+	rk, err := tenant.RequireRepoKey(ctx)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	h.gotRepoKey = rk
+	branch := req.DefaultBranch
+	if branch == "" {
+		branch = "main"
+	}
+	return &rpc.InitRepoResponse{
+		DefaultBranch: branch,
+		CommitOID:     "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+		TreeOID:       "ffffffffffffffffffffffffffffffffffffffff",
+	}, nil
+}
+
 func startGitDataTestServer(t *testing.T, handler rpc.GitDataHandler, opts ...grpc.ServerOption) (rpc.GitDataClient, *grpc.ClientConn) {
 	t.Helper()
 	lis := bufconn.Listen(1024 * 1024)
@@ -237,6 +254,24 @@ func TestGitDataRoundTrip(t *testing.T) {
 	if logResp.TotalCommits != 2 || len(logResp.Commits) != 1 || logResp.Commits[0].RawSignature == "" || logResp.TreePathCommits["README.md"].ShortOID != "ccccccc" {
 		t.Fatalf("unexpected commit log response: %+v", logResp)
 	}
+
+	initResp, err := client.InitRepo(ctx, &rpc.InitRepoRequest{
+		TenantID:      "acme",
+		RepoID:        "core",
+		DefaultBranch: "main",
+		AuthorName:    "Stravin",
+		AuthorEmail:   "noreply@stravin.dev",
+		CommitMessage: "Initial commit",
+		Files: []rpc.InitFile{
+			{Path: "README.md", Content: []byte("# Core\n")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("InitRepo: %v", err)
+	}
+	if initResp.DefaultBranch != "main" || initResp.CommitOID == "" || initResp.TreeOID == "" {
+		t.Fatalf("unexpected init repo response: %+v", initResp)
+	}
 }
 
 func TestGitDataTenantIsolation(t *testing.T) {
@@ -314,9 +349,12 @@ func TestGitDataTenantIsolation(t *testing.T) {
 		if _, err := client.GetCommitLog(ctx, &rpc.GetCommitLogRequest{TenantID: "acme", RepoID: "core"}); status.Code(err) != codes.PermissionDenied {
 			t.Fatalf("GetCommitLog code = %v (%v), want PermissionDenied", status.Code(err), err)
 		}
+		if _, err := client.InitRepo(ctx, &rpc.InitRepoRequest{TenantID: "acme", RepoID: "core"}); status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("InitRepo code = %v (%v), want PermissionDenied", status.Code(err), err)
+		}
 	})
 
-	t.Run("missing metadata rejected on ListRefs and GetCommitLog", func(t *testing.T) {
+	t.Run("missing metadata rejected on ListRefs, GetCommitLog, and InitRepo", func(t *testing.T) {
 		refsOut := new(rpc.ListRefsResponse)
 		if err := cc.Invoke(context.Background(), rpc.GitDataListRefsMethod, &rpc.ListRefsRequest{TenantID: "acme", RepoID: "core"}, refsOut, grpc.ForceCodec(rpc.GitDataCodec())); status.Code(err) != codes.InvalidArgument {
 			t.Fatalf("ListRefs without metadata code = %v, want InvalidArgument", status.Code(err))
@@ -324,6 +362,10 @@ func TestGitDataTenantIsolation(t *testing.T) {
 		logOut := new(rpc.GetCommitLogResponse)
 		if err := cc.Invoke(context.Background(), rpc.GitDataGetCommitLogMethod, &rpc.GetCommitLogRequest{TenantID: "acme", RepoID: "core"}, logOut, grpc.ForceCodec(rpc.GitDataCodec())); status.Code(err) != codes.InvalidArgument {
 			t.Fatalf("GetCommitLog without metadata code = %v, want InvalidArgument", status.Code(err))
+		}
+		initOut := new(rpc.InitRepoResponse)
+		if err := cc.Invoke(context.Background(), rpc.GitDataInitRepoMethod, &rpc.InitRepoRequest{TenantID: "acme", RepoID: "core"}, initOut, grpc.ForceCodec(rpc.GitDataCodec())); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("InitRepo without metadata code = %v, want InvalidArgument", status.Code(err))
 		}
 	})
 }
