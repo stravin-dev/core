@@ -34,6 +34,8 @@ type ServerConfig struct {
 	Authenticator            Authenticator
 	Limiter                  Limiter
 	Resolver                 *Resolver
+	RouteResolver            RouteResolver
+	MaxOrgDepth              int
 	Router                   NodeSelector
 	Proxy                    *WireProxy
 	PackCache                *PackCacheCoordinator
@@ -83,10 +85,14 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	httpHandler.SetMaxDecompressedBodyBytes(cfg.MaxDecompressedBodyBytes)
 	httpHandler.SetPackCache(cfg.PackCache)
+	httpHandler.SetRouteResolver(cfg.RouteResolver)
+	httpHandler.SetMaxOrgDepth(cfg.MaxOrgDepth)
 	sshServer, err := NewSSHServer(cfg.HostKey, cfg.Authenticator, cfg.Limiter, cfg.Resolver, cfg.Router, cfg.Proxy, metrics, cfg.Logger)
 	if err != nil {
 		return nil, err
 	}
+	sshServer.SetRouteResolver(cfg.RouteResolver)
+	sshServer.SetMaxOrgDepth(cfg.MaxOrgDepth)
 
 	probes := cfg.Probes
 	if probes == nil {

@@ -59,6 +59,8 @@ type HTTPHandler struct {
 	auth                     Authenticator
 	limiter                  Limiter
 	resolver                 *Resolver
+	routeResolver            RouteResolver
+	maxOrgDepth              int
 	router                   NodeSelector
 	proxy                    *WireProxy
 	metrics                  *Metrics
@@ -107,6 +109,7 @@ func NewHTTPHandler(
 		auth:                     auth,
 		limiter:                  limiter,
 		resolver:                 resolver,
+		maxOrgDepth:              DefaultMaxOrgDepth,
 		router:                   router,
 		proxy:                    proxy,
 		metrics:                  metrics,
@@ -120,6 +123,20 @@ func NewHTTPHandler(
 func (h *HTTPHandler) SetProbes(probes *health.Registry) {
 	if probes != nil {
 		h.probes = probes
+	}
+}
+
+// SetRouteResolver attaches an optional Valkey-backed RouteResolver for nested
+// organization Git paths.
+func (h *HTTPHandler) SetRouteResolver(r RouteResolver) {
+	h.routeResolver = r
+}
+
+// SetMaxOrgDepth overrides the maximum organization segment depth allowed in
+// Git Smart HTTP paths (default DefaultMaxOrgDepth = 4 -> max 5 path segments).
+func (h *HTTPHandler) SetMaxOrgDepth(depth int) {
+	if depth > 0 {
+		h.maxOrgDepth = depth
 	}
 }
 
@@ -150,7 +167,7 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reqPath = r.URL.Path
 	}
 
-	route, err := parseSmartHTTPPath(r.Method, reqPath, r.URL.Query().Get("service"))
+	route, err := parseSmartHTTPPathWithDepth(r.Method, reqPath, r.URL.Query().Get("service"), h.maxOrgDepth)
 	if err != nil {
 		h.metrics.RecordRequest(r.Context(), "http", "unknown", strconv.Itoa(http.StatusNotFound), "invalid_request", time.Since(start))
 		http.Error(w, "not found", http.StatusNotFound)
@@ -158,8 +175,6 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := telemetry.ExtractHTTP(r.Context(), r.Header)
-	ctx, span := h.metrics.StartIngressSpan(ctx, "http", route.metricOp, string(route.repo.TenantID), string(route.repo.RepoID), "")
-	defer span.End()
 
 	token, ok := extractHTTPToken(r.Header.Get("Authorization"))
 	if !ok {
@@ -177,6 +192,22 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeUnauthorized(w, ctx, route.metricOp, start)
 		return
 	}
+
+	repoKey, err := ResolveRepoPath(ctx, h.routeResolver, route.parsedPath)
+	if err != nil {
+		if errors.Is(err, ErrRouteNotFound) {
+			h.metrics.RecordRequest(ctx, "http", route.metricOp, strconv.Itoa(http.StatusNotFound), "not_found", time.Since(start))
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		h.metrics.RecordRequest(ctx, "http", route.metricOp, strconv.Itoa(http.StatusServiceUnavailable), "route_unavailable", time.Since(start))
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	route.repo = repoKey
+
+	ctx, span := h.metrics.StartIngressSpan(ctx, "http", route.metricOp, string(route.repo.TenantID), string(route.repo.RepoID), "")
+	defer span.End()
 
 	if err := AuthorizeRepoOperation(principal, route.repo, route.op); err != nil {
 		h.metrics.RecordRequest(ctx, "http", route.metricOp, strconv.Itoa(http.StatusForbidden), "forbidden", time.Since(start))
@@ -540,6 +571,7 @@ const (
 
 type smartHTTPRoute struct {
 	kind           routeKind
+	parsedPath     ParsedRepoPath
 	repo           tenant.RepoKey
 	op             rpc.Operation
 	metricOp       string
@@ -547,13 +579,9 @@ type smartHTTPRoute struct {
 	responsePrefix []byte
 }
 
-func parseSmartHTTPPath(method, rawPath, service string) (smartHTTPRoute, error) {
-	if rawPath == "" || strings.ContainsAny(rawPath, "\\\x00") {
-		return smartHTTPRoute{}, errors.New("edge: invalid path")
-	}
-	lower := strings.ToLower(rawPath)
-	if strings.Contains(lower, "..") || strings.Contains(lower, "%2e") || strings.Contains(lower, "%2f") || strings.Contains(lower, "%5c") {
-		return smartHTTPRoute{}, errors.New("edge: path traversal rejected")
+func parseSmartHTTPPathWithDepth(method, rawPath, service string, maxOrgDepth int) (smartHTTPRoute, error) {
+	if err := validateRawPathSafety(rawPath); err != nil {
+		return smartHTTPRoute{}, err
 	}
 
 	trimmed := strings.TrimPrefix(rawPath, "/")
@@ -562,55 +590,64 @@ func parseSmartHTTPPath(method, rawPath, service string) (smartHTTPRoute, error)
 		return smartHTTPRoute{}, errors.New("edge: incomplete repo path")
 	}
 
-	tenantRaw := parts[0]
-	repoSeg := parts[1]
-	if !strings.HasSuffix(repoSeg, ".git") {
-		return smartHTTPRoute{}, errors.New("edge: repo segment must end with .git")
-	}
-	repoRaw := strings.TrimSuffix(repoSeg, ".git")
+	var (
+		repoParts      []string
+		kind           routeKind
+		op             rpc.Operation
+		metricOp       string
+		contentType    string
+		responsePrefix []byte
+	)
 
-	repoKey, err := tenant.NewRepoKey(tenantRaw, repoRaw)
-	if err != nil {
-		return smartHTTPRoute{}, err
-	}
-
-	suffix := strings.Join(parts[2:], "/")
 	switch {
-	case method == http.MethodGet && suffix == "info/refs":
-		op := rpc.Operation(service)
+	case method == http.MethodGet && len(parts) >= 4 && parts[len(parts)-2] == "info" && parts[len(parts)-1] == "refs":
+		op = rpc.Operation(service)
 		if err := op.Validate(); err != nil {
 			return smartHTTPRoute{}, err
 		}
-		return smartHTTPRoute{
-			kind:           routeInfoRefs,
-			repo:           repoKey,
-			op:             op,
-			metricOp:       "ls-refs",
-			contentType:    fmt.Sprintf("application/x-%s-advertisement", op),
-			responsePrefix: []byte(pktLine(fmt.Sprintf("# service=%s\n", op)) + "0000"),
-		}, nil
+		repoParts = parts[:len(parts)-2]
+		kind = routeInfoRefs
+		metricOp = "ls-refs"
+		contentType = fmt.Sprintf("application/x-%s-advertisement", op)
+		responsePrefix = []byte(pktLine(fmt.Sprintf("# service=%s\n", op)) + "0000")
 
-	case method == http.MethodPost && suffix == string(rpc.OpUploadPack):
-		return smartHTTPRoute{
-			kind:        routeUploadPack,
-			repo:        repoKey,
-			op:          rpc.OpUploadPack,
-			metricOp:    "fetch",
-			contentType: "application/x-git-upload-pack-result",
-		}, nil
+	case method == http.MethodPost && parts[len(parts)-1] == string(rpc.OpUploadPack):
+		repoParts = parts[:len(parts)-1]
+		kind = routeUploadPack
+		op = rpc.OpUploadPack
+		metricOp = "fetch"
+		contentType = "application/x-git-upload-pack-result"
 
-	case method == http.MethodPost && suffix == string(rpc.OpReceivePack):
-		return smartHTTPRoute{
-			kind:        routeReceivePack,
-			repo:        repoKey,
-			op:          rpc.OpReceivePack,
-			metricOp:    "push",
-			contentType: "application/x-git-receive-pack-result",
-		}, nil
+	case method == http.MethodPost && parts[len(parts)-1] == string(rpc.OpReceivePack):
+		repoParts = parts[:len(parts)-1]
+		kind = routeReceivePack
+		op = rpc.OpReceivePack
+		metricOp = "push"
+		contentType = "application/x-git-receive-pack-result"
 
 	default:
 		return smartHTTPRoute{}, errors.New("edge: unsupported smart http endpoint")
 	}
+
+	parsed, err := ParseRepoPathSegments(repoParts, true, maxOrgDepth)
+	if err != nil {
+		return smartHTTPRoute{}, err
+	}
+
+	var legacyRepo tenant.RepoKey
+	if parsed.IsLegacyTwoSegment() {
+		legacyRepo, _ = parsed.LegacyRepoKey()
+	}
+
+	return smartHTTPRoute{
+		kind:           kind,
+		parsedPath:     parsed,
+		repo:           legacyRepo,
+		op:             op,
+		metricOp:       metricOp,
+		contentType:    contentType,
+		responsePrefix: responsePrefix,
+	}, nil
 }
 
 func pktLine(payload string) string {

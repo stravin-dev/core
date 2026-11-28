@@ -241,3 +241,130 @@ func TestSSHServer_SessionChannelCap(t *testing.T) {
 		t.Fatal("expected 3rd concurrent SSH session channel to be rejected")
 	}
 }
+
+func TestParseSSHExecCommandPath_MultiSegmentAndFailClosed(t *testing.T) {
+	valid := []struct {
+		cmd      string
+		wantOp   rpc.Operation
+		wantFull string
+	}{
+		{"git-upload-pack '/acme/core.git'", rpc.OpUploadPack, "acme/core"},
+		{"git-upload-pack '/acme/eng/core.git'", rpc.OpUploadPack, "acme/eng/core"},
+		{"git-receive-pack '/acme/eng/payments/core.git'", rpc.OpReceivePack, "acme/eng/payments/core"},
+		{"git-upload-pack '/acme/eng/payments/sub/core.git'", rpc.OpUploadPack, "acme/eng/payments/sub/core"},
+		{`git-upload-pack "acme/eng/payments/sub/core"`, rpc.OpUploadPack, "acme/eng/payments/sub/core"},
+	}
+	for _, tc := range valid {
+		op, parsed, err := ParseSSHExecCommandPath(tc.cmd, DefaultMaxOrgDepth)
+		if err != nil {
+			t.Fatalf("ParseSSHExecCommandPath(%q) unexpected error: %v", tc.cmd, err)
+		}
+		if op != tc.wantOp || parsed.FullPath != tc.wantFull {
+			t.Fatalf("ParseSSHExecCommandPath(%q) = (%q, %q), want (%q, %q)", tc.cmd, op, parsed.FullPath, tc.wantOp, tc.wantFull)
+		}
+	}
+
+	invalid := []string{
+		"git-upload-pack '/a/b/c/d/e/core.git'",
+		"git-upload-pack '/acme/./core.git'",
+		"git-upload-pack '/acme/../core.git'",
+		"git-upload-pack '/acme//core.git'",
+		"git-upload-pack '//acme/core.git'",
+		"git-upload-pack '/acme/-/core.git'",
+		"git-upload-pack '/acme/eng\x07/core.git'",
+		"git-upload-pack '/acme/%2e%2e/core.git'",
+	}
+	for _, cmd := range invalid {
+		if _, _, err := ParseSSHExecCommandPath(cmd, DefaultMaxOrgDepth); err == nil {
+			t.Fatalf("expected error for invalid SSH command %q", cmd)
+		}
+	}
+}
+
+func TestSSHServer_NestedOrgRouteMapAndFailClosed(t *testing.T) {
+	env := newTestEdgeEnv(t, LimiterConfig{})
+	defer env.close()
+
+	env.sshServer.SetRouteResolver(&stubRouteResolver{
+		routes: map[string]RouteEntry{
+			"acme/eng/core":               {RootTenantID: "acme", RepoID: "core"},
+			"acme/eng/payments/core":      {RootTenantID: "acme", RepoID: "core"},
+			"acme/eng/payments/sub/core":  {RootTenantID: "acme", RepoID: "core"},
+			"acme/alias-flat":             {RootTenantID: "acme", RepoID: "core"},
+			"beta/eng/payments/forbidden": {RootTenantID: "beta", RepoID: "secret"},
+		},
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen ssh: %v", err)
+	}
+	go func() { _ = env.sshServer.Serve(ln) }()
+	defer func() { _ = env.sshServer.Close() }()
+
+	client, err := ssh.Dial("tcp", ln.Addr().String(), &ssh.ClientConfig{
+		User:            "git",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(env.clientKey.(ssh.Signer))},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("ssh.Dial: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	// 1. 2-, 3-, 4-, 5-segment mapped paths & 2-segment fallback all resolve to immutable (acme, core).
+	for _, cmd := range []string{
+		"git-upload-pack '/acme/core.git'",
+		"git-upload-pack '/acme/alias-flat.git'",
+		"git-upload-pack '/acme/eng/core.git'",
+		"git-upload-pack '/acme/eng/payments/core.git'",
+		"git-upload-pack '/acme/eng/payments/sub/core.git'",
+	} {
+		sess, err := client.NewSession()
+		if err != nil {
+			t.Fatalf("NewSession(%q): %v", cmd, err)
+		}
+		var stdout, stderr bytes.Buffer
+		sess.Stdout = &stdout
+		sess.Stderr = &stderr
+		if err := sess.Run(cmd); err != nil {
+			t.Fatalf("Run(%q) failed: %v (stderr=%q)", cmd, err, stderr.String())
+		}
+		_ = sess.Close()
+		meta, _ := env.node.snapshot()
+		if meta.TenantID != "acme" || meta.RepoID != "core" {
+			t.Fatalf("Run(%q) routed to %+v, want acme/core", cmd, meta)
+		}
+	}
+
+	// 2. Unmapped >2-segment path fails closed with repository not found.
+	sessUnmapped, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession unmapped: %v", err)
+	}
+	var unmappedStderr bytes.Buffer
+	sessUnmapped.Stderr = &unmappedStderr
+	if err := sessUnmapped.Run("git-upload-pack '/acme/eng/unmapped.git'"); err == nil {
+		t.Fatal("expected unmapped >2-segment SSH path to fail closed")
+	}
+	_ = sessUnmapped.Close()
+	if !strings.Contains(unmappedStderr.String(), "repository not found") {
+		t.Fatalf("expected repository not found stderr, got %q", unmappedStderr.String())
+	}
+
+	// 3. Depth > cap (6 segments) fails closed as invalid path.
+	sessDeep, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession deep: %v", err)
+	}
+	var deepStderr bytes.Buffer
+	sessDeep.Stderr = &deepStderr
+	if err := sessDeep.Run("git-upload-pack '/acme/a/b/c/d/core.git'"); err == nil {
+		t.Fatal("expected 6-segment SSH path to be rejected")
+	}
+	_ = sessDeep.Close()
+	if !strings.Contains(deepStderr.String(), "invalid git command") {
+		t.Fatalf("expected invalid git command stderr, got %q", deepStderr.String())
+	}
+}

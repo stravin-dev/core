@@ -1238,3 +1238,95 @@ func TestHTTPHandler_InfoRefsRetryAnd502Logging(t *testing.T) {
 		}
 	})
 }
+
+func TestHTTPHandler_NestedOrgRouteMapAndFailClosed(t *testing.T) {
+	env := newTestEdgeEnv(t, LimiterConfig{})
+	defer env.close()
+
+	stub := &stubRouteResolver{
+		routes: map[string]RouteEntry{
+			"acme/alias":                 {RootTenantID: "acme", RepoID: "core"},
+			"acme/eng/core":              {RootTenantID: "acme", RepoID: "core"},
+			"acme/eng/payments/core":     {RootTenantID: "acme", RepoID: "core"},
+			"acme/eng/payments/sub/core": {RootTenantID: "acme", RepoID: "core"},
+			"beta/eng/secret":            {RootTenantID: "beta", RepoID: "secret"},
+		},
+	}
+	env.handler.SetRouteResolver(stub)
+
+	// 1. Valid 2-, 3-, 4-, 5-segment paths resolve via route map (and 2-seg fallback) to immutable (acme, core).
+	validPaths := []struct {
+		method string
+		target string
+		wantOp rpc.Operation
+	}{
+		{http.MethodGet, "/acme/core.git/info/refs?service=git-upload-pack", rpc.OpUploadPack},
+		{http.MethodGet, "/acme/alias.git/info/refs?service=git-upload-pack", rpc.OpUploadPack},
+		{http.MethodGet, "/acme/eng/core.git/info/refs?service=git-upload-pack", rpc.OpUploadPack},
+		{http.MethodPost, "/acme/eng/payments/core.git/git-upload-pack", rpc.OpUploadPack},
+		{http.MethodPost, "/acme/eng/payments/sub/core.git/git-receive-pack", rpc.OpReceivePack},
+	}
+	for _, tc := range validPaths {
+		req := httptest.NewRequest(tc.method, tc.target, strings.NewReader("payload"))
+		req.Header.Set("Authorization", "Bearer tok-acme")
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s %s status = %d, want 200 (body=%q)", tc.method, tc.target, rec.Code, rec.Body.String())
+		}
+		meta, _ := env.node.snapshot()
+		if meta.TenantID != "acme" || meta.RepoID != "core" || meta.Operation != tc.wantOp {
+			t.Fatalf("%s %s routed to %+v, want acme/core op=%s", tc.method, tc.target, meta, tc.wantOp)
+		}
+	}
+
+	// 2. Cross-tenant mapped nested path is rejected with 403 Forbidden.
+	crossReq := httptest.NewRequest(http.MethodGet, "/beta/eng/secret.git/info/refs?service=git-upload-pack", nil)
+	crossReq.Header.Set("Authorization", "Bearer tok-acme")
+	crossRec := httptest.NewRecorder()
+	env.handler.ServeHTTP(crossRec, crossReq)
+	if crossRec.Code != http.StatusForbidden {
+		t.Fatalf("cross-tenant nested path status = %d, want 403", crossRec.Code)
+	}
+
+	// 3. Unmapped >2-segment path fails closed with 404 Not Found.
+	unmappedReq := httptest.NewRequest(http.MethodGet, "/acme/eng/unmapped.git/info/refs?service=git-upload-pack", nil)
+	unmappedReq.Header.Set("Authorization", "Bearer tok-acme")
+	unmappedRec := httptest.NewRecorder()
+	env.handler.ServeHTTP(unmappedRec, unmappedReq)
+	if unmappedRec.Code != http.StatusNotFound {
+		t.Fatalf("unmapped 3-segment path status = %d, want 404", unmappedRec.Code)
+	}
+
+	// 4. Malformed, traversal, control-char, and depth-exceeding (>5 segments) paths fail closed with 404.
+	invalidTargets := []string{
+		"/acme/a/b/c/d/core.git/info/refs?service=git-upload-pack",
+		"/acme/../beta/core.git/info/refs?service=git-upload-pack",
+		"/acme/./core.git/info/refs?service=git-upload-pack",
+		"/acme//core.git/info/refs?service=git-upload-pack",
+		"/acme/-/core.git/info/refs?service=git-upload-pack",
+		"/acme/%2e%2e/core.git/info/refs?service=git-upload-pack",
+	}
+	for _, target := range invalidTargets {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req.Header.Set("Authorization", "Bearer tok-acme")
+		rec := httptest.NewRecorder()
+		env.handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("invalid target %q status = %d, want 404", target, rec.Code)
+		}
+	}
+
+	// 5. Route resolver backend error fails closed with 503 Service Unavailable.
+	stub.mu.Lock()
+	stub.err = fmt.Errorf("valkey timeout")
+	stub.mu.Unlock()
+	errReq := httptest.NewRequest(http.MethodGet, "/acme/eng/core.git/info/refs?service=git-upload-pack", nil)
+	errReq.Header.Set("Authorization", "Bearer tok-acme")
+	errRec := httptest.NewRecorder()
+	env.handler.ServeHTTP(errRec, errReq)
+	if errRec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("route resolver backend error status = %d, want 503", errRec.Code)
+	}
+}
