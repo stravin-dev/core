@@ -194,6 +194,8 @@ func setupGitDataFixture(t *testing.T, extraServerOpts ...grpc.ServerOption) *gi
 	metaStore.SetRefs(rk, []ddb.RefState{
 		{Repo: rk, RefName: "refs/heads/main", OID: mainCommit},
 		{Repo: rk, RefName: "refs/heads/feature", OID: branchCommit},
+		{Repo: rk, RefName: "refs/tags/v1.0.0", OID: secondCommit},
+		{Repo: rk, RefName: "refs/stravin/pr/42/head", OID: branchCommit},
 	})
 	metaStore.AddManifest(rk, 0, ddb.PackManifest{
 		Repo:      rk,
@@ -721,5 +723,445 @@ func TestGitData_TenantIsolationAndTelemetrySpans(t *testing.T) {
 	}
 	if !sawTreeSpan {
 		t.Fatal("expected node.gitdata.list_tree span to be recorded")
+	}
+}
+
+func TestGitData_ListRefs_BranchesTagsDefaultPaginationAndValidation(t *testing.T) {
+	fx := setupGitDataFixture(t)
+	ctx := context.Background()
+
+	// Unfiltered ListRefs returns default branch, HEAD OID, counts, and all refs sorted.
+	allResp, err := fx.client.ListRefs(ctx, &rpc.ListRefsRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+	})
+	if err != nil {
+		t.Fatalf("ListRefs all: %v", err)
+	}
+	if allResp.DefaultBranch != "refs/heads/main" || allResp.HeadOID != fx.mainCommit {
+		t.Fatalf("default/head = (%q, %q), want (refs/heads/main, %q)", allResp.DefaultBranch, allResp.HeadOID, fx.mainCommit)
+	}
+	if allResp.BranchCount != 2 || allResp.TagCount != 1 || len(allResp.Refs) != 4 || allResp.NextCursor != "" {
+		t.Fatalf("counts/refs = (branches=%d tags=%d refs=%d next=%q), want (2, 1, 4, \"\")", allResp.BranchCount, allResp.TagCount, len(allResp.Refs), allResp.NextCursor)
+	}
+
+	var sawMainDefault, sawTag, sawOther bool
+	for _, r := range allResp.Refs {
+		switch r.Name {
+		case "refs/heads/main":
+			if r.ShortName == "main" && r.Kind == "branch" && r.IsDefault && r.TargetOID == fx.mainCommit {
+				sawMainDefault = true
+			}
+		case "refs/tags/v1.0.0":
+			if r.ShortName == "v1.0.0" && r.Kind == "tag" && !r.IsDefault && r.TargetOID == fx.secondCommit {
+				sawTag = true
+			}
+		case "refs/stravin/pr/42/head":
+			if r.ShortName == "stravin/pr/42/head" && r.Kind == "other" && !r.IsDefault {
+				sawOther = true
+			}
+		}
+	}
+	if !sawMainDefault || !sawTag || !sawOther {
+		t.Fatalf("unexpected ref entries: %+v", allResp.Refs)
+	}
+
+	// Prefix filter keeps total repo counts and HeadOID while filtering Refs.
+	tagResp, err := fx.client.ListRefs(ctx, &rpc.ListRefsRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+		Prefix:   "refs/tags/",
+	})
+	if err != nil {
+		t.Fatalf("ListRefs tags: %v", err)
+	}
+	if len(tagResp.Refs) != 1 || tagResp.Refs[0].ShortName != "v1.0.0" || tagResp.BranchCount != 2 || tagResp.TagCount != 1 || tagResp.HeadOID != fx.mainCommit {
+		t.Fatalf("tag filtered resp unexpected: %+v", tagResp)
+	}
+
+	// Pagination with Limit=1 and Cursor.
+	p1, err := fx.client.ListRefs(ctx, &rpc.ListRefsRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+		Prefix:   "refs/heads/",
+		Limit:    1,
+	})
+	if err != nil {
+		t.Fatalf("ListRefs page1: %v", err)
+	}
+	if len(p1.Refs) != 1 || p1.Refs[0].ShortName != "feature" || p1.NextCursor != "1" {
+		t.Fatalf("page1 = %+v, want feature + cursor=1", p1)
+	}
+	p2, err := fx.client.ListRefs(ctx, &rpc.ListRefsRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+		Prefix:   "refs/heads/",
+		Limit:    1,
+		Cursor:   p1.NextCursor,
+	})
+	if err != nil {
+		t.Fatalf("ListRefs page2: %v", err)
+	}
+	if len(p2.Refs) != 1 || p2.Refs[0].ShortName != "main" || p2.NextCursor != "" {
+		t.Fatalf("page2 = %+v, want main + empty cursor", p2)
+	}
+
+	// Validation errors.
+	for _, badPrefix := range []string{"../evil", "--flag", "refs/heads/\x00bad"} {
+		if _, err := fx.client.ListRefs(ctx, &rpc.ListRefsRequest{
+			TenantID: string(fx.repoKey.TenantID),
+			RepoID:   string(fx.repoKey.RepoID),
+			Prefix:   badPrefix,
+		}); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("prefix %q code = %v, want InvalidArgument", badPrefix, status.Code(err))
+		}
+	}
+	if _, err := fx.client.ListRefs(ctx, &rpc.ListRefsRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+		Cursor:   "not-a-number",
+	}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("invalid cursor code = %v, want InvalidArgument", status.Code(err))
+	}
+
+	// Tenant mismatch rejected.
+	spoofCtx := metadata.AppendToOutgoingContext(ctx,
+		rpc.HeaderTenantID, "other-tenant",
+		rpc.HeaderRepoID, string(fx.repoKey.RepoID),
+	)
+	if _, err := fx.client.ListRefs(spoofCtx, &rpc.ListRefsRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+	}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("spoofed tenant ListRefs code = %v, want PermissionDenied", status.Code(err))
+	}
+}
+
+func TestGitData_GetCommitLog_RefsPathsTreePathCommitsAndValidation(t *testing.T) {
+	fx := setupGitDataFixture(t)
+	ctx := context.Background()
+
+	// Default ref (HEAD -> main) with IncludePathLastCommits=true at root.
+	rootLog, err := fx.client.GetCommitLog(ctx, &rpc.GetCommitLogRequest{
+		TenantID:               string(fx.repoKey.TenantID),
+		RepoID:                 string(fx.repoKey.RepoID),
+		IncludePathLastCommits: true,
+	})
+	if err != nil {
+		t.Fatalf("GetCommitLog root: %v", err)
+	}
+	if rootLog.TotalCommits != 3 || len(rootLog.Commits) != 3 {
+		t.Fatalf("total/len = (%d, %d), want (3, 3)", rootLog.TotalCommits, len(rootLog.Commits))
+	}
+	top := rootLog.Commits[0]
+	if top.OID != fx.mainCommit || top.ShortOID != fx.mainCommit[:7] || top.Subject != "main diverge commit" || top.AuthorName != "Test" || top.AuthorEmail != "test@example.com" || top.AuthorTime == "" || top.TreeOID == "" || len(top.ParentOIDs) != 1 || top.ParentOIDs[0] != fx.secondCommit {
+		t.Fatalf("top commit unexpected: %+v", top)
+	}
+	rootCommitEntry := rootLog.Commits[2]
+	if rootCommitEntry.OID != fx.rootCommit || len(rootCommitEntry.ParentOIDs) != 0 {
+		t.Fatalf("root commit entry unexpected: %+v", rootCommitEntry)
+	}
+
+	// Verify per-path last commits at root:
+	// main_only.txt -> mainCommit, README.md -> secondCommit, assets -> secondCommit, main.go -> rootCommit.
+	if got := rootLog.TreePathCommits["main_only.txt"].OID; got != fx.mainCommit {
+		t.Fatalf("TreePathCommits[main_only.txt] = %q, want %q", got, fx.mainCommit)
+	}
+	if got := rootLog.TreePathCommits["README.md"].OID; got != fx.secondCommit {
+		t.Fatalf("TreePathCommits[README.md] = %q, want %q", got, fx.secondCommit)
+	}
+	if got := rootLog.TreePathCommits["assets"].OID; got != fx.secondCommit {
+		t.Fatalf("TreePathCommits[assets] = %q, want %q", got, fx.secondCommit)
+	}
+	if got := rootLog.TreePathCommits["main.go"].OID; got != fx.rootCommit {
+		t.Fatalf("TreePathCommits[main.go] = %q, want %q", got, fx.rootCommit)
+	}
+
+	// Subdirectory Path="assets" with IncludePathLastCommits=true:
+	// logo.png & raw.bin -> secondCommit, large.bin -> rootCommit.
+	assetsLog, err := fx.client.GetCommitLog(ctx, &rpc.GetCommitLogRequest{
+		TenantID:               string(fx.repoKey.TenantID),
+		RepoID:                 string(fx.repoKey.RepoID),
+		Ref:                    "main",
+		Path:                   "/assets/",
+		IncludePathLastCommits: true,
+	})
+	if err != nil {
+		t.Fatalf("GetCommitLog assets: %v", err)
+	}
+	if assetsLog.TotalCommits != 2 || len(assetsLog.Commits) != 2 {
+		t.Fatalf("assets total/len = (%d, %d), want (2, 2)", assetsLog.TotalCommits, len(assetsLog.Commits))
+	}
+	if got := assetsLog.TreePathCommits["logo.png"].OID; got != fx.secondCommit {
+		t.Fatalf("TreePathCommits[logo.png] = %q, want %q", got, fx.secondCommit)
+	}
+	if got := assetsLog.TreePathCommits["large.bin"].OID; got != fx.rootCommit {
+		t.Fatalf("TreePathCommits[large.bin] = %q, want %q", got, fx.rootCommit)
+	}
+
+	// Branch ref + Limit=1.
+	featLog, err := fx.client.GetCommitLog(ctx, &rpc.GetCommitLogRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+		Ref:      "refs/heads/feature",
+		Limit:    1,
+	})
+	if err != nil {
+		t.Fatalf("GetCommitLog feature: %v", err)
+	}
+	if featLog.TotalCommits != 3 || len(featLog.Commits) != 1 || featLog.Commits[0].OID != fx.branchCommit {
+		t.Fatalf("feature log unexpected: %+v", featLog)
+	}
+
+	// Tag ref.
+	tagLog, err := fx.client.GetCommitLog(ctx, &rpc.GetCommitLogRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+		Ref:      "v1.0.0",
+		Limit:    1,
+	})
+	if err != nil {
+		t.Fatalf("GetCommitLog tag: %v", err)
+	}
+	if tagLog.TotalCommits != 2 || len(tagLog.Commits) != 1 || tagLog.Commits[0].OID != fx.secondCommit {
+		t.Fatalf("tag log unexpected: %+v", tagLog)
+	}
+
+	// File path filter (non-tree) with IncludePathLastCommits=true does not error.
+	fileLog, err := fx.client.GetCommitLog(ctx, &rpc.GetCommitLogRequest{
+		TenantID:               string(fx.repoKey.TenantID),
+		RepoID:                 string(fx.repoKey.RepoID),
+		Path:                   "main.go",
+		IncludePathLastCommits: true,
+	})
+	if err != nil {
+		t.Fatalf("GetCommitLog file path: %v", err)
+	}
+	if fileLog.TotalCommits != 1 || len(fileLog.Commits) != 1 || fileLog.Commits[0].OID != fx.rootCommit {
+		t.Fatalf("file log unexpected: %+v", fileLog)
+	}
+
+	// Validation: invalid ref, path traversal, flag injection, missing ref, tenant mismatch.
+	for _, badRef := range []string{"--all", "main..feature", "HEAD@{0}", "main\x00evil"} {
+		if _, err := fx.client.GetCommitLog(ctx, &rpc.GetCommitLogRequest{
+			TenantID: string(fx.repoKey.TenantID),
+			RepoID:   string(fx.repoKey.RepoID),
+			Ref:      badRef,
+		}); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("ref %q code = %v, want InvalidArgument", badRef, status.Code(err))
+		}
+	}
+	for _, badPath := range []string{"../secret", "-flag", "a/\x00/b"} {
+		if _, err := fx.client.GetCommitLog(ctx, &rpc.GetCommitLogRequest{
+			TenantID: string(fx.repoKey.TenantID),
+			RepoID:   string(fx.repoKey.RepoID),
+			Path:     badPath,
+		}); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("path %q code = %v, want InvalidArgument", badPath, status.Code(err))
+		}
+	}
+	if _, err := fx.client.GetCommitLog(ctx, &rpc.GetCommitLogRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+		Ref:      "does-not-exist",
+	}); status.Code(err) != codes.NotFound {
+		t.Fatalf("missing ref code = %v, want NotFound", status.Code(err))
+	}
+	spoofCtx := metadata.AppendToOutgoingContext(ctx,
+		rpc.HeaderTenantID, "other-tenant",
+		rpc.HeaderRepoID, string(fx.repoKey.RepoID),
+	)
+	if _, err := fx.client.GetCommitLog(spoofCtx, &rpc.GetCommitLogRequest{
+		TenantID: string(fx.repoKey.TenantID),
+		RepoID:   string(fx.repoKey.RepoID),
+	}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("spoofed tenant GetCommitLog code = %v, want PermissionDenied", status.Code(err))
+	}
+}
+
+func TestGitData_GetCommitLog_SignedCommitsGPGAndSSH(t *testing.T) {
+	workDir := t.TempDir()
+	runGit := func(stdin string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = workDir
+		if stdin != "" {
+			cmd.Stdin = strings.NewReader(stdin)
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit("", "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(workDir, "README.md"), []byte("signed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit("", "add", "README.md")
+	treeOID := runGit("", "write-tree")
+
+	pgpSig := "-----BEGIN PGP SIGNATURE-----\n\niQEzBAABCAAdFiEEtest\n-----END PGP SIGNATURE-----"
+	pgpCommitRaw := "tree " + treeOID + "\n" +
+		"author Alice <alice@example.com> 1700000000 +0000\n" +
+		"committer Alice <alice@example.com> 1700000000 +0000\n" +
+		"gpgsig -----BEGIN PGP SIGNATURE-----\n" +
+		" \n" +
+		" iQEzBAABCAAdFiEEtest\n" +
+		" -----END PGP SIGNATURE-----\n" +
+		"\n" +
+		"gpg signed commit\n" +
+		"\n" +
+		"body line\n"
+	pgpExpectedPayload := "tree " + treeOID + "\n" +
+		"author Alice <alice@example.com> 1700000000 +0000\n" +
+		"committer Alice <alice@example.com> 1700000000 +0000\n" +
+		"\n" +
+		"gpg signed commit\n" +
+		"\n" +
+		"body line\n"
+	c1 := runGit(pgpCommitRaw, "hash-object", "-t", "commit", "-w", "--stdin")
+
+	sshSig := "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHtest\n-----END SSH SIGNATURE-----"
+	sshCommitRaw := "tree " + treeOID + "\n" +
+		"parent " + c1 + "\n" +
+		"author Bob <bob@example.com> 1700000100 +0000\n" +
+		"committer Bob <bob@example.com> 1700000100 +0000\n" +
+		"gpgsig -----BEGIN SSH SIGNATURE-----\n" +
+		" U1NIU0lHtest\n" +
+		" -----END SSH SIGNATURE-----\n" +
+		"\n" +
+		"ssh signed commit\n"
+	sshExpectedPayload := "tree " + treeOID + "\n" +
+		"parent " + c1 + "\n" +
+		"author Bob <bob@example.com> 1700000100 +0000\n" +
+		"committer Bob <bob@example.com> 1700000100 +0000\n" +
+		"\n" +
+		"ssh signed commit\n"
+	c2 := runGit(sshCommitRaw, "hash-object", "-t", "commit", "-w", "--stdin")
+
+	runGit("", "update-ref", "refs/heads/main", c2)
+	runGit("", "repack", "-a", "-d", "-q")
+
+	packDir := filepath.Join(workDir, ".git", "objects", "pack")
+	packMatches, err := filepath.Glob(filepath.Join(packDir, "*.pack"))
+	if err != nil || len(packMatches) != 1 {
+		t.Fatalf("expected 1 packfile, got %v (err=%v)", packMatches, err)
+	}
+	packBytes, err := os.ReadFile(packMatches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	idxBytes, err := os.ReadFile(strings.TrimSuffix(packMatches[0], ".pack") + ".idx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	packSum := sha256.Sum256(packBytes)
+	packID := hex.EncodeToString(packSum[:])
+
+	rk, _ := tenant.NewRepoKey("acme", "signed-repo")
+	metaStore := newFakeMetadataStore()
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	})
+	metaStore.SetRefs(rk, []ddb.RefState{{Repo: rk, RefName: "refs/heads/main", OID: c2}})
+	metaStore.AddManifest(rk, 0, ddb.PackManifest{
+		Repo: rk, ULID: "01JDF8Z7Q2K9M4N6P8R0T2V4W6", PackID: packID, SizeBytes: int64(len(packBytes)), Status: ddb.PackStatusActive,
+	})
+	packFetcher := newFakePackFetcher()
+	packFetcher.Put(packID, packBytes, idxBytes)
+
+	nvmeCache, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitExec := gitexec.NewSubprocessExecutor(gitexec.Config{})
+	mat, err := NewMaterializer(MaterializerConfig{Meta: metaStore, Packs: packFetcher, Cache: nvmeCache, GitExecutor: gitExec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mat.Close)
+	srv, err := NewGitDataServer(GitDataServerConfig{Materializer: mat, GitDataExec: gitExec, Region: "us-east-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := srv.GetCommitLog(context.Background(), &rpc.GetCommitLogRequest{
+		TenantID: string(rk.TenantID),
+		RepoID:   string(rk.RepoID),
+	})
+	if err != nil {
+		t.Fatalf("GetCommitLog signed: %v", err)
+	}
+	if len(resp.Commits) != 2 {
+		t.Fatalf("commits = %d, want 2", len(resp.Commits))
+	}
+	if resp.Commits[0].RawSignature != sshSig || resp.Commits[0].SignedPayload != sshExpectedPayload {
+		t.Fatalf("SSH commit signature mismatch:\ngot sig=%q\nwant sig=%q\ngot payload=%q\nwant payload=%q",
+			resp.Commits[0].RawSignature, sshSig, resp.Commits[0].SignedPayload, sshExpectedPayload)
+	}
+	if resp.Commits[1].RawSignature != pgpSig || resp.Commits[1].SignedPayload != pgpExpectedPayload || resp.Commits[1].Body != "body line" {
+		t.Fatalf("GPG commit signature mismatch:\ngot sig=%q\nwant sig=%q\ngot payload=%q\nwant payload=%q\nbody=%q",
+			resp.Commits[1].RawSignature, pgpSig, resp.Commits[1].SignedPayload, pgpExpectedPayload, resp.Commits[1].Body)
+	}
+}
+
+func TestGitData_EmptyRepositoryGracefulResponses(t *testing.T) {
+	rk, _ := tenant.NewRepoKey("acme", "empty-repo")
+	metaStore := newFakeMetadataStore()
+	metaStore.PutMeta(ddb.RepoMeta{
+		Repo:           rk,
+		HomeRegion:     "us-east-1",
+		FailoverEpoch:  1,
+		RefShards:      1,
+		ManifestShards: 1,
+		WriteState:     lease.ModeActive,
+		DefaultBranch:  "refs/heads/main",
+	})
+	nvmeCache, err := cache.New(cache.Config{Root: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitExec := gitexec.NewSubprocessExecutor(gitexec.Config{})
+	mat, err := NewMaterializer(MaterializerConfig{
+		Meta: metaStore, Packs: newFakePackFetcher(), Cache: nvmeCache, GitExecutor: gitExec,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mat.Close)
+	srv, err := NewGitDataServer(GitDataServerConfig{Materializer: mat, GitDataExec: gitExec, Region: "us-east-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	refsResp, err := srv.ListRefs(context.Background(), &rpc.ListRefsRequest{
+		TenantID: string(rk.TenantID),
+		RepoID:   string(rk.RepoID),
+	})
+	if err != nil {
+		t.Fatalf("ListRefs empty repo: %v", err)
+	}
+	if refsResp.DefaultBranch != "refs/heads/main" || refsResp.HeadOID != "" || len(refsResp.Refs) != 0 || refsResp.BranchCount != 0 || refsResp.TagCount != 0 {
+		t.Fatalf("unexpected empty repo ListRefs response: %+v", refsResp)
+	}
+
+	logResp, err := srv.GetCommitLog(context.Background(), &rpc.GetCommitLogRequest{
+		TenantID:               string(rk.TenantID),
+		RepoID:                 string(rk.RepoID),
+		IncludePathLastCommits: true,
+	})
+	if err != nil {
+		t.Fatalf("GetCommitLog empty repo: %v", err)
+	}
+	if logResp.TotalCommits != 0 || len(logResp.Commits) != 0 {
+		t.Fatalf("unexpected empty repo GetCommitLog response: %+v", logResp)
 	}
 }

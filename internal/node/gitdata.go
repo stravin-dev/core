@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/trace"
@@ -20,13 +22,25 @@ import (
 )
 
 const (
-	defaultDiffContextLines = 3
-	maxDiffContextLines     = 100
-	defaultDiffMaxFiles     = 500
-	maxDiffMaxFiles         = 2000
-	defaultMaxPatchBytes    = 1 << 20 // 1 MiB
-	blobSniffBytes          = 8192
-	blobStreamChunkBytes    = 64 * 1024
+	defaultDiffContextLines  = 3
+	maxDiffContextLines      = 100
+	defaultDiffMaxFiles      = 500
+	maxDiffMaxFiles          = 2000
+	defaultMaxPatchBytes     = 1 << 20 // 1 MiB
+	blobSniffBytes           = 8192
+	blobStreamChunkBytes     = 64 * 1024
+	defaultListRefsLimit     = 100
+	maxListRefsLimit         = 500
+	defaultCommitLogLimit    = 20
+	maxCommitLogLimit        = 100
+	maxCommitCountCap        = 100000
+	maxCommitObjectBytes     = 1 << 20 // 1 MiB
+	maxTreePathEntries       = 200
+	treePathScanCommitLimit  = 200
+	gitDataSubprocessTimeout = 10 * time.Second
+	commitLogFormat          = "%H%x00%T%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%s%x00%b"
+	commitSummaryFormat      = "%H%x00%an%x00%aI%x00%s"
+	treePathNameOnlyFormat   = "%x1e%H%x00%an%x00%aI%x00%s%x00"
 )
 
 // GitDataServerConfig configures the read-only GitData gRPC service on stravin-node.
@@ -537,6 +551,375 @@ func (s *GitDataServer) handleListTree(ctx context.Context, repoKey tenant.RepoK
 		TreeOID: resolvedOID,
 		Entries: entries,
 	}, nil
+}
+
+// ListRefs returns repository branches, tags, default branch HEAD resolution, and counts.
+func (s *GitDataServer) ListRefs(ctx context.Context, req *rpc.ListRefsRequest) (*rpc.ListRefsResponse, error) {
+	start := time.Now()
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "gitdata: request is nil")
+	}
+	repoKey, err := resolveAuthorizedRepoKey(ctx, req.TenantID, req.RepoID)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx = telemetry.ExtractGRPC(ctx)
+	ctx, span := s.tracer.Start(ctx, "node.gitdata.list_refs", trace.WithAttributes(
+		telemetry.NewSpanAttrs().
+			TenantID(string(repoKey.TenantID)).
+			RepoID(string(repoKey.RepoID)).
+			GitOperation("gitdata_refs").
+			Build()...,
+	))
+	defer span.End()
+
+	resp, err := s.handleListRefs(ctx, repoKey, req)
+	s.recordMetricsAndSpan(ctx, span, "gitdata_refs", start, err)
+	return resp, err
+}
+
+func (s *GitDataServer) handleListRefs(ctx context.Context, repoKey tenant.RepoKey, req *rpc.ListRefsRequest) (*rpc.ListRefsResponse, error) {
+	if err := validateRefPrefix(req.Prefix); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "gitdata: %v", err)
+	}
+	offset, err := parsePageToken(req.Cursor)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "gitdata: invalid cursor")
+	}
+
+	limit := req.Limit
+	if limit == 0 {
+		limit = defaultListRefsLimit
+	}
+	if limit > maxListRefsLimit {
+		limit = maxListRefsLimit
+	}
+
+	meta, refs, err := s.materializer.LoadAuthoritativeRefs(ctx, repoKey)
+	if err != nil {
+		return nil, mapSyncError(repoKey, err)
+	}
+
+	defaultRef := normalizeDefaultBranch(meta.DefaultBranch)
+	sorted := make([]ddb.RefState, len(refs))
+	copy(sorted, refs)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].RefName < sorted[j].RefName
+	})
+
+	var (
+		branchCount uint32
+		tagCount    uint32
+		headOID     string
+		matched     = make([]rpc.RefEntry, 0, len(sorted))
+	)
+	for _, r := range sorted {
+		kind, shortName := classifyRef(r.RefName)
+		switch kind {
+		case "branch":
+			branchCount++
+		case "tag":
+			tagCount++
+		}
+		isDefault := defaultRef != "" && r.RefName == defaultRef
+		if isDefault {
+			headOID = r.OID
+		}
+		if req.Prefix != "" && !strings.HasPrefix(r.RefName, req.Prefix) {
+			continue
+		}
+		matched = append(matched, rpc.RefEntry{
+			Name:      r.RefName,
+			ShortName: shortName,
+			TargetOID: r.OID,
+			Kind:      kind,
+			IsDefault: isDefault,
+		})
+	}
+
+	if offset > len(matched) {
+		offset = len(matched)
+	}
+	end := offset + int(limit)
+	nextCursor := ""
+	if end < len(matched) {
+		nextCursor = strconv.Itoa(end)
+	} else {
+		end = len(matched)
+	}
+
+	page := make([]rpc.RefEntry, end-offset)
+	copy(page, matched[offset:end])
+
+	return &rpc.ListRefsResponse{
+		DefaultBranch: defaultRef,
+		HeadOID:       headOID,
+		Refs:          page,
+		BranchCount:   branchCount,
+		TagCount:      tagCount,
+		NextCursor:    nextCursor,
+	}, nil
+}
+
+// GetCommitLog returns commit metadata, raw cryptographic signature payloads,
+// bounded total commit count, and optional per-path last-commit summaries.
+func (s *GitDataServer) GetCommitLog(ctx context.Context, req *rpc.GetCommitLogRequest) (*rpc.GetCommitLogResponse, error) {
+	start := time.Now()
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "gitdata: request is nil")
+	}
+	repoKey, err := resolveAuthorizedRepoKey(ctx, req.TenantID, req.RepoID)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx = telemetry.ExtractGRPC(ctx)
+	ctx, span := s.tracer.Start(ctx, "node.gitdata.get_commit_log", trace.WithAttributes(
+		telemetry.NewSpanAttrs().
+			TenantID(string(repoKey.TenantID)).
+			RepoID(string(repoKey.RepoID)).
+			GitOperation("gitdata_commits").
+			Build()...,
+	))
+	defer span.End()
+
+	resp, err := s.handleGetCommitLog(ctx, repoKey, req)
+	s.recordMetricsAndSpan(ctx, span, "gitdata_commits", start, err)
+	return resp, err
+}
+
+func (s *GitDataServer) handleGetCommitLog(ctx context.Context, repoKey tenant.RepoKey, req *rpc.GetCommitLogRequest) (*rpc.GetCommitLogResponse, error) {
+	ref := req.Ref
+	if ref == "" {
+		ref = "HEAD"
+	}
+	if !isSafeRefOrOID(ref) {
+		return nil, status.Errorf(codes.InvalidArgument, "gitdata: invalid ref %q", req.Ref)
+	}
+
+	cleanPath, err := sanitizeTreePath(req.Path)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "gitdata: %v", err)
+	}
+
+	limit := req.Limit
+	if limit == 0 {
+		limit = defaultCommitLogLimit
+	}
+	if limit > maxCommitLogLimit {
+		limit = maxCommitLogLimit
+	}
+
+	syncRes, err := s.materializer.SyncAndPin(ctx, repoKey)
+	if err != nil {
+		return nil, mapSyncError(repoKey, err)
+	}
+	defer syncRes.Handle.Release()
+	repoDir := syncRes.Handle.Path()
+
+	// Empty repository with no commits yet returns an empty log gracefully.
+	if len(syncRes.Refs) == 0 && isDefaultOrHeadRef(ref, syncRes.Meta.DefaultBranch) {
+		return &rpc.GetCommitLogResponse{
+			TotalCommits: 0,
+			Commits:      []rpc.CommitEntry{},
+		}, nil
+	}
+
+	commitOID, err := s.gitExec.ExecRevParse(ctx, gitexec.RevParseRequest{
+		Repo:    repoKey,
+		RepoDir: repoDir,
+		Rev:     ref + "^{commit}",
+		Timeout: gitDataSubprocessTimeout,
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "gitdata: ref %q not found", ref)
+	}
+
+	var logBuf bytes.Buffer
+	if err := s.gitExec.ExecLog(ctx, gitexec.LogRequest{
+		Repo:      repoKey,
+		RepoDir:   repoDir,
+		CommitOID: commitOID,
+		Path:      cleanPath,
+		MaxCount:  limit,
+		Format:    commitLogFormat,
+		Stdout:    &logBuf,
+		Timeout:   gitDataSubprocessTimeout,
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "gitdata: log %s: %v", commitOID, err)
+	}
+
+	commits, err := parseCommitLogOutput(logBuf.Bytes())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+
+	if len(commits) > 0 {
+		oids := make([]string, len(commits))
+		for i, c := range commits {
+			oids[i] = c.OID
+		}
+		rawObjects, err := s.gitExec.ExecCatFileBatch(ctx, gitexec.CatFileBatchRequest{
+			Repo:           repoKey,
+			RepoDir:        repoDir,
+			OIDs:           oids,
+			MaxObjectBytes: maxCommitObjectBytes,
+			Timeout:        gitDataSubprocessTimeout,
+		})
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "gitdata: cat-file batch commits: %v", err)
+		}
+		for i := range commits {
+			if raw, ok := rawObjects[commits[i].OID]; ok {
+				commits[i].RawSignature, commits[i].SignedPayload = extractCommitSignature(raw)
+			}
+		}
+	}
+
+	totalCommits, err := s.gitExec.ExecRevListCount(ctx, gitexec.RevListCountRequest{
+		Repo:      repoKey,
+		RepoDir:   repoDir,
+		CommitOID: commitOID,
+		Path:      cleanPath,
+		MaxCount:  maxCommitCountCap,
+		Timeout:   gitDataSubprocessTimeout,
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "gitdata: rev-list count %s: %v", commitOID, err)
+	}
+
+	var treePathCommits map[string]rpc.CommitSummary
+	if req.IncludePathLastCommits {
+		treePathCommits, err = s.resolveTreePathCommits(ctx, repoKey, repoDir, commitOID, cleanPath)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &rpc.GetCommitLogResponse{
+		TotalCommits:    totalCommits,
+		Commits:         commits,
+		TreePathCommits: treePathCommits,
+	}, nil
+}
+
+func (s *GitDataServer) resolveTreePathCommits(
+	ctx context.Context,
+	repoKey tenant.RepoKey,
+	repoDir string,
+	commitOID string,
+	cleanPath string,
+) (map[string]rpc.CommitSummary, error) {
+	treeRev := commitOID + "^{tree}"
+	if cleanPath != "" {
+		treeRev = commitOID + ":" + cleanPath
+	}
+	treeOID, err := s.gitExec.ExecRevParse(ctx, gitexec.RevParseRequest{
+		Repo:    repoKey,
+		RepoDir: repoDir,
+		Rev:     treeRev,
+		Timeout: gitDataSubprocessTimeout,
+	})
+	if err != nil {
+		return nil, nil
+	}
+
+	metas, err := s.gitExec.ExecCatFileBatchCheck(ctx, gitexec.CatFileBatchCheckRequest{
+		Repo:    repoKey,
+		RepoDir: repoDir,
+		OIDs:    []string{treeOID},
+		Timeout: gitDataSubprocessTimeout,
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "gitdata: cat-file batch-check tree: %v", err)
+	}
+	if !metas[treeOID].Exists || metas[treeOID].Type != "tree" {
+		return nil, nil
+	}
+
+	var lsBuf bytes.Buffer
+	if err := s.gitExec.ExecLsTree(ctx, gitexec.LsTreeRequest{
+		Repo:      repoKey,
+		RepoDir:   repoDir,
+		TreeOID:   treeOID,
+		Recursive: false,
+		Stdout:    &lsBuf,
+		Timeout:   gitDataSubprocessTimeout,
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "gitdata: ls-tree %s: %v", treeOID, err)
+	}
+
+	entries, err := parseLsTreeOutput(lsBuf.Bytes(), cleanPath)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	if len(entries) == 0 {
+		return map[string]rpc.CommitSummary{}, nil
+	}
+	if len(entries) > maxTreePathEntries {
+		entries = entries[:maxTreePathEntries]
+	}
+
+	wanted := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		wanted[e.Name] = struct{}{}
+	}
+
+	var scanBuf bytes.Buffer
+	if err := s.gitExec.ExecLog(ctx, gitexec.LogRequest{
+		Repo:      repoKey,
+		RepoDir:   repoDir,
+		CommitOID: commitOID,
+		Path:      cleanPath,
+		MaxCount:  treePathScanCommitLimit,
+		Format:    treePathNameOnlyFormat,
+		NameOnly:  true,
+		Stdout:    &scanBuf,
+		Timeout:   gitDataSubprocessTimeout,
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "gitdata: log path scan %s: %v", commitOID, err)
+	}
+
+	result := parseNameOnlyLogOutput(scanBuf.Bytes(), cleanPath, wanted)
+	if len(result) == len(wanted) {
+		return result, nil
+	}
+
+	// Fallback for entries untouched in the recent commit scan window.
+	for _, e := range entries {
+		if _, ok := result[e.Name]; ok {
+			continue
+		}
+		var oneBuf bytes.Buffer
+		if err := s.gitExec.ExecLog(ctx, gitexec.LogRequest{
+			Repo:      repoKey,
+			RepoDir:   repoDir,
+			CommitOID: commitOID,
+			Path:      e.Path,
+			MaxCount:  1,
+			Format:    commitSummaryFormat,
+			Stdout:    &oneBuf,
+			Timeout:   gitDataSubprocessTimeout,
+		}); err != nil {
+			return nil, status.Errorf(codes.Internal, "gitdata: log last commit %s: %v", e.Path, err)
+		}
+		if summary, ok := parseCommitSummaryOutput(oneBuf.Bytes()); ok {
+			result[e.Name] = summary
+		}
+	}
+	return result, nil
+}
+
+func isDefaultOrHeadRef(ref, defaultBranch string) bool {
+	if ref == "HEAD" {
+		return true
+	}
+	normDefault := normalizeDefaultBranch(defaultBranch)
+	if normDefault == "" {
+		return false
+	}
+	return ref == normDefault || ref == strings.TrimPrefix(normDefault, "refs/heads/")
 }
 
 func (s *GitDataServer) recordMetricsAndSpan(ctx context.Context, span trace.Span, op string, start time.Time, err error) {

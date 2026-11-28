@@ -72,6 +72,61 @@ func (h *fakeGitDataHandler) ListTree(ctx context.Context, req *rpc.ListTreeRequ
 	}, nil
 }
 
+func (h *fakeGitDataHandler) ListRefs(ctx context.Context, req *rpc.ListRefsRequest) (*rpc.ListRefsResponse, error) {
+	rk, err := tenant.RequireRepoKey(ctx)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	h.gotRepoKey = rk
+	return &rpc.ListRefsResponse{
+		DefaultBranch: "refs/heads/main",
+		HeadOID:       "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		BranchCount:   1,
+		TagCount:      1,
+		Refs: []rpc.RefEntry{
+			{Name: "refs/heads/main", ShortName: "main", TargetOID: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Kind: "branch", IsDefault: true},
+		},
+		NextCursor: req.Cursor,
+	}, nil
+}
+
+func (h *fakeGitDataHandler) GetCommitLog(ctx context.Context, req *rpc.GetCommitLogRequest) (*rpc.GetCommitLogResponse, error) {
+	rk, err := tenant.RequireRepoKey(ctx)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	h.gotRepoKey = rk
+	resp := &rpc.GetCommitLogResponse{
+		TotalCommits: 2,
+		Commits: []rpc.CommitEntry{
+			{
+				OID:           "cccccccccccccccccccccccccccccccccccccccc",
+				ShortOID:      "ccccccc",
+				TreeOID:       "dddddddddddddddddddddddddddddddddddddddd",
+				ParentOIDs:    []string{"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+				AuthorName:    "Alice",
+				AuthorEmail:   "alice@example.com",
+				AuthorTime:    "2026-11-27T12:00:00Z",
+				Subject:       "feat: add overview",
+				RawSignature:  "-----BEGIN SSH SIGNATURE-----\nabc\n-----END SSH SIGNATURE-----",
+				SignedPayload: "tree dddddddddddddddddddddddddddddddddddddddd\n\nfeat: add overview\n",
+			},
+		},
+	}
+	if req.IncludePathLastCommits {
+		resp.TreePathCommits = map[string]rpc.CommitSummary{
+			"README.md": {
+				OID:        "cccccccccccccccccccccccccccccccccccccccc",
+				ShortOID:   "ccccccc",
+				Subject:    "feat: add overview",
+				AuthorName: "Alice",
+				AuthorTime: "2026-11-27T12:00:00Z",
+			},
+		}
+	}
+	return resp, nil
+}
+
 func startGitDataTestServer(t *testing.T, handler rpc.GitDataHandler, opts ...grpc.ServerOption) (rpc.GitDataClient, *grpc.ClientConn) {
 	t.Helper()
 	lis := bufconn.Listen(1024 * 1024)
@@ -155,6 +210,33 @@ func TestGitDataRoundTrip(t *testing.T) {
 	if len(treeResp.Entries) != 1 || treeResp.Entries[0].Name != "main.go" {
 		t.Fatalf("unexpected tree response: %+v", treeResp)
 	}
+
+	refsResp, err := client.ListRefs(ctx, &rpc.ListRefsRequest{
+		TenantID: "acme",
+		RepoID:   "core",
+		Prefix:   "refs/heads/",
+		Limit:    50,
+	})
+	if err != nil {
+		t.Fatalf("ListRefs: %v", err)
+	}
+	if refsResp.DefaultBranch != "refs/heads/main" || refsResp.BranchCount != 1 || refsResp.TagCount != 1 || len(refsResp.Refs) != 1 || !refsResp.Refs[0].IsDefault {
+		t.Fatalf("unexpected refs response: %+v", refsResp)
+	}
+
+	logResp, err := client.GetCommitLog(ctx, &rpc.GetCommitLogRequest{
+		TenantID:               "acme",
+		RepoID:                 "core",
+		Ref:                    "main",
+		Limit:                  10,
+		IncludePathLastCommits: true,
+	})
+	if err != nil {
+		t.Fatalf("GetCommitLog: %v", err)
+	}
+	if logResp.TotalCommits != 2 || len(logResp.Commits) != 1 || logResp.Commits[0].RawSignature == "" || logResp.TreePathCommits["README.md"].ShortOID != "ccccccc" {
+		t.Fatalf("unexpected commit log response: %+v", logResp)
+	}
 }
 
 func TestGitDataTenantIsolation(t *testing.T) {
@@ -218,6 +300,30 @@ func TestGitDataTenantIsolation(t *testing.T) {
 		})
 		if status.Code(err) != codes.InvalidArgument {
 			t.Fatalf("ListTree invalid tenant code = %v (%v), want InvalidArgument", status.Code(err), err)
+		}
+	})
+
+	t.Run("mismatched tenant metadata rejected on ListRefs and GetCommitLog", func(t *testing.T) {
+		ctx := metadata.AppendToOutgoingContext(context.Background(),
+			rpc.HeaderTenantID, "other-tenant",
+			rpc.HeaderRepoID, "core",
+		)
+		if _, err := client.ListRefs(ctx, &rpc.ListRefsRequest{TenantID: "acme", RepoID: "core"}); status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("ListRefs code = %v (%v), want PermissionDenied", status.Code(err), err)
+		}
+		if _, err := client.GetCommitLog(ctx, &rpc.GetCommitLogRequest{TenantID: "acme", RepoID: "core"}); status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("GetCommitLog code = %v (%v), want PermissionDenied", status.Code(err), err)
+		}
+	})
+
+	t.Run("missing metadata rejected on ListRefs and GetCommitLog", func(t *testing.T) {
+		refsOut := new(rpc.ListRefsResponse)
+		if err := cc.Invoke(context.Background(), rpc.GitDataListRefsMethod, &rpc.ListRefsRequest{TenantID: "acme", RepoID: "core"}, refsOut, grpc.ForceCodec(rpc.GitDataCodec())); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("ListRefs without metadata code = %v, want InvalidArgument", status.Code(err))
+		}
+		logOut := new(rpc.GetCommitLogResponse)
+		if err := cc.Invoke(context.Background(), rpc.GitDataGetCommitLogMethod, &rpc.GetCommitLogRequest{TenantID: "acme", RepoID: "core"}, logOut, grpc.ForceCodec(rpc.GitDataCodec())); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("GetCommitLog without metadata code = %v, want InvalidArgument", status.Code(err))
 		}
 	})
 }

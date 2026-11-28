@@ -136,6 +136,87 @@ func TestSubprocessExecutor_GitDataOperations(t *testing.T) {
 	if !strings.Contains(lsBuf.String(), "hello.txt") || !strings.Contains(lsBuf.String(), "sub") {
 		t.Fatalf("ExecLsTree output missing entries: %q", lsBuf.String())
 	}
+
+	var logBuf bytes.Buffer
+	if err := e.ExecLog(ctx, LogRequest{
+		Repo: rk, RepoDir: bareDir, CommitOID: c2, MaxCount: 5, Format: "%H%x00%s", Stdout: &logBuf,
+	}); err != nil {
+		t.Fatalf("ExecLog: %v", err)
+	}
+	if !strings.Contains(logBuf.String(), c2) || !strings.Contains(logBuf.String(), "second") || !strings.Contains(logBuf.String(), c1) {
+		t.Fatalf("ExecLog output unexpected: %q", logBuf.String())
+	}
+
+	var pathLogBuf bytes.Buffer
+	if err := e.ExecLog(ctx, LogRequest{
+		Repo: rk, RepoDir: bareDir, CommitOID: c2, Path: "sub/data.bin", MaxCount: 5, Format: "%H%x00%s", Stdout: &pathLogBuf,
+	}); err != nil {
+		t.Fatalf("ExecLog path: %v", err)
+	}
+	if strings.Contains(pathLogBuf.String(), c2) || !strings.Contains(pathLogBuf.String(), c1) {
+		t.Fatalf("ExecLog path output unexpected: %q", pathLogBuf.String())
+	}
+
+	var nameOnlyBuf bytes.Buffer
+	if err := e.ExecLog(ctx, LogRequest{
+		Repo: rk, RepoDir: bareDir, CommitOID: c2, MaxCount: 5, Format: "%x1e%H%x00%s%x00", NameOnly: true, Stdout: &nameOnlyBuf,
+	}); err != nil {
+		t.Fatalf("ExecLog name-only: %v", err)
+	}
+	if !strings.Contains(nameOnlyBuf.String(), "hello.txt") || !strings.Contains(nameOnlyBuf.String(), "sub/data.bin") {
+		t.Fatalf("ExecLog name-only output unexpected: %q", nameOnlyBuf.String())
+	}
+
+	totalCount, err := e.ExecRevListCount(ctx, RevListCountRequest{Repo: rk, RepoDir: bareDir, CommitOID: c2})
+	if err != nil || totalCount != 2 {
+		t.Fatalf("ExecRevListCount = (%d, %v), want (2, nil)", totalCount, err)
+	}
+	cappedCount, err := e.ExecRevListCount(ctx, RevListCountRequest{Repo: rk, RepoDir: bareDir, CommitOID: c2, MaxCount: 1})
+	if err != nil || cappedCount != 1 {
+		t.Fatalf("ExecRevListCount capped = (%d, %v), want (1, nil)", cappedCount, err)
+	}
+	pathCount, err := e.ExecRevListCount(ctx, RevListCountRequest{Repo: rk, RepoDir: bareDir, CommitOID: c2, Path: "sub/data.bin"})
+	if err != nil || pathCount != 1 {
+		t.Fatalf("ExecRevListCount path = (%d, %v), want (1, nil)", pathCount, err)
+	}
+
+	batchObjs, err := e.ExecCatFileBatch(ctx, CatFileBatchRequest{
+		Repo: rk, RepoDir: bareDir, OIDs: []string{c2, c1, c2, strings.Repeat("f", 40)},
+	})
+	if err != nil {
+		t.Fatalf("ExecCatFileBatch: %v", err)
+	}
+	if len(batchObjs) != 2 || !bytes.Contains(batchObjs[c2], []byte("second")) || !bytes.Contains(batchObjs[c1], []byte("initial")) {
+		t.Fatalf("ExecCatFileBatch unexpected result keys=%d", len(batchObjs))
+	}
+
+	// Oversized object is skipped cleanly without failing the batch.
+	smallBatch, err := e.ExecCatFileBatch(ctx, CatFileBatchRequest{
+		Repo: rk, RepoDir: bareDir, OIDs: []string{blobOID, c2}, MaxObjectBytes: 1024,
+	})
+	if err != nil {
+		t.Fatalf("ExecCatFileBatch max bytes: %v", err)
+	}
+	if _, hasBlob := smallBatch[blobOID]; hasBlob {
+		t.Fatal("expected oversized blob to be skipped")
+	}
+	if _, hasCommit := smallBatch[c2]; !hasCommit {
+		t.Fatal("expected small commit to be present")
+	}
+
+	// Invalid arguments rejected before spawning git.
+	if err := e.ExecLog(ctx, LogRequest{Repo: rk, RepoDir: bareDir, CommitOID: "--evil", MaxCount: 1, Stdout: &logBuf}); err == nil {
+		t.Fatal("expected ExecLog to reject flag-like commit OID")
+	}
+	if err := e.ExecLog(ctx, LogRequest{Repo: rk, RepoDir: bareDir, CommitOID: c2, MaxCount: 0, Stdout: &logBuf}); err == nil {
+		t.Fatal("expected ExecLog to reject zero MaxCount")
+	}
+	if _, err := e.ExecRevListCount(ctx, RevListCountRequest{Repo: rk, RepoDir: bareDir, CommitOID: "not-hex"}); err == nil {
+		t.Fatal("expected ExecRevListCount to reject non-hex OID")
+	}
+	if _, err := e.ExecCatFileBatch(ctx, CatFileBatchRequest{Repo: rk, RepoDir: bareDir, OIDs: []string{"--flag"}}); err == nil {
+		t.Fatal("expected ExecCatFileBatch to reject invalid OID")
+	}
 }
 
 func TestIsValidHexOID(t *testing.T) {
