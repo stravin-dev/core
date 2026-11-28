@@ -1,3 +1,17 @@
+# [1.17.0](https://github.com/stravin-dev/core/compare/v1.16.0...v1.17.0) (2026-11-28)
+
+
+### Bug Fixes
+
+* **gitdata:** bootstrap missing DynamoDB RepoMeta in InitRepo ([bc16719](https://github.com/stravin-dev/core/commit/bc16719f700a7a7edada5826f05d0d67d211eaa1))
+* **gitdata:** bootstrap missing DynamoDB RepoMeta in InitRepo ([#198](https://github.com/stravin-dev/core/issues/198)) ([9e65eef](https://github.com/stravin-dev/core/commit/9e65eef052918d100b0f819f384f1628620f6db7))
+
+
+### Features
+
+* **gitdata:** add InitRepo unary RPC ([#197](https://github.com/stravin-dev/core/issues/197)) ([fc3778b](https://github.com/stravin-dev/core/commit/fc3778b6c7d5c563cdf843991db852aca33cefe0))
+* **gitdata:** add InitRepo unary RPC for initial repository commits ([bcd8a60](https://github.com/stravin-dev/core/commit/bcd8a60e7289094bab2110dc3e1cad41f6a6382b))
+
 # [1.16.0](https://github.com/stravin-dev/core/compare/v1.15.0...v1.16.0) (2026-11-28)
 
 
