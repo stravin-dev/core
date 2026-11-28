@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -469,12 +470,15 @@ func (e *SubprocessExecutor) ExecCatFileBatch(ctx context.Context, req CatFileBa
 			return nil, fmt.Errorf("gitexec: malformed cat-file batch header %q", strings.TrimSpace(header))
 		}
 		oid := fields[0]
-		sz, err := strconv.ParseUint(fields[2], 10, 64)
+		sz, err := strconv.ParseInt(fields[2], 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("gitexec: parse cat-file batch size %q: %w", fields[2], err)
 		}
-		if sz > maxBytes {
-			if _, err := io.CopyN(io.Discard, reader, int64(sz)+1); err != nil {
+		if sz < 0 || sz == math.MaxInt64 {
+			return nil, fmt.Errorf("gitexec: invalid cat-file batch size %d", sz)
+		}
+		if uint64(sz) > maxBytes {
+			if _, err := io.CopyN(io.Discard, reader, sz+1); err != nil {
 				return nil, fmt.Errorf("gitexec: discard oversized object %s: %w", oid, err)
 			}
 			continue
